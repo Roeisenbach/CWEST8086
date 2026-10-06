@@ -1,0 +1,35 @@
+// Windows resources for CWEST8086.
+//
+// Two names for the same icon on purpose:
+//   1          -- the lowest numeric icon id, which is what Explorer and the
+//                 taskbar pick up for the executable itself.
+//   GLFW_ICON  -- the name GLFW looks up with LoadIcon() when it creates the
+//                 window class, so the window and Alt+Tab match.
+//
+// Regenerate app.ico with:  python tools/makeicon.py
+1         ICON "app.ico"
+GLFW_ICON ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION     0,6,0,0
+PRODUCTVERSION  0,6,0,0
+FILEOS          0x4L
+FILETYPE        0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "CWEST8086 - Core Wars Editor, Simulator and Tournaments"
+            VALUE "FileVersion",     "0.6.0.0"
+            VALUE "InternalName",    "cwest8086"
+            VALUE "OriginalFilename","app.exe"
+            VALUE "ProductName",     "CWEST8086"
+            VALUE "ProductVersion",  "0.6.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
