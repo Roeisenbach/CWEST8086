@@ -1,0 +1,12 @@
+# run artifacts
+scores.csv
+last-run.txt
+*.eng.txt
+*.jar.txt
+gui/buildGui/src-stamp/
+tools/build/
+
+# the field directories hold warriors and nothing else - every file in them is
+# loaded as a warrior, so they are not tracked and carry no placeholder
+survivors/
+zombies/

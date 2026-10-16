@@ -1,0 +1,7 @@
+# keep the POSIX launcher LF-only so it runs after a Windows checkout
+run.sh text eol=lf
+*.sh   text eol=lf
+
+# never line-ending-mangle the engine
+*.class binary
+*.jar   binary
