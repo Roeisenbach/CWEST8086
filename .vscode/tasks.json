@@ -1,0 +1,97 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "Kill App",
+            "command": "if (Get-Process -Name 'app' -ErrorAction SilentlyContinue) { Stop-Process -Name 'app' -Force }",
+            "problemMatcher": []
+        },
+        {
+            // Everything the app links except main.cpp -- the engine, Dear ImGui
+            // and its backends, the text editor and the icon resource -- built
+            // once at -O2 into build/ and then only when a source changes. The
+            // engine is an interpreter: at -O0 it runs a competition several
+            // times slower than it has to, so main.cpp alone stays unoptimised
+            // and quick to rebuild.
+            "type": "shell",
+            "label": "Build Objects",
+            "command": "powershell",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-File", "tools/build_objects.ps1"],
+            "problemMatcher": []
+        },
+        {
+            // The headless joiner: a console exe that plays a share of a hosted
+            // tournament on a machine with no display. Static so it copies to
+            // any Windows box on its own.
+            "type": "shell",
+            "label": "Build cwnode",
+            "command": "g++",
+            "args": [
+                "-O2",
+                "-std=c++17",
+                "-static",
+                "src/engine/cwnode.cpp",
+                "build/eng_cpu.o",
+                "build/eng_war.o",
+                "build/eng_compete.o",
+                "build/eng_netpack.o",
+                "-lws2_32",
+                "-o",
+                "cwnode.exe"
+            ],
+            "dependsOn": ["Build Objects"],
+            "problemMatcher": []
+        },
+        {
+            // The development build: app.exe in the project root, beside the
+            // assets/, gpu-engine/ and CGX-engine/ folders it looks for.
+            // -mwindows: a GUI program, no console window. -static: no MinGW
+            // runtime DLLs, so the exe also runs on a machine without MSYS2.
+            // tools/make_release.ps1 makes the optimised, packaged build.
+            "type": "shell",
+            "label": "Build ImGui App",
+            "command": "g++",
+            "args": [
+                "-g",
+                "-std=c++17",
+                "src/main.cpp",
+                "build/*.o",
+                "-Isrc",
+                "-Ithird_party/imgui",
+                "-Ithird_party/imgui/backends",
+                "-Ithird_party/glfw/include",
+                "-Lthird_party/glfw/lib-mingw-w64",
+                "-lglfw3",
+                "-lopengl32",
+                "-lgdi32",
+                "-lcomdlg32",
+                "-lshell32",
+                "-lole32",
+                "-lws2_32",
+                "-mwindows",
+                "-static",
+                "-o",
+                "app.exe"
+            ],
+            "dependsOn": [
+                "Kill App",
+                "Build Objects",
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            // The packaged release: release/CWEST8086/ and a zip of it.
+            "type": "shell",
+            "label": "Make Release",
+            "command": "powershell",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-File", "tools/make_release.ps1"],
+            "problemMatcher": []
+        }
+    ]
+}

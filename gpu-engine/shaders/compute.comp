@@ -1,0 +1,1532 @@
+/* CoreWars8086 -> GPU.  One compute invocation runs one entire war.
+ *
+ * ACCURACY build (v1): a faithful port of il.co.codeguru.corewars8086, bugs
+ * included (stale OF/AF, buggy SAHF, shl16/shr16/sar16 touch only ZF, REP
+ * rewinds IP, 0x82==0x80, ...).  Speed restructuring is v2.
+ *
+ * Decode is structural, not a 256-case switch: the opcode's bit layout drives
+ * it.  Per-warrior state lives in a scratch SSBO (binding 5), 32 uints/slot,
+ * MAX_WARRIORS slots per game -- keeping it out of private memory so the driver
+ * shader compiler doesn't choke and occupancy stays sane.  Register/segment
+ * indices match the 8086 ModRM fields directly:
+ *   slot[0..7]  = AX CX DX BX SP BP SI DI
+ *   slot[8..11] = ES CS SS DS
+ *
+ * INT 0x86 / INT 0x87 do not run their whole loop inside one execOne(); they
+ * seed a `repeat` countdown drained step-by-step inside the turn (still atomic,
+ * matching the engine).  REP is NOT a repeat: it rewinds IP by 2, so it
+ * interleaves with other warriors.
+ *
+ * Scheduling: main() is a persistent-thread work queue -- a fixed grid of
+ * workers each pull games from binding-6 g_qhead (atomicAdd) and call the
+ * resumable runWar() until the batch drains, so a worker never idles while its
+ * game is done.  runWar() advances one game by at most pc.roundBudget rounds,
+ * persisting/restoring via the GAME_HDR block in `scratch`.
+ */
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+// ============================================================================
+//  Constants
+// ============================================================================
+const uint MAX_WARRIORS      = 20u;
+
+const uint ARENA_SEG         = 0x1000u;
+const uint ARENA_SIZE        = 0x10000u;
+const uint ARENA_LIN_LO      = 0x10000u;
+const uint ARENA_LIN_HI      = 0x1FFFFu;
+
+const uint STACK_SIZE        = 0x800u;
+const uint SHARED_SIZE       = 0x400u;
+const uint NEXT_FREE_START   = 0x20000u;
+
+const uint SLAB_BYTES        = 0x20000u;
+const uint SLAB_UINTS        = SLAB_BYTES / 4u;   // 0x8000
+const uint LIN_BASE          = 0x10000u;
+
+const uint MIN_GAP           = 1024u;
+const uint MAX_LOADING_TRIES = 100u;
+const int  MAX_SPEED         = 16;
+const int  DECELERATION_ROUNDS = 5;
+
+const uint T_SURVIVOR = 0u, T_SURVIVOR_1 = 1u, T_SURVIVOR_2 = 2u,
+           T_ZOMBIE   = 3u, T_ZOMBIE_H   = 4u;
+
+const uint END_RUNNING = 0u, END_SINGLE_WINNER = 1u, END_MAX_ROUND = 2u, END_ABORTED = 3u;
+const uint DR_NONE = 0u, DR_CPU = 1u, DR_MEM = 2u;
+
+#define FL_CF 0x0001u
+#define FL_PF 0x0004u
+#define FL_AF 0x0010u
+#define FL_ZF 0x0040u
+#define FL_SF 0x0080u
+#define FL_TF 0x0100u
+#define FL_IF 0x0200u
+#define FL_DF 0x0400u
+#define FL_OF 0x0800u
+
+const uint REP_NONE = 0u, REP_INT86 = 1u, REP_INT87 = 2u;
+const uint NO_WARRIOR = 0xFFFFFFFFu;
+
+// scratch region per game: a 16-uint header + MAX_WARRIORS warrior slots.
+// The war is resumable: each dispatch advances every game by at most
+// pc.roundBudget rounds, persisting state here, until the host sees it finished
+// (gamesOut[gi].endReason != END_RUNNING).
+const uint GAME_HDR   = 16u;
+#define GH_PHASE  0u    // 0 fresh, 1 fighting, 2 done
+#define GH_ROUND  1u
+#define GH_NWAR   2u
+#define GH_NALIVE 3u
+#define GH_NSURV  4u
+#define GH_RNGLO  5u
+#define GH_RNGHI  6u
+#define GH_LDFAIL 7u
+#define GH_ALIVEM 8u    // bit i = warrior i still standing
+#define GH_SGRPM  9u    // bit g = group g still has a living survivor
+
+// scratch slot: 32 uints per warrior per game
+const uint SLOT_UINTS = 32u;
+#define SL_IP    12u
+#define SL_FL    13u
+#define SL_EN    14u
+#define SL_B1    15u
+#define SL_B2    16u
+#define SL_RPT   17u
+#define SL_RPM   18u
+#define SL_RPI   19u
+#define SL_STKLO 20u
+#define SL_STKHI 21u
+#define SL_SHRLO 22u
+#define SL_SHRHI 23u
+#define SL_SRC   24u
+#define SL_LOFF  25u
+#define SL_CSZ   26u
+#define SL_TYPE  27u
+#define SL_GRP   28u
+#define SL_ALIVE 29u
+#define SL_DEATH 30u
+
+// ============================================================================
+//  Buffers
+// ============================================================================
+struct GameIn {
+    uint seedLo, seedHi, numGroups, numWarriors, zombieSpeed;
+    uint _pad0, _pad1, _pad2;
+    uint wType   [MAX_WARRIORS];
+    uint wGroup  [MAX_WARRIORS];
+    uint wCodeOff[MAX_WARRIORS];
+    uint wCodeLen[MAX_WARRIORS];
+};
+struct GameOut {
+    uint endReason, rounds, numSurvivorsAlive, numWarriorsAlive, aliveMask;
+    uint _pad0, _pad1, _pad2;
+    uint deathReason[MAX_WARRIORS];
+    uint loadOffset [MAX_WARRIORS];
+    uint ssSeg      [MAX_WARRIORS];
+    uint esSeg      [MAX_WARRIORS];
+    uint srcIndex   [MAX_WARRIORS];
+};
+
+layout(std430, binding = 0) readonly  buffer GamesInB  { GameIn  gamesIn [];  };
+layout(std430, binding = 1) readonly  buffer CodeB     { uint    codeWord[];  };
+layout(std430, binding = 2)           buffer ArenaB    { uint    arena   [];  };
+layout(std430, binding = 3)           buffer GamesOutB { GameOut gamesOut[];  };
+layout(std430, binding = 4) readonly  buffer SpeedB    { uint    speedTab[];  }; // [65536] -> 0..16
+layout(std430, binding = 5)           buffer ScratchB  { uint    scratch [];  }; // gameCount * (GAME_HDR + MAX_WARRIORS*32)
+// [0] is the queue head the workers bump; [1..] is the worklist -- the indices
+// of the games that are not finished yet. The host rebuilds it before each
+// pass, so late in a run the workers stop paying an atomic and a header read
+// per already-finished game just to discover there is nothing to do.
+layout(std430, binding = 6)           buffer QueueB    { uint    q[]; };
+#define g_qhead q[0]
+#define QLIST   1u
+
+layout(push_constant) uniform PC {
+    uint gameCount;
+    uint roundBudget;   // max rounds to advance per dispatch
+    uint maxRounds;      // hard ceiling (Competition.MAX_ROUND)
+} pc;
+
+// ============================================================================
+//  Per-invocation war state (scalars only -- the per-warrior state is in `scratch`)
+// ============================================================================
+uint g_numWarriors, g_numAlive, g_numSurv, g_nextFree, g_base, g_sbase, g_ghdr;
+// Who is still standing, and which groups still have a survivor -- both kept in
+// registers across a whole dispatch and persisted in the game header, so the
+// round loop never rescans the roster in memory.
+uint g_aliveMask, g_survGroupMask;
+bool g_loadFailed;
+uint64_t g_rng;
+bool g_fault;
+uint g_faultReason;
+
+uint md_mode, md_reg, md_rm, md_seg, md_off;
+bool md_isReg;
+
+// ---------------------------------------------------------------------------
+//  The acting warrior's state, held in per-invocation variables (registers) for
+//  the length of its turn, loaded by loadCur() and written back by storeCur().
+//
+//  These used to be `scratch[...]` -- an SSBO -- so every register reference,
+//  every flag update and every one of canRW()'s four bound checks was a global
+//  memory access, and a single instruction makes dozens of them. Reading and
+//  writing the whole block once per turn is a couple of wide accesses instead
+//  (the slot layout is uvec4-aligned, so the driver merges them).
+// ---------------------------------------------------------------------------
+uint C_AX, C_CX, C_DX, C_BX, C_SP, C_BP, C_SI, C_DI;   // reg index 0..7
+uint C_ES, C_CS, C_SS, C_DS;                            // seg index 0..3
+uint C_IP, C_FL, C_EN, C_RPT, C_RPM, C_RPI;
+// Only the window bases are held: the sizes are constants, so the tops are one
+// add away rather than a load. Likewise the two bomb counters live in scratch
+// (S_B1/S_B2 below) because only INT 86/87 touch them, and those are three
+// instructions in a million.
+//
+// Between them that is four fewer values to carry and, more to the point, four
+// fewer loads and two fewer stores in every loadCur/storeCur pair -- 125 -> 149
+// games/s. Which of the two effects it is has not been measured (there is no
+// profiler on this machine, and no register count): the traffic is the simpler
+// explanation and the one the next line supports.
+uint C_STKLO, C_SHRLO;
+// Energy and type were tried in scratch as well. That drops two more values but
+// does NOT drop traffic -- it only moves three accesses out of the merged
+// loadCur/storeCur block and scatters them across the use sites -- and it was
+// slower (149 -> 139). So the trimming stops where the traffic saving stops.
+uint C_TYPE;
+#define C_STKHI (C_STKLO + STACK_SIZE)
+#define C_SHRHI (C_SHRLO + SHARED_SIZE - 1u)
+#define S_B1 scratch[(g_sbase + w * SLOT_UINTS) + SL_B1]
+#define S_B2 scratch[(g_sbase + w * SLOT_UINTS) + SL_B2]
+
+// per-warrior scratch base for the warrior a function is working on (param `w`)
+#define WB (g_sbase + w * SLOT_UINTS)
+#define rAX C_AX
+#define rCX C_CX
+#define rDX C_DX
+#define rBX C_BX
+#define rSP C_SP
+#define rBP C_BP
+#define rSI C_SI
+#define rDI C_DI
+#define rES C_ES
+#define rCS C_CS
+#define rSS C_SS
+#define rDS C_DS
+#define rIP C_IP
+#define rFL C_FL
+
+uint slotBase(uint i) { return g_sbase + i * SLOT_UINTS; }
+
+void loadCur(uint w) {
+    uint b = WB;
+    // Two 16-bit registers to the word. They are 16-bit machine registers, so
+    // this costs a shift and a mask each and halves the scratch traffic that
+    // every turn pays -- and scratch is three times the transactions the arena
+    // is, with a hot set sitting right on the edge of a 2 MB L2.
+    uint p0 = scratch[b + 0u], p1 = scratch[b + 1u], p2 = scratch[b + 2u];
+    uint p3 = scratch[b + 3u], p4 = scratch[b + 4u], p5 = scratch[b + 5u];
+    C_AX = p0 & 0xFFFFu; C_CX = p0 >> 16u;
+    C_DX = p1 & 0xFFFFu; C_BX = p1 >> 16u;
+    C_SP = p2 & 0xFFFFu; C_BP = p2 >> 16u;
+    C_SI = p3 & 0xFFFFu; C_DI = p3 >> 16u;
+    C_ES = p4 & 0xFFFFu; C_CS = p4 >> 16u;
+    C_SS = p5 & 0xFFFFu; C_DS = p5 >> 16u;
+    C_IP  = scratch[b + SL_IP];  C_FL  = scratch[b + SL_FL];
+    C_EN  = scratch[b + SL_EN];  C_RPT = scratch[b + SL_RPT];
+    C_RPM = scratch[b + SL_RPM]; C_RPI = scratch[b + SL_RPI];
+    C_TYPE  = scratch[b + SL_TYPE];
+    C_STKLO = scratch[b + SL_STKLO];
+    C_SHRLO = scratch[b + SL_SHRLO];
+}
+void storeCur(uint w) {                 // the immutable four and TYPE never change
+    uint b = WB;
+    // masked on the way in, so a stray high bit can never reach the neighbour
+    scratch[b + 0u] = (C_AX & 0xFFFFu) | (C_CX << 16u);
+    scratch[b + 1u] = (C_DX & 0xFFFFu) | (C_BX << 16u);
+    scratch[b + 2u] = (C_SP & 0xFFFFu) | (C_BP << 16u);
+    scratch[b + 3u] = (C_SI & 0xFFFFu) | (C_DI << 16u);
+    scratch[b + 4u] = (C_ES & 0xFFFFu) | (C_CS << 16u);
+    scratch[b + 5u] = (C_SS & 0xFFFFu) | (C_DS << 16u);
+    scratch[b + SL_IP]  = C_IP;  scratch[b + SL_FL]  = C_FL;
+    scratch[b + SL_EN]  = C_EN;  scratch[b + SL_RPT] = C_RPT;
+    scratch[b + SL_RPM] = C_RPM; scratch[b + SL_RPI] = C_RPI;
+}
+
+// ============================================================================
+//  java.util.Random  (exact)
+// ============================================================================
+void rngSetSeed(int64_t s) { g_rng = uint64_t(s ^ 0x5DEECE66DL) & 0xFFFFFFFFFFFFUL; }
+int  rngNext(int bits) {
+    g_rng = (g_rng * 0x5DEECE66DUL + 0xBUL) & 0xFFFFFFFFFFFFUL;
+    return int(g_rng >> uint64_t(48 - bits));
+}
+int rngNextInt(int bound) {
+    int u = rngNext(31);
+    if ((bound & (bound - 1)) == 0) return int((int64_t(bound) * int64_t(u)) >> 31);
+    int r = u % bound;
+    while ((u - r) > (2147483647 - (bound - 1))) { u = rngNext(31); r = u % bound; }
+    return r;
+}
+
+// ============================================================================
+//  Flags
+// ============================================================================
+bool gf(uint w, uint m) { return (rFL & m) != 0u; }
+void sfl(uint w, uint m, bool b) { rFL = (b ? (rFL | m) : (rFL & ~m)) & 0xFFFFu; }
+bool getCF(uint w){ return gf(w, FL_CF); }  bool getPF(uint w){ return gf(w, FL_PF); }
+bool getZF(uint w){ return gf(w, FL_ZF); }  bool getSF(uint w){ return gf(w, FL_SF); }
+bool getOF(uint w){ return gf(w, FL_OF); }  bool getDF(uint w){ return gf(w, FL_DF); }
+void setCF(uint w, bool b){ sfl(w, FL_CF, b); }
+void setOF(uint w, bool b){ sfl(w, FL_OF, b); }
+void setZF(uint w, bool b){ sfl(w, FL_ZF, b); }
+
+bool parityEven(uint x) {
+    x &= 0xFFu;
+    x ^= x >> 4u; x ^= x >> 2u; x ^= x >> 1u;
+    return (x & 1u) == 0u;
+}
+
+// ============================================================================
+//  Registers  (array-indexed; RegisterIndexingDecoder without the switch)
+// ============================================================================
+// Selects, not memory. A ModRM field is a dynamic index, and a dynamically
+// indexed array would be spilled to local memory by the driver -- so the eight
+// registers stay as eight scalars and the index picks between them with
+// arithmetic, which on a GPU is very nearly free next to a load.
+uint gpr(uint i) {
+    uint lo = (i < 2u) ? ((i == 0u) ? C_AX : C_CX) : ((i == 2u) ? C_DX : C_BX);
+    uint hi = (i < 6u) ? ((i == 4u) ? C_SP : C_BP) : ((i == 6u) ? C_SI : C_DI);
+    return (i < 4u) ? lo : hi;
+}
+void setgpr(uint i, uint v) {
+    C_AX = (i == 0u) ? v : C_AX;   C_CX = (i == 1u) ? v : C_CX;
+    C_DX = (i == 2u) ? v : C_DX;   C_BX = (i == 3u) ? v : C_BX;
+    C_SP = (i == 4u) ? v : C_SP;   C_BP = (i == 5u) ? v : C_BP;
+    C_SI = (i == 6u) ? v : C_SI;   C_DI = (i == 7u) ? v : C_DI;
+}
+uint r16(uint w, uint i)             { return gpr(i & 7u) & 0xFFFFu; }
+void setr16(uint w, uint i, uint v)   { setgpr(i & 7u, v & 0xFFFFu); }
+uint r8(uint w, uint i) {
+    uint x = gpr(i & 3u);
+    return ((i < 4u) ? x : (x >> 8u)) & 0xFFu;
+}
+void setr8(uint w, uint i, uint v) {
+    uint j = i & 3u;
+    uint x = gpr(j);
+    uint nv = (i < 4u) ? ((x & 0xFF00u) | (v & 0xFFu))
+                       : ((x & 0x00FFu) | ((v & 0xFFu) << 8u));
+    setgpr(j, nv);
+}
+uint sreg(uint w, uint i) {
+    uint j = i & 3u;
+    return ((j < 2u) ? ((j == 0u) ? C_ES : C_CS) : ((j == 2u) ? C_SS : C_DS)) & 0xFFFFu;
+}
+void setsreg(uint w, uint i, uint v) {
+    uint j = i & 3u; v &= 0xFFFFu;
+    C_ES = (j == 0u) ? v : C_ES;   C_CS = (j == 1u) ? v : C_CS;
+    C_SS = (j == 2u) ? v : C_SS;   C_DS = (j == 3u) ? v : C_DS;
+}
+
+// ============================================================================
+//  Memory  (exact RealModeAddress semantics)
+// ============================================================================
+uint linAddr(uint seg, uint off) {
+    return (((seg & 0xFFFFu) * 16u) + (off & 0xFFFFu)) & 0xFFFFFu;
+}
+bool canRW(uint w, uint lin) {
+    // The three windows are disjoint, so this is three independent range tests
+    // and no branching. The arena goes first: nearly every access lands there.
+    return ((lin - ARENA_LIN_LO) <= (ARENA_LIN_HI - ARENA_LIN_LO))
+        || ((lin - C_STKLO)      <= (C_STKHI - C_STKLO))
+        || ((lin - C_SHRLO)      <= (C_SHRHI - C_SHRLO));
+}
+bool canExec(uint lin) { return lin >= ARENA_LIN_LO && lin <= ARENA_LIN_HI; }
+
+uint rawGet8(uint lin) {
+    uint rel = lin - LIN_BASE;
+    return (arena[g_base + (rel >> 2)] >> ((rel & 3u) * 8u)) & 0xFFu;
+}
+void rawSet8(uint lin, uint val) {
+    uint rel = lin - LIN_BASE;
+    uint idx = g_base + (rel >> 2);
+    uint sh  = (rel & 3u) * 8u;
+    arena[idx] = (arena[idx] & ~(0xFFu << sh)) | ((val & 0xFFu) << sh);
+}
+
+uint memRead8(uint w, uint seg, uint off) {
+    if (g_fault) return 0u;
+    uint lin = linAddr(seg, off);
+    if (!canRW(w, lin)) { g_fault = true; g_faultReason = DR_MEM; return 0u; }
+    return rawGet8(lin);
+}
+void memWrite8(uint w, uint seg, uint off, uint val) {
+    if (g_fault) return;
+    uint lin = linAddr(seg, off);
+    if (!canRW(w, lin)) { g_fault = true; g_faultReason = DR_MEM; return; }
+    rawSet8(lin, val);
+}
+// A word is two byte accesses whose offsets wrap inside the segment, which is
+// what the engine's base class does. When the pair neither wraps, nor straddles
+// a 32-bit word, nor leaves the allowed windows -- the overwhelmingly common
+// case -- it is one access to the arena buffer instead of two, and for a write
+// that turns two read-modify-writes into one.
+uint memRead16(uint w, uint seg, uint off) {
+    if (g_fault) return 0u;
+    if (off != 0xFFFFu) {
+        uint lin = linAddr(seg, off);
+        if ((lin & 3u) != 3u && canRW(w, lin) && canRW(w, lin + 1u)) {
+            uint rel = lin - LIN_BASE;
+            return (arena[g_base + (rel >> 2)] >> ((rel & 3u) * 8u)) & 0xFFFFu;
+        }
+    }
+    uint lo = memRead8(w, seg, off);
+    uint hi = memRead8(w, seg, (off + 1u) & 0xFFFFu);
+    return lo | (hi << 8u);
+}
+void memWrite16(uint w, uint seg, uint off, uint val) {
+    if (g_fault) return;
+    if (off != 0xFFFFu) {
+        uint lin = linAddr(seg, off);
+        if ((lin & 3u) != 3u && canRW(w, lin) && canRW(w, lin + 1u)) {
+            uint rel = lin - LIN_BASE;
+            uint idx = g_base + (rel >> 2);
+            uint sh  = (rel & 3u) * 8u;
+            arena[idx] = (arena[idx] & ~(0xFFFFu << sh)) | ((val & 0xFFFFu) << sh);
+            return;
+        }
+    }
+    memWrite8(w, seg, off,                  val & 0xFFu);
+    memWrite8(w, seg, (off + 1u) & 0xFFFFu, (val >> 8u) & 0xFFu);
+}
+
+// Both halves of a far pointer -- offset then segment -- returned as (seg, off).
+//
+// This is the tail of CALL FAR through memory, which is ~68% of every opcode
+// the engine executes, and the shader is latency-bound, so how these two loads
+// are issued matters more than how many there are. Going through memRead16
+// twice put a fault check between them, and that made the second load wait for
+// the first to come back. Here the four bytes are one 32-bit load when they
+// share a word (a 4-aligned pointer), and otherwise two loads with nothing
+// between them to serialise the pair.
+uvec2 readFarPtr(uint w, uint seg, uint off) {
+    if (g_fault) return uvec2(0u);
+    uint lo = linAddr(seg, off);
+    if ((off & 0xFFFCu) == off && off <= 0xFFFBu && canRW(w, lo) && canRW(w, lo + 3u)) {
+        uint word = arena[g_base + ((lo - LIN_BASE) >> 2)];
+        return uvec2((word >> 16u) & 0xFFFFu, word & 0xFFFFu);
+    }
+    uint ip = memRead16(w, seg,  off);
+    uint cs = memRead16(w, seg, (off + 2u) & 0xFFFFu);
+    return uvec2(cs, ip);
+}
+
+uint fetch8(uint w) {
+    uint off = rIP;
+    rIP = (rIP + 1u) & 0xFFFFu;
+    if (g_fault) return 0u;
+    uint lin = linAddr(rCS, off);
+    // the engine treats executing outside the arena as a MEMORY fault, not a CPU
+    // one -- readExecuteByte throws MemoryException
+    if (!canExec(lin)) { g_fault = true; g_faultReason = DR_MEM; return 0u; }
+    return rawGet8(lin);
+}
+uint fetch16(uint w) {
+    uint off = rIP;
+    rIP = (rIP + 2u) & 0xFFFFu;
+    if (g_fault) return 0u;
+    uint l0 = linAddr(rCS, off);
+    if (off != 0xFFFFu && (l0 & 3u) != 3u && canExec(l0)) {   // both bytes, one word
+        uint rel = l0 - LIN_BASE;
+        return (arena[g_base + (rel >> 2)] >> ((rel & 3u) * 8u)) & 0xFFFFu;
+    }
+    uint l1 = linAddr(rCS, (off + 1u) & 0xFFFFu);
+    if (!canExec(l0) || !canExec(l1)) { g_fault = true; g_faultReason = DR_MEM; return 0u; }
+    return rawGet8(l0) | (rawGet8(l1) << 8u);
+}
+int fetchS8 (uint w) { uint b = fetch8(w);  return int(b ^ 0x80u)   - 0x80;   }
+int fetchS16(uint w) { uint v = fetch16(w); return int(v ^ 0x8000u) - 0x8000; }
+
+// ============================================================================
+//  ALU core  (OF & AF stay stale, as in the engine)
+// ============================================================================
+// 0 ADD, 1 OR, 2 ADC, 3 SBB, 4 AND, 5 SUB, 6 XOR, 7 CMP.
+//
+// The arithmetic result and the logic result are both computed and one is
+// selected. The eight-way branch this replaces sat on the path of every
+// arithmetic instruction in the engine, and the 8/16-bit split doubled it; the
+// widths differ only by a mask and a sign bit, so they share one body now.
+// The four flags are one write of the flag word rather than four
+// read-modify-writes.
+uint aluCompute(uint w, uint aluOp, uint a, uint b, bool w8) {
+    int  c    = getCF(w) ? 1 : 0;
+    uint mask = w8 ? 0xFFu : 0xFFFFu;
+    a &= mask; b &= mask;
+
+    bool isSub = (aluOp == 3u) || (aluOp == 5u) || (aluOp == 7u);
+    bool isLog = (aluOp == 1u) || (aluOp == 4u) || (aluOp == 6u);
+    int  cin   = (aluOp == 2u) ? c : ((aluOp == 3u) ? -c : 0);
+    int  ari   = isSub ? (int(a) - int(b) + cin) : (int(a) + int(b) + cin);
+    uint lg    = (aluOp == 1u) ? (a | b) : ((aluOp == 4u) ? (a & b) : (a ^ b));
+
+    uint resu  = uint(isLog ? int(lg) : ari);
+    uint carry = w8 ? (resu & 0xFF00u) : (resu & 0xFFFF0000u);
+    uint low   = resu & mask;
+    uint signb = w8 ? 0x80u : 0x8000u;
+
+    uint f = C_FL & ~(FL_CF | FL_PF | FL_SF | FL_ZF);
+    if (carry != 0u)             f |= FL_CF;
+    if (parityEven(low & 0xFFu)) f |= FL_PF;
+    if ((low & signb) != 0u)     f |= FL_SF;
+    if (low == 0u)               f |= FL_ZF;
+    C_FL = f & 0xFFFFu;
+    return low;
+}
+uint inc8v (uint w, uint v) { bool c = getCF(w); uint r = aluCompute(w, 0u, v, 1u, true ); setCF(w, c); return r; }
+uint dec8v (uint w, uint v) { bool c = getCF(w); uint r = aluCompute(w, 5u, v, 1u, true ); setCF(w, c); return r; }
+uint inc16v(uint w, uint v) { bool c = getCF(w); uint r = aluCompute(w, 0u, v, 1u, false); setCF(w, c); return r; }
+uint dec16v(uint w, uint v) { bool c = getCF(w); uint r = aluCompute(w, 5u, v, 1u, false); setCF(w, c); return r; }
+
+// ============================================================================
+//  Stack + control transfer helpers
+// ============================================================================
+void pushW(uint w, uint val) {
+    rSP = (rSP - 2u) & 0xFFFFu;
+    memWrite16(w, rSS, rSP, val);
+}
+uint popW(uint w) {
+    uint v = memRead16(w, rSS, rSP);
+    rSP = (rSP + 2u) & 0xFFFFu;
+    return v;
+}
+void callNear(uint w, uint target) { pushW(w, rIP); rIP = target & 0xFFFFu; }
+void callFar(uint w, uint seg, uint off) { pushW(w, rCS); rCS = seg & 0xFFFFu; callNear(w, off); }
+
+// ============================================================================
+//  String primitives
+// ============================================================================
+void movsb(uint w) {
+    uint v = memRead8(w, rDS, rSI);
+    memWrite8(w, rES, rDI, v);
+    uint d = getDF(w) ? 0xFFFFu : 1u;
+    rSI = (rSI + d) & 0xFFFFu; rDI = (rDI + d) & 0xFFFFu;
+}
+void movsw(uint w) {
+    uint v = memRead16(w, rDS, rSI);
+    memWrite16(w, rES, rDI, v);
+    uint d = getDF(w) ? 0xFFFEu : 2u;
+    rSI = (rSI + d) & 0xFFFFu; rDI = (rDI + d) & 0xFFFFu;
+}
+void cmpsb(uint w) {
+    uint a = memRead8(w, rDS, rSI);
+    uint b = memRead8(w, rES, rDI);
+    aluCompute(w, 5u, a, b, true);
+    uint d = getDF(w) ? 0xFFFFu : 1u;
+    rSI = (rSI + d) & 0xFFFFu; rDI = (rDI + d) & 0xFFFFu;
+}
+void cmpsw(uint w) {
+    uint a = memRead16(w, rDS, rSI);
+    uint b = memRead16(w, rES, rDI);
+    aluCompute(w, 5u, a, b, false);
+    uint d = getDF(w) ? 0xFFFEu : 2u;
+    rSI = (rSI + d) & 0xFFFFu; rDI = (rDI + d) & 0xFFFFu;
+}
+void stosb(uint w) {
+    memWrite8(w, rES, rDI, rAX & 0xFFu);
+    uint d = getDF(w) ? 0xFFFFu : 1u;
+    rDI = (rDI + d) & 0xFFFFu;
+}
+void stosw(uint w) {
+    memWrite16(w, rES, rDI, rAX & 0xFFFFu);
+    uint d = getDF(w) ? 0xFFFEu : 2u;
+    rDI = (rDI + d) & 0xFFFFu;
+}
+void lodsb(uint w) {
+    uint v = memRead8(w, rDS, rSI);
+    setr8(w, 0u, v);
+    uint d = getDF(w) ? 0xFFFFu : 1u;
+    rSI = (rSI + d) & 0xFFFFu;
+}
+void lodsw(uint w) {
+    uint v = memRead16(w, rDS, rSI);
+    rAX = v & 0xFFFFu;
+    uint d = getDF(w) ? 0xFFFEu : 2u;
+    rSI = (rSI + d) & 0xFFFFu;
+}
+void scasb(uint w) {
+    uint b = memRead8(w, rES, rDI);
+    aluCompute(w, 5u, rAX & 0xFFu, b, true);
+    uint d = getDF(w) ? 0xFFFFu : 1u;
+    rDI = (rDI + d) & 0xFFFFu;
+}
+void scasw(uint w) {
+    uint b = memRead16(w, rES, rDI);
+    aluCompute(w, 5u, rAX & 0xFFFFu, b, false);
+    uint d = getDF(w) ? 0xFFFEu : 2u;
+    rDI = (rDI + d) & 0xFFFFu;
+}
+void stosdw(uint w) {                       // virtual opcode used by INT 0x86
+    memWrite16(w, rES, rDI,                 rAX & 0xFFFFu);
+    memWrite16(w, rES, (rDI + 2u) & 0xFFFFu, rDX & 0xFFFFu);
+    uint d = getDF(w) ? 0xFFFCu : 4u;
+    rDI = (rDI + d) & 0xFFFFu;
+}
+
+// ============================================================================
+//  ModRM decoder  (IndirectAddressingDecoder)
+// ============================================================================
+void decodeModRM(uint w) {
+    uint mb = fetch8(w);
+    md_mode  = (mb >> 6u) & 3u;
+    md_reg   = (mb >> 3u) & 7u;
+    md_rm    =  mb        & 7u;
+    md_isReg = (md_mode == 3u);
+    if (md_isReg) return;
+
+    // Selects, not an eight-way branch. Every operand address goes through
+    // here, and both sides of each select are register reads that cost less
+    // than the branch would -- a select has no divergence, a branch does.
+    //
+    //   rm 0..3 : (BX|BP) + (SI|DI)      SS iff the base is BP
+    //   rm 4..7 : SI, DI, BP, BX         SS iff the base is BP
+    // The one case that cannot be a select is rm 6 with mode 0, which is a
+    // direct 16-bit displacement and has to fetch two more bytes.
+    uint rm = md_rm;
+    uint b03 = ((rm < 2u) ? rBX : rBP) + (((rm & 1u) != 0u) ? rDI : rSI);
+    uint b47 = (rm == 4u) ? rSI : ((rm == 5u) ? rDI : ((rm == 6u) ? rBP : rBX));
+    bool bpBased = (rm == 2u) || (rm == 3u) || (rm == 6u);
+    uint base = (rm < 4u) ? b03 : b47;
+    uint seg  = bpBased ? rSS : rDS;
+
+    if (rm == 6u && md_mode == 0u) { base = fetch16(w); seg = rDS; }
+
+    // mode 0 is 97% of all operands, so it pays nothing for the other two
+    int disp = 0;
+    if (md_mode != 0u) disp = (md_mode == 1u) ? fetchS8(w) : fetchS16(w);
+
+    md_off = (base + uint(disp)) & 0xFFFFu;
+    md_seg = seg & 0xFFFFu;
+}
+uint mrmMem8(uint w)           { return md_isReg ? r8(w, md_rm)  : memRead8(w, md_seg, md_off); }
+void mrmSetMem8(uint w, uint v){ if (md_isReg) setr8(w, md_rm, v);  else memWrite8(w, md_seg, md_off, v); }
+uint mrmMem16(uint w)          { return md_isReg ? r16(w, md_rm) : memRead16(w, md_seg, md_off); }
+void mrmSetMem16(uint w, uint v){ if (md_isReg) setr16(w, md_rm, v); else memWrite16(w, md_seg, md_off, v); }
+
+// ============================================================================
+//  Opcode groups 0x00 - 0x8F
+// ============================================================================
+void doALUBlock(uint w, uint op) {          // 0x00 - 0x3F
+    uint low3 = op & 7u;
+    uint grp  = (op >> 3u) & 7u;            // 0..7 = ADD OR ADC SBB AND SUB XOR CMP
+
+    if (low3 <= 5u) {
+        uint aluOp = grp;
+        bool isCmp = (aluOp == 7u);
+        if (low3 == 0u) {
+            decodeModRM(w); if (g_fault) return;
+            uint a = mrmMem8(w); uint b = r8(w, md_reg); if (g_fault) return;
+            uint r = aluCompute(w, aluOp, a, b, true);
+            if (!isCmp) mrmSetMem8(w, r);
+        } else if (low3 == 1u) {
+            decodeModRM(w); if (g_fault) return;
+            uint a = mrmMem16(w); uint b = r16(w, md_reg); if (g_fault) return;
+            uint r = aluCompute(w, aluOp, a, b, false);
+            if (!isCmp) mrmSetMem16(w, r);
+        } else if (low3 == 2u) {
+            decodeModRM(w); if (g_fault) return;
+            uint a = r8(w, md_reg); uint b = mrmMem8(w); if (g_fault) return;
+            uint r = aluCompute(w, aluOp, a, b, true);
+            if (!isCmp) setr8(w, md_reg, r);
+        } else if (low3 == 3u) {
+            decodeModRM(w); if (g_fault) return;
+            uint a = r16(w, md_reg); uint b = mrmMem16(w); if (g_fault) return;
+            uint r = aluCompute(w, aluOp, a, b, false);
+            if (!isCmp) setr16(w, md_reg, r);
+        } else if (low3 == 4u) {
+            uint b = fetch8(w); if (g_fault) return;
+            uint r = aluCompute(w, aluOp, rAX & 0xFFu, b, true);
+            if (!isCmp) setr8(w, 0u, r);
+        } else {
+            uint b = fetch16(w); if (g_fault) return;
+            uint r = aluCompute(w, aluOp, rAX & 0xFFFFu, b, false);
+            if (!isCmp) setr16(w, 0u, r);
+        }
+        return;
+    }
+    if (low3 == 6u) {                        // PUSH sreg  (0x06/0x0E/0x16/0x1E)
+        if (grp < 4u) pushW(w, sreg(w, grp));
+        else g_fault = true;                 // 0x26/2E/36/3E seg-override prefix (unimpl)
+        return;
+    }
+    // low3 == 7: POP sreg (0x07/0x17/0x1F); 0x0F invalid; 0x27/2F/37/3F DAA-family (unimpl)
+    if (grp == 0u || grp == 2u || grp == 3u) setsreg(w, grp, popW(w));
+    else                                     g_fault = true;
+}
+
+void doGrp1(uint w, uint op) {               // 0x80 - 0x83  <?> rm, imm
+    decodeModRM(w); if (g_fault) return;
+    uint aluOp = md_reg;
+    bool isCmp = (aluOp == 7u);
+    if (op == 0x80u || op == 0x82u) {
+        uint a = mrmMem8(w); if (g_fault) return;
+        uint b = fetch8(w);  if (g_fault) return;
+        uint r = aluCompute(w, aluOp, a, b, true);
+        if (!isCmp) mrmSetMem8(w, r);
+    } else if (op == 0x81u) {
+        uint a = mrmMem16(w); if (g_fault) return;
+        uint b = fetch16(w);  if (g_fault) return;
+        uint r = aluCompute(w, aluOp, a, b, false);
+        if (!isCmp) mrmSetMem16(w, r);
+    } else {                                  // 0x83: sign-extended imm8
+        uint a = mrmMem16(w); if (g_fault) return;
+        int  b = fetchS8(w);  if (g_fault) return;
+        uint r = aluCompute(w, aluOp, a, uint(b) & 0xFFFFu, false);
+        if (!isCmp) mrmSetMem16(w, r);
+    }
+}
+
+void doMovGrp(uint w, uint op) {              // 0x84 - 0x8F
+    if (op == 0x84u || op == 0x85u) {         // TEST rm, reg
+        decodeModRM(w); if (g_fault) return;
+        bool w8 = (op == 0x84u);
+        uint a = w8 ? r8(w, md_reg)  : r16(w, md_reg);
+        uint b = w8 ? mrmMem8(w)     : mrmMem16(w);
+        if (g_fault) return;
+        aluCompute(w, 4u, a, b, w8);
+        return;
+    }
+    if (op == 0x86u || op == 0x87u) {         // XCHG rm, reg
+        decodeModRM(w); if (g_fault) return;
+        if (op == 0x86u) {
+            uint t = r8(w, md_reg);
+            uint m = mrmMem8(w); if (g_fault) return;
+            setr8(w, md_reg, m);
+            mrmSetMem8(w, t);
+        } else {
+            uint t = r16(w, md_reg);
+            uint m = mrmMem16(w); if (g_fault) return;
+            setr16(w, md_reg, m);
+            mrmSetMem16(w, t);
+        }
+        return;
+    }
+    if (op >= 0x88u && op <= 0x8Bu) {          // MOV
+        decodeModRM(w); if (g_fault) return;
+        bool w8    = ((op & 1u) == 0u);
+        bool toReg = ((op & 2u) != 0u);
+        if (w8) {
+            if (toReg) { uint v = mrmMem8(w); if (g_fault) return; setr8(w, md_reg, v); }
+            else       { mrmSetMem8(w, r8(w, md_reg)); }
+        } else {
+            if (toReg) { uint v = mrmMem16(w); if (g_fault) return; setr16(w, md_reg, v); }
+            else       { mrmSetMem16(w, r16(w, md_reg)); }
+        }
+        return;
+    }
+    if (op == 0x8Cu) {                          // MOV rm16, sreg
+        decodeModRM(w); if (g_fault) return;
+        mrmSetMem16(w, sreg(w, md_reg));
+        return;
+    }
+    if (op == 0x8Du) {                          // LEA r16, m
+        decodeModRM(w); if (g_fault) return;
+        if (md_isReg) { g_fault = true; return; }
+        setr16(w, md_reg, md_off);
+        return;
+    }
+    if (op == 0x8Eu) {                          // MOV sreg, rm16
+        decodeModRM(w); if (g_fault) return;
+        uint v = mrmMem16(w); if (g_fault) return;
+        setsreg(w, md_reg, v);
+        return;
+    }
+    // 0x8F POP rm16  (reg field ignored)
+    decodeModRM(w); if (g_fault) return;
+    uint v = popW(w); if (g_fault) return;
+    mrmSetMem16(w, v);
+}
+
+bool jccCond(uint w, uint c) {
+    bool OF = getOF(w), CF = getCF(w), ZF = getZF(w), SF = getSF(w), PF = getPF(w);
+    if (c == 0u)  return OF;
+    if (c == 1u)  return !OF;
+    if (c == 2u)  return CF;
+    if (c == 3u)  return !CF;
+    if (c == 4u)  return ZF;
+    if (c == 5u)  return !ZF;
+    if (c == 6u)  return CF || ZF;
+    if (c == 7u)  return !CF && !ZF;
+    if (c == 8u)  return SF;
+    if (c == 9u)  return !SF;
+    if (c == 10u) return PF;
+    if (c == 11u) return !PF;
+    if (c == 12u) return SF != OF;
+    if (c == 13u) return SF == OF;
+    if (c == 14u) return ZF || (SF != OF);
+    return !ZF && (SF == OF);
+}
+
+// ============================================================================
+//  INT 0x86 / INT 0x87 continuation (drained inside the turn)
+// ============================================================================
+void repeatStep(uint w) {
+    if (C_RPM == REP_INT86) {
+        stosdw(w);
+        if (C_RPT > 0u) C_RPT -= 1u;
+        if (C_RPT == 0u) C_RPM = REP_NONE;
+        return;
+    }
+    uint i = C_RPI;
+    uint diff = getDF(w) ? (0u - i) : i;
+    uint a1 = (rDI + diff) & 0xFFFFu;
+    uint v1 = memRead16(w, rES, a1);
+    if (!g_fault && v1 == (rAX & 0xFFFFu)) {
+        uint a2 = (rDI + diff + 2u) & 0xFFFFu;
+        uint v2 = memRead16(w, rES, a2);
+        if (!g_fault && v2 == (rDX & 0xFFFFu)) {
+            memWrite16(w, rES, a1, rBX & 0xFFFFu);
+            memWrite16(w, rES, a2, rCX & 0xFFFFu);
+            C_RPT = 0u; C_RPM = REP_NONE;
+            return;
+        }
+    }
+    C_RPI += 1u;
+    if (C_RPT > 0u) C_RPT -= 1u;
+    if (C_RPT == 0u) C_RPM = REP_NONE;
+}
+
+// ============================================================================
+//  Shift / rotate group  (0xD0 - 0xD3)
+//  reg field: 0 ROL 1 ROR 2 RCL 3 RCR 4 SHL 5 SHR 6 invalid 7 SAR
+//  Replicated asymmetry -- ops that also set P/S/Z beyond CF/OF:
+//    ROL/ROR/RCL: 16-bit only.   RCR: never.   SHL/SHR/SAR: 8-bit full, 16-bit ZF only.
+// ============================================================================
+void ncoFull(uint w, uint val, bool w8) {
+    if (w8) { sfl(w, FL_PF, parityEven(val));        sfl(w, FL_SF, (val & 0x80u)   != 0u); sfl(w, FL_ZF, val == 0u); }
+    else    { sfl(w, FL_PF, parityEven(val & 0xFFu)); sfl(w, FL_SF, (val & 0x8000u) != 0u); sfl(w, FL_ZF, val == 0u); }
+}
+void doShiftRot(uint w, uint op) {
+    decodeModRM(w); if (g_fault) return;
+    uint sub = md_reg;
+    if (sub == 6u) { g_fault = true; return; }
+    bool w8 = (op == 0xD0u || op == 0xD2u);
+    uint count = (op == 0xD0u || op == 0xD1u) ? 1u : (rCX & 0xFFu);
+    count &= 0x1Fu;
+    if (count == 0u) return;
+
+    uint val  = w8 ? mrmMem8(w) : mrmMem16(w);
+    if (g_fault) return;
+    uint bits = w8 ? 8u : 16u;
+    uint msb  = bits - 1u;
+    uint mask = (bits == 8u) ? 0xFFu : 0xFFFFu;
+
+    bool doFull  = (w8 && sub >= 4u) || (!w8 && sub <= 2u);
+    bool doZonly = (!w8 && sub >= 4u);
+
+    for (uint k = 0u; k < count; ++k) {
+        uint m1, m2, lsb, cf, sgn;
+        if (sub == 0u) {
+            m1 = (val >> msb) & 1u; m2 = (val >> (msb - 1u)) & 1u;
+            val = ((val << 1u) | m1) & mask;
+            setCF(w, m1 != 0u); setOF(w, m1 != m2);
+        } else if (sub == 1u) {
+            lsb = val & 1u;
+            val = ((val >> 1u) | (lsb << msb)) & mask;
+            m1 = (val >> msb) & 1u; m2 = (val >> (msb - 1u)) & 1u;
+            setCF(w, lsb != 0u); setOF(w, m1 != m2);
+        } else if (sub == 2u) {
+            m1 = (val >> msb) & 1u; m2 = (val >> (msb - 1u)) & 1u;
+            cf = getCF(w) ? 1u : 0u;
+            val = ((val << 1u) | cf) & mask;
+            setCF(w, m1 != 0u); setOF(w, m1 != m2);
+        } else if (sub == 3u) {
+            lsb = val & 1u;
+            cf = getCF(w) ? 1u : 0u;
+            val = ((val >> 1u) | (cf << msb)) & mask;
+            m1 = (val >> msb) & 1u; m2 = (val >> (msb - 1u)) & 1u;
+            setCF(w, lsb != 0u); setOF(w, m1 != m2);
+        } else if (sub == 4u) {
+            m1 = (val >> msb) & 1u; m2 = (val >> (msb - 1u)) & 1u;
+            val = (val << 1u) & mask;
+            setCF(w, m1 != 0u); setOF(w, m1 != m2);
+        } else if (sub == 5u) {
+            lsb = val & 1u;
+            val = (val >> 1u) & mask;
+            m1 = (val >> msb) & 1u; m2 = (val >> (msb - 1u)) & 1u;
+            setCF(w, lsb != 0u); setOF(w, m1 != m2);
+        } else {                              // SAR
+            lsb = val & 1u;
+            sgn = (val >> msb) & 1u;
+            val = ((val >> 1u) | (sgn << msb)) & mask;
+            m1 = (val >> msb) & 1u; m2 = (val >> (msb - 1u)) & 1u;
+            setCF(w, lsb != 0u); setOF(w, m1 != m2);
+        }
+        if      (doFull)  ncoFull(w, val, w8);
+        else if (doZonly) sfl(w, FL_ZF, val == 0u);
+    }
+    if (w8) mrmSetMem8(w, val); else mrmSetMem16(w, val);
+}
+
+// ============================================================================
+//  Group 3  (0xF6 rm8 / 0xF7 rm16):  TEST/NOT/NEG/MUL/DIV
+// ============================================================================
+void doGrp3(uint w, uint op) {
+    decodeModRM(w); if (g_fault) return;
+    uint sub = md_reg;
+    bool w8 = (op == 0xF6u);
+    if (sub == 1u || sub == 5u || sub == 7u) { g_fault = true; return; }
+
+    if (sub == 0u) {
+        uint a = w8 ? mrmMem8(w) : mrmMem16(w); if (g_fault) return;
+        uint b = w8 ? fetch8(w)  : fetch16(w);  if (g_fault) return;
+        aluCompute(w, 4u, a, b, w8);
+        return;
+    }
+    if (sub == 2u) {
+        uint v = w8 ? mrmMem8(w) : mrmMem16(w); if (g_fault) return;
+        v = w8 ? ((~v) & 0xFFu) : ((~v) & 0xFFFFu);
+        if (w8) mrmSetMem8(w, v); else mrmSetMem16(w, v);
+        return;
+    }
+    if (sub == 3u) {                              // NEG
+        uint v = w8 ? mrmMem8(w) : mrmMem16(w); if (g_fault) return;
+        uint r = aluCompute(w, 5u, 0u, v, w8);
+        if (w8) mrmSetMem8(w, r); else mrmSetMem16(w, r);
+        return;
+    }
+    if (sub == 4u) {                              // MUL
+        if (w8) {
+            uint m = mrmMem8(w); if (g_fault) return;
+            uint res = (rAX & 0xFFu) * m;
+            setr8(w, 4u, (res >> 8u) & 0xFFu);
+            setr8(w, 0u,  res        & 0xFFu);
+            bool nz = ((rAX >> 8u) & 0xFFu) != 0u;
+            setOF(w, nz); setCF(w, nz);
+        } else {
+            uint m = mrmMem16(w); if (g_fault) return;
+            uint res = (rAX & 0xFFFFu) * (m & 0xFFFFu);
+            rDX = (res >> 16u) & 0xFFFFu;
+            rAX =  res         & 0xFFFFu;
+            bool nz = (C_DX & 0xFFFFu) != 0u;   // DX (engine re-reads it after the store)
+            setOF(w, nz); setCF(w, nz);
+        }
+        return;
+    }
+    // sub == 6: DIV  (replicates the engine's overflow-check casts)
+    if (w8) {
+        uint m = mrmMem8(w); if (g_fault) return;
+        if (m == 0u) { g_fault = true; return; }
+        uint tmp = rAX & 0xFFFFu;
+        uint q   = tmp / m;
+        int  sq  = (q >= 0x8000u) ? (int(q) - 0x10000) : int(q);
+        if (sq > 0xFF) { g_fault = true; return; }
+        setr8(w, 0u,  q        & 0xFFu);
+        setr8(w, 4u, (tmp % m) & 0xFFu);
+    } else {
+        uint m = mrmMem16(w); if (g_fault) return;
+        if (m == 0u) { g_fault = true; return; }
+        uint tmp = ((rDX & 0xFFFFu) << 16u) | (rAX & 0xFFFFu);
+        uint q   = tmp / m;
+        if (int(q) > 0xFFFF) { g_fault = true; return; }
+        rAX =  q        & 0xFFFFu;
+        rDX = (tmp % m) & 0xFFFFu;
+    }
+}
+
+// ============================================================================
+//  Groups 4 / 5  (0xFE rm8 / 0xFF rm16)
+// ============================================================================
+void doGrp4(uint w) {                             // 0xFE
+    decodeModRM(w); if (g_fault) return;
+    uint sub = md_reg;
+    if (sub == 0u)      { uint v = mrmMem8(w); if (g_fault) return; mrmSetMem8(w, inc8v(w, v)); }
+    else if (sub == 1u) { uint v = mrmMem8(w); if (g_fault) return; mrmSetMem8(w, dec8v(w, v)); }
+    else g_fault = true;
+}
+void doGrp5(uint w) {                             // 0xFF
+    decodeModRM(w); if (g_fault) return;
+    uint sub = md_reg;
+    // /3 (CALL FAR through memory) is 98% of every 0xFF, which makes it about
+    // two thirds of every instruction the engine runs. It goes first.
+    if (sub == 3u) {
+        if (md_isReg) { g_fault = true; return; }
+        uvec2 p = readFarPtr(w, md_seg, md_off);
+        if (g_fault) return;
+        callFar(w, p.x, p.y);           // (cs, ip)
+        return;
+    }
+    if (sub == 0u)      { uint v = mrmMem16(w); if (g_fault) return; mrmSetMem16(w, inc16v(w, v)); }
+    else if (sub == 1u) { uint v = mrmMem16(w); if (g_fault) return; mrmSetMem16(w, dec16v(w, v)); }
+    else if (sub == 2u) { uint t = mrmMem16(w); if (g_fault) return; callNear(w, t); }
+    else if (sub == 4u) { uint t = mrmMem16(w); if (g_fault) return; rIP = t & 0xFFFFu; }
+    else if (sub == 5u) {
+        if (md_isReg) { g_fault = true; return; }
+        uint nip = memRead16(w, md_seg,  md_off);
+        uint ncs = memRead16(w, md_seg, (md_off + 2u) & 0xFFFFu);
+        if (g_fault) return;
+        rCS = ncs & 0xFFFFu; rIP = nip & 0xFFFFu;
+    }
+    else if (sub == 6u) { uint t = mrmMem16(w); if (g_fault) return; pushW(w, t); }
+    else g_fault = true;
+}
+
+// ============================================================================
+//  REP / REPNZ  (0xF3 / 0xF2)  --  one iteration then rewind IP by 2 (engine).
+// ============================================================================
+void doRep(uint w, uint op) {
+    uint nx = fetch8(w); if (g_fault) return;
+    bool repz = (op == 0xF3u);
+    bool done = true;
+    if ((rCX & 0xFFFFu) != 0u) { rCX = (rCX - 1u) & 0xFFFFu; done = false; }
+
+    bool valid = false;
+    if (nx == 0xA6u)      { valid = true; if (!done) { cmpsb(w); done = repz ? !getZF(w) : getZF(w); } }
+    else if (nx == 0xA7u) { valid = true; if (!done) { cmpsw(w); done = repz ? !getZF(w) : getZF(w); } }
+    else if (nx == 0xAEu) { valid = true; if (!done) { scasb(w); done = repz ? !getZF(w) : getZF(w); } }
+    else if (nx == 0xAFu) { valid = true; if (!done) { scasw(w); done = repz ? !getZF(w) : getZF(w); } }
+    else if (repz) {
+        if      (nx == 0xA4u) { valid = true; if (!done) movsb(w); }
+        else if (nx == 0xA5u) { valid = true; if (!done) movsw(w); }
+        else if (nx == 0xAAu) { valid = true; if (!done) stosb(w); }
+        else if (nx == 0xABu) { valid = true; if (!done) stosw(w); }
+        else if (nx == 0xACu) { valid = true; if (!done) lodsb(w); }
+        else if (nx == 0xADu) { valid = true; if (!done) lodsw(w); }
+    }
+    if (!valid)  { g_fault = true; return; }
+    if (g_fault) return;
+    if (!done) rIP = (rIP - 2u) & 0xFFFFu;
+}
+
+// ============================================================================
+//  Opcode groups 0x90 - 0xFF
+// ============================================================================
+void do9X(uint w, uint op) {
+    if (op < 0x98u) {                             // XCHG r16, AX  (0x90 = NOP)
+        uint idx = op & 7u;
+        uint t = r16(w, idx);
+        setr16(w, idx, rAX & 0xFFFFu);
+        rAX = t & 0xFFFFu;
+        return;
+    }
+    if (op == 0x98u) { setr8(w, 4u, ((rAX & 0x80u)   != 0u) ? 0xFFu   : 0u); return; }   // CBW
+    if (op == 0x99u) { rDX =         ((rAX & 0x8000u) != 0u) ? 0xFFFFu : 0u;  return; }   // CWD
+    if (op == 0x9Au) {
+        uint nip = fetch16(w); if (g_fault) return;
+        uint ncs = fetch16(w); if (g_fault) return;
+        callFar(w, ncs, nip);
+        return;
+    }
+    if (op == 0x9Bu) {                             // NRG  (two consecutive 0x9B)
+        uint b2 = fetch8(w); if (g_fault) return;
+        if (b2 != 0x9Bu) { g_fault = true; return; }
+        uint e = C_EN & 0xFFFFu;
+        if (e < 0xFFFFu) C_EN = e + 1u;
+        return;
+    }
+    if (op == 0x9Cu) { pushW(w, rFL); return; }                    // PUSHF
+    if (op == 0x9Du) { uint v = popW(w); if (g_fault) return; rFL = v & 0xFFFFu; return; } // POPF
+    if (op == 0x9Eu) {                             // SAHF  (engine's sign-extension bug)
+        uint ah = (rAX >> 8u) & 0xFFu;
+        uint f2 = rFL & 0xFF00u;
+        rFL = (((ah & 0x80u) != 0u) ? (0xFF00u | ah) : (f2 | ah)) & 0xFFFFu;
+        return;
+    }
+    setr8(w, 4u, rFL & 0xFFu);                     // 0x9F LAHF
+}
+
+void doAX(uint w, uint op) {
+    if (op == 0xA0u) { uint a = fetch16(w); if (g_fault) return; uint v = memRead8 (w, rDS, a); if (g_fault) return; setr8(w, 0u, v); return; }
+    if (op == 0xA1u) { uint a = fetch16(w); if (g_fault) return; uint v = memRead16(w, rDS, a); if (g_fault) return; rAX = v & 0xFFFFu;  return; }
+    if (op == 0xA2u) { uint a = fetch16(w); if (g_fault) return; memWrite8 (w, rDS, a, rAX & 0xFFu);   return; }
+    if (op == 0xA3u) { uint a = fetch16(w); if (g_fault) return; memWrite16(w, rDS, a, rAX & 0xFFFFu); return; }
+    if (op == 0xA4u) { movsb(w); return; }
+    if (op == 0xA5u) { movsw(w); return; }
+    if (op == 0xA6u) { cmpsb(w); return; }
+    if (op == 0xA7u) { cmpsw(w); return; }
+    if (op == 0xA8u) { uint b = fetch8(w);  if (g_fault) return; aluCompute(w, 4u, rAX & 0xFFu,   b, true ); return; }
+    if (op == 0xA9u) { uint b = fetch16(w); if (g_fault) return; aluCompute(w, 4u, rAX & 0xFFFFu, b, false); return; }
+    if (op == 0xAAu) { stosb(w); return; }
+    if (op == 0xABu) { stosw(w); return; }
+    if (op == 0xACu) { lodsb(w); return; }
+    if (op == 0xADu) { lodsw(w); return; }
+    if (op == 0xAEu) { scasb(w); return; }
+    scasw(w);                                      // 0xAF
+}
+
+void doBX(uint w, uint op) {
+    if (op < 0xB8u) { uint b = fetch8(w);  if (g_fault) return; setr8 (w, op & 7u, b); }
+    else            { uint b = fetch16(w); if (g_fault) return; setr16(w, op & 7u, b); }
+}
+
+void doCX(uint w, uint op) {
+    if (op == 0xC0u || op == 0xC1u || op == 0xC8u || op == 0xC9u) { g_fault = true; return; }
+    if (op == 0xC2u) {                             // RETN imm16
+        uint n  = fetch16(w); if (g_fault) return;
+        uint ip = popW(w);    if (g_fault) return;
+        rIP = ip & 0xFFFFu;  rSP = (rSP + n) & 0xFFFFu;
+        return;
+    }
+    if (op == 0xC3u) { uint ip = popW(w); if (g_fault) return; rIP = ip & 0xFFFFu; return; }
+    if (op == 0xC4u || op == 0xC5u) {              // LES / LDS
+        decodeModRM(w); if (g_fault) return;
+        if (md_isReg) { g_fault = true; return; }
+        uint lo = memRead16(w, md_seg, md_off); if (g_fault) return;
+        setr16(w, md_reg, lo);
+        uint hi = memRead16(w, md_seg, (md_off + 2u) & 0xFFFFu); if (g_fault) return;
+        if (op == 0xC4u) rES = hi & 0xFFFFu; else rDS = hi & 0xFFFFu;
+        return;
+    }
+    if (op == 0xC6u) { decodeModRM(w); if (g_fault) return; uint b = fetch8(w);  if (g_fault) return; mrmSetMem8 (w, b); return; }
+    if (op == 0xC7u) { decodeModRM(w); if (g_fault) return; uint b = fetch16(w); if (g_fault) return; mrmSetMem16(w, b); return; }
+    if (op == 0xCAu) {                             // RETF imm16
+        uint n  = fetch16(w); if (g_fault) return;
+        uint ip = popW(w);    if (g_fault) return;
+        uint cs = popW(w);    if (g_fault) return;
+        rIP = ip & 0xFFFFu; rCS = cs & 0xFFFFu; rSP = (rSP + n) & 0xFFFFu;
+        return;
+    }
+    if (op == 0xCBu) {                             // RETF
+        uint ip = popW(w); if (g_fault) return;
+        uint cs = popW(w); if (g_fault) return;
+        rIP = ip & 0xFFFFu; rCS = cs & 0xFFFFu;
+        return;
+    }
+    if (op == 0xCCu || op == 0xCEu) { g_fault = true; return; }   // INT3 / INTO
+    if (op == 0xCDu) {                             // INT imm8  (0x86 / 0x87 only)
+        uint id = fetch8(w); if (g_fault) return;
+        if (id == 0x86u) {
+            if (S_B1 != 0u) { S_B1 -= 1u; C_RPM = REP_INT86; C_RPT = 64u; }
+        } else if (id == 0x87u) {
+            if (S_B2 != 0u) { S_B2 -= 1u; C_RPM = REP_INT87; C_RPT = 65536u; C_RPI = 0u; }
+        } else {
+            g_fault = true;
+        }
+        return;
+    }
+    // 0xCF IRET
+    uint ip = popW(w); if (g_fault) return;
+    uint cs = popW(w); if (g_fault) return;
+    uint fl = popW(w); if (g_fault) return;
+    rIP = ip & 0xFFFFu; rCS = cs & 0xFFFFu; rFL = fl & 0xFFFFu;
+}
+
+void doDX(uint w, uint op) {
+    if (op <= 0xD3u) { doShiftRot(w, op); return; }
+    if (op == 0xD7u) {                             // XLAT
+        uint a = (rBX + (rAX & 0xFFu)) & 0xFFFFu;
+        uint v = memRead8(w, rDS, a); if (g_fault) return;
+        setr8(w, 0u, v);
+        return;
+    }
+    g_fault = true;                                // D4/D5 AAM/AAD, D6 invalid, D8-DF x87
+}
+
+void doEX(uint w, uint op) {
+    if (op <= 0xE2u) {                             // LOOPNZ / LOOPZ / LOOP
+        int disp = fetchS8(w); if (g_fault) return;
+        rCX = (rCX - 1u) & 0xFFFFu;
+        bool take = (rCX & 0xFFFFu) != 0u;
+        if      (op == 0xE0u) take = take && !getZF(w);
+        else if (op == 0xE1u) take = take &&  getZF(w);
+        if (take) rIP = (rIP + uint(disp)) & 0xFFFFu;
+        return;
+    }
+    if (op == 0xE3u) {                             // JCXZ
+        int disp = fetchS8(w); if (g_fault) return;
+        if ((rCX & 0xFFFFu) == 0u) rIP = (rIP + uint(disp)) & 0xFFFFu;
+        return;
+    }
+    if (op == 0xE8u) {                             // CALL near rel16
+        int disp = fetchS16(w); if (g_fault) return;
+        callNear(w, (rIP + uint(disp)) & 0xFFFFu);
+        return;
+    }
+    if (op == 0xE9u) {                             // JMP near rel16
+        int disp = fetchS16(w); if (g_fault) return;
+        rIP = (rIP + uint(disp)) & 0xFFFFu;
+        return;
+    }
+    if (op == 0xEAu) {                             // JMP far imm16:imm16
+        uint nip = fetch16(w); if (g_fault) return;
+        uint ncs = fetch16(w); if (g_fault) return;
+        rIP = nip & 0xFFFFu; rCS = ncs & 0xFFFFu;
+        return;
+    }
+    if (op == 0xEBu) {                             // JMP short rel8
+        int disp = fetchS8(w); if (g_fault) return;
+        rIP = (rIP + uint(disp)) & 0xFFFFu;
+        return;
+    }
+    g_fault = true;                                // E4-E7 / EC-EF IN/OUT
+}
+
+void doFX(uint w, uint op) {
+    // 0xFF is reached directly from execOne; everything else lands here.
+    if (op == 0xFFu) { doGrp5(w);                 return; }
+    if (op == 0xF2u || op == 0xF3u) { doRep(w, op);  return; }
+    if (op == 0xF5u) { setCF(w, !getCF(w));        return; }   // CMC
+    if (op == 0xF6u || op == 0xF7u) { doGrp3(w, op); return; }
+    if (op == 0xF8u) { setCF(w, false);           return; }   // CLC
+    if (op == 0xF9u) { setCF(w, true);            return; }   // STC
+    if (op == 0xFAu) { sfl(w, FL_IF, false);      return; }   // CLI
+    if (op == 0xFBu) { sfl(w, FL_IF, true);       return; }   // STI
+    if (op == 0xFCu) { sfl(w, FL_DF, false);      return; }   // CLD
+    if (op == 0xFDu) { sfl(w, FL_DF, true);       return; }   // STD
+    if (op == 0xFEu) { doGrp4(w);                 return; }
+    if (op == 0xFFu) { doGrp5(w);                 return; }
+    g_fault = true;                                // F0 LOCK, F1 invalid, F4 HLT
+}
+
+// ============================================================================
+//  execOne  --  one engine "nextOpcode()" step
+// ============================================================================
+void execOne(uint w) {
+    if (C_RPT != 0u) { repeatStep(w); return; }
+
+    uint op = fetch8(w);
+    if (g_fault) return;
+
+    // Measured over a real tournament (engine/ophist): 0xFF is 69% of every
+    // opcode executed and 0x00-0x3F another 14%, so those two are tested before
+    // anything else. The chain below used to walk fourteen comparisons to reach
+    // 0xFF -- on the single hottest instruction in the whole engine.
+    if (op == 0xFFu) { doGrp5(w);          return; }
+    if (op < 0x40u)  { doALUBlock(w, op);  return; }
+    if (op < 0x50u) {                                   // 0x40-0x4F INC/DEC r16
+        uint idx = op & 7u;
+        if ((op & 8u) == 0u) setr16(w, idx, inc16v(w, r16(w, idx)));
+        else                 setr16(w, idx, dec16v(w, r16(w, idx)));
+        return;
+    }
+    if (op < 0x58u) { pushW(w, r16(w, op & 7u));   return; }   // 0x50-0x57 PUSH r16
+    if (op < 0x60u) { setr16(w, op & 7u, popW(w)); return; }   // 0x58-0x5F POP r16
+    if (op < 0x70u) { g_fault = true;              return; }   // 0x60-0x6F invalid
+    if (op < 0x80u) {                                          // 0x70-0x7F Jcc rel8
+        int disp = fetchS8(w); if (g_fault) return;
+        if (jccCond(w, op & 0xFu)) rIP = (rIP + uint(disp)) & 0xFFFFu;
+        return;
+    }
+    if (op < 0x84u) { doGrp1(w, op);   return; }               // 0x80-0x83
+    if (op < 0x90u) { doMovGrp(w, op); return; }               // 0x84-0x8F
+    if (op < 0xA0u) { do9X(w, op); return; }
+    if (op < 0xB0u) { doAX(w, op); return; }
+    if (op < 0xC0u) { doBX(w, op); return; }
+    if (op < 0xD0u) { doCX(w, op); return; }
+    if (op < 0xE0u) { doDX(w, op); return; }
+    if (op < 0xF0u) { doEX(w, op); return; }
+    doFX(w, op);
+}
+
+// There is deliberately no stepOpcode()/warriorTurn() pair any more. Draining
+// an instruction's repeat inside a nested loop is what made INT 87 cost a warp
+// 32x what its work is worth; the scheduler in runWar() is flat instead, one
+// execOne() per iteration for every lane.
+
+// ============================================================================
+//  War setup
+// ============================================================================
+bool isZombieType(uint t) { return t == T_ZOMBIE || t == T_ZOMBIE_H; }
+// Stacks and shared blocks have to start zeroed. The host used to do that with
+// one vkCmdFillBuffer per game -- 16384 commands and a gigabyte of writes to set
+// up a big chunk, which is what made large chunks lose the device before the
+// first dispatch even ran. A war zeroes exactly the ~20 KB it allocates, once,
+// against the ~130000 opcodes it is about to execute.
+uint allocCore(uint size) {
+    uint a = g_nextFree;
+    g_nextFree += size;
+    uint rel = a - LIN_BASE;                 // paragraph-aligned, size is a multiple of 4
+    for (uint o = 0u; o < size; o += 4u) arena[g_base + ((rel + o) >> 2)] = 0u;
+    return a;
+}
+
+int getLoadOffset(uint warriorSize) {
+    int loadAddr = 0; bool found = false; uint tries = 0u;
+    while (!found && tries < MAX_LOADING_TRIES) {
+        ++tries;
+        loadAddr = rngNextInt(int(ARENA_SIZE));
+        found = true;
+        if (loadAddr < int(MIN_GAP)) found = false;
+        if (loadAddr + int(warriorSize) > int(ARENA_SIZE) - int(MIN_GAP)) found = false;
+        for (uint i = 0u; i < g_numWarriors; ++i) {
+            uint bi = slotBase(i);
+            int oL = int(scratch[bi + SL_LOFF]);
+            int oS = int(scratch[bi + SL_CSZ]);
+            int oStart = oL - int(MIN_GAP);
+            int oEnd   = oL + oS + int(MIN_GAP);
+            if ((loadAddr + int(warriorSize) >= oStart) && (loadAddr < oEnd)) found = false;
+        }
+    }
+    if (!found) g_loadFailed = true;
+    return loadAddr & 0xFFFF;
+}
+
+// ============================================================================
+//  Round scheduling
+// ============================================================================
+// Groups that still have a living survivor, one bit each. Rebuilt only when a
+// warrior dies -- at most once per warrior per war -- so the count that
+// warIsOver() asks for on every single round is a bit population count and not
+// the O(n^2) walk over the whole roster it used to be. That walk ran on every
+// round of every endgame, which is where a war spends most of its life.
+void rebuildSurvGroups() {
+    uint m = 0u;
+    for (uint i = 0u; i < g_numWarriors; ++i) {
+        if ((g_aliveMask & (1u << i)) == 0u) continue;
+        uint bi = slotBase(i);
+        if (isZombieType(scratch[bi + SL_TYPE])) continue;
+        m |= 1u << (scratch[bi + SL_GRP] & 31u);
+    }
+    g_survGroupMask = m;
+}
+
+void handleDeath(uint w) {
+    if (scratch[WB + SL_ALIVE] == 0u) return;
+    scratch[WB + SL_ALIVE] = 0u;
+    scratch[WB + SL_DEATH] = (g_faultReason == DR_NONE) ? DR_CPU : g_faultReason;
+    g_aliveMask &= ~(1u << w);
+    --g_numAlive;
+    if (!isZombieType(C_TYPE)) { --g_numSurv; rebuildSurvGroups(); }
+}
+
+uint countAliveSurvivorGroups() { return uint(bitCount(g_survGroupMask)); }
+
+bool warIsOver() {
+    if (g_numAlive <= 1u) return true;
+    if (g_numSurv == 1u) return true;
+    if (g_numSurv == 2u && countAliveSurvivorGroups() == 1u) return true;
+    return false;
+}
+
+// ============================================================================
+//  war setup (loader) -- runs once, on the first dispatch that touches a game
+// ============================================================================
+void loadWar(uint gi) {
+    rngSetSeed((int64_t(int(gamesIn[gi].seedHi)) << 32) | int64_t(uint64_t(gamesIn[gi].seedLo)));
+
+    g_numWarriors = 0u; g_numAlive = 0u; g_numSurv = 0u;
+    g_aliveMask = 0u; g_survGroupMask = 0u;
+    g_nextFree = NEXT_FREE_START; g_loadFailed = false;
+
+    uint remaining[MAX_WARRIORS];
+    uint numGroups = gamesIn[gi].numGroups;
+    for (uint i = 0u; i < numGroups; ++i) remaining[i] = i;
+    uint rem = numGroups;
+
+    while (rem > 0u && !g_loadFailed) {
+        int ri = rngNextInt(int(rem));
+        uint gid = remaining[ri];
+        for (uint k = uint(ri); k + 1u < rem; ++k) remaining[k] = remaining[k + 1u];
+        --rem;
+
+        uint sharedLin = allocCore(SHARED_SIZE);
+        uint sharedSeg = (sharedLin / 16u) & 0xFFFFu;
+
+        for (uint s = 0u; s < gamesIn[gi].numWarriors; ++s) {
+            if (gamesIn[gi].wGroup[s] != gid) continue;
+
+            uint codeLen = gamesIn[gi].wCodeLen[s];
+            int  loadOff = getLoadOffset(codeLen);
+            if (g_loadFailed) break;
+
+            uint stackLin = allocCore(STACK_SIZE);
+            uint stackSeg = (stackLin / 16u) & 0xFFFFu;
+
+            uint idx = g_numWarriors++;
+            uint wb  = slotBase(idx);
+            scratch[wb + SL_SRC]   = s;
+            scratch[wb + SL_LOFF]  = uint(loadOff);
+            scratch[wb + SL_CSZ]   = codeLen;
+            scratch[wb + SL_TYPE]  = gamesIn[gi].wType[s];
+            scratch[wb + SL_GRP]   = gid;
+            scratch[wb + SL_ALIVE] = 1u;
+            scratch[wb + SL_DEATH] = DR_NONE;
+
+            // packed two per word: AX|CX, DX|BX, SP|BP, SI|DI, ES|CS, SS|DS
+            scratch[wb + 0u] = uint(loadOff);                     // AX, CX=0
+            scratch[wb + 1u] = 0u;                                // DX=0, BX=0
+            scratch[wb + 2u] = STACK_SIZE;                        // SP, BP=0
+            scratch[wb + 3u] = 0u;                                // SI=0, DI=0
+            scratch[wb + 4u] = sharedSeg | (uint(ARENA_SEG) << 16u);   // ES, CS
+            scratch[wb + 5u] = stackSeg  | (uint(ARENA_SEG) << 16u);   // SS, DS
+            scratch[wb + SL_IP] = uint(loadOff); scratch[wb + SL_FL] = 0u;
+            scratch[wb + SL_EN] = 0u; scratch[wb + SL_B1] = 2u; scratch[wb + SL_B2] = 1u;
+            scratch[wb + SL_RPT] = 0u; scratch[wb + SL_RPM] = REP_NONE; scratch[wb + SL_RPI] = 0u;
+            scratch[wb + SL_STKLO] = stackLin;  scratch[wb + SL_STKHI] = stackLin + STACK_SIZE;
+            scratch[wb + SL_SHRLO] = sharedLin; scratch[wb + SL_SHRHI] = sharedLin + SHARED_SIZE - 1u;
+
+            g_aliveMask |= 1u << idx;
+            ++g_numAlive;
+            if (!isZombieType(gamesIn[gi].wType[s])) {
+                ++g_numSurv;
+                g_survGroupMask |= 1u << (gid & 31u);
+            }
+
+            uint co = gamesIn[gi].wCodeOff[s];
+            for (uint k = 0u; k < codeLen; ++k) {
+                uint bo = co + k;
+                uint b  = (codeWord[bo >> 2] >> ((bo & 3u) * 8u)) & 0xFFu;
+                rawSet8(linAddr(ARENA_SEG, (uint(loadOff) + k) & 0xFFFFu), b);
+            }
+        }
+    }
+}
+
+// ============================================================================
+//  finish: write the GameOut record and mark the game done
+// ============================================================================
+void finishWar(uint gi, uint endReason, uint rounds) {
+    uint aliveMask = g_aliveMask;
+
+    gamesOut[gi].rounds            = rounds;
+    gamesOut[gi].numSurvivorsAlive = g_numSurv;
+    gamesOut[gi].numWarriorsAlive  = g_numAlive;
+    gamesOut[gi].aliveMask         = aliveMask;
+    gamesOut[gi]._pad0 = 0u; gamesOut[gi]._pad1 = 0u; gamesOut[gi]._pad2 = 0u;
+    for (uint i = 0u; i < MAX_WARRIORS; ++i) {
+        bool live = (i < g_numWarriors);
+        uint bi = slotBase(i);
+        gamesOut[gi].deathReason[i] = live ? scratch[bi + SL_DEATH] : 0u;
+        gamesOut[gi].loadOffset[i]  = live ? scratch[bi + SL_LOFF]  : 0u;
+        gamesOut[gi].ssSeg[i]       = live ? (scratch[bi + 5u] & 0xFFFFu) : 0u;   // SS|DS
+        gamesOut[gi].esSeg[i]       = live ? (scratch[bi + 4u] & 0xFFFFu) : 0u;   // ES|CS
+        gamesOut[gi].srcIndex[i]    = live ? scratch[bi + SL_SRC]   : 0u;
+    }
+    scratch[g_ghdr + GH_PHASE] = 2u;
+    gamesOut[gi].endReason = endReason;      // written last: the host's "done" signal
+}
+
+// ============================================================================
+//  runWar -- resumable.  Advances one game by up to pc.roundBudget rounds.
+// ============================================================================
+void runWar(uint gi) {
+    g_base  = gi * SLAB_UINTS;
+    g_ghdr  = gi * (GAME_HDR + MAX_WARRIORS * SLOT_UINTS);
+    g_sbase = g_ghdr + GAME_HDR;
+
+    uint phase = scratch[g_ghdr + GH_PHASE];
+    if (phase == 2u) return;                 // already finished
+
+    if (phase == 0u) {
+        loadWar(gi);
+        if (g_loadFailed) { finishWar(gi, END_ABORTED, 0u); return; }
+        scratch[g_ghdr + GH_ROUND]  = 0u;
+        scratch[g_ghdr + GH_NWAR]   = g_numWarriors;
+        scratch[g_ghdr + GH_NALIVE] = g_numAlive;
+        scratch[g_ghdr + GH_NSURV]  = g_numSurv;
+        scratch[g_ghdr + GH_RNGLO]  = uint(g_rng & 0xFFFFFFFFUL);
+        scratch[g_ghdr + GH_RNGHI]  = uint(g_rng >> 32);
+        scratch[g_ghdr + GH_LDFAIL] = 0u;
+        scratch[g_ghdr + GH_ALIVEM] = g_aliveMask;
+        scratch[g_ghdr + GH_SGRPM]  = g_survGroupMask;
+        scratch[g_ghdr + GH_PHASE]  = 1u;
+    } else {
+        g_numWarriors = scratch[g_ghdr + GH_NWAR];
+        g_numAlive    = scratch[g_ghdr + GH_NALIVE];
+        g_numSurv     = scratch[g_ghdr + GH_NSURV];
+        g_rng = uint64_t(scratch[g_ghdr + GH_RNGLO]) | (uint64_t(scratch[g_ghdr + GH_RNGHI]) << 32);
+        g_aliveMask     = scratch[g_ghdr + GH_ALIVEM];
+        g_survGroupMask = scratch[g_ghdr + GH_SGRPM];
+        g_loadFailed  = false;
+    }
+
+    int round     = int(scratch[g_ghdr + GH_ROUND]);
+    int hardMax   = int(pc.maxRounds);
+    int budgetEnd = min(round + int(pc.roundBudget), hardMax);
+    uint zspeed   = gamesIn[gi].zombieSpeed;
+
+    while (round < budgetEnd) {
+        if (warIsOver()) {
+            uint er = (g_numSurv == 1u) ? END_SINGLE_WINNER : END_ABORTED;
+            finishWar(gi, er, uint(round));
+            return;
+        }
+        // ------------------------------------------------------------------
+        //  One round, as a pipeline: every trip round this loop is exactly one
+        //  execOne() for every lane, and nothing else.
+        //
+        //  It used to be a walk over the warriors calling warriorTurn(), which
+        //  drained a whole instruction -- including the repeat of an INT 87 --
+        //  inside a nested while. INT 87 scans up to 65536 words, and measured
+        //  over a real tournament it averages ~51000 iterations and accounts
+        //  for as much work as every other instruction in the engine put
+        //  together. In a nested loop that is a lane spinning fifty thousand
+        //  times while the other thirty-one in its warp sit masked off and
+        //  idle: the warp costs 32x what the work is worth.
+        //
+        //  Flattened, a lane part-way through a scan and a lane running an
+        //  ordinary opcode are both just "one execOne this iteration", so the
+        //  warp stays busy. The order of everything -- opcodes, RNG draws,
+        //  energy -- is untouched; only the shape of the loop changed.
+        // ------------------------------------------------------------------
+        bool decelerate = (round % DECELERATION_ROUNDS) == 0;
+        uint m    = g_aliveMask;
+        uint cur  = NO_WARRIOR;
+        uint owed = 0u;            // logical opcodes this warrior still owes
+        bool first = false;        // the current one is the turn's first
+
+        while (true) {
+            if (cur == NO_WARRIOR) {
+                if (m == 0u) break;
+                cur = uint(findLSB(m));
+                m &= m - 1u;
+                loadCur(cur);
+                owed = 0u; first = true;
+                g_fault = false; g_faultReason = DR_NONE;
+            }
+
+            execOne(cur);
+
+            if (g_fault) { storeCur(cur); handleDeath(cur); cur = NO_WARRIOR; continue; }
+            if (C_RPT != 0u) continue;      // mid-repeat: resume it next iteration
+
+            if (first) {
+                first = false;
+                if (isZombieType(C_TYPE)) {
+                    // a zombie's extra opcodes draw no randomness
+                    int extra = int(zspeed) * ((C_TYPE == T_ZOMBIE_H) ? 2 : 1) - 1;
+                    owed = uint(max(extra, 0));
+                } else {
+                    if (decelerate) {
+                        uint e0 = C_EN & 0xFFFFu;
+                        if (e0 > 0u) C_EN = e0 - 1u;
+                    }
+                    uint e = C_EN & 0xFFFFu;
+                    int spd = (e == 0u) ? 0 : min(MAX_SPEED, int(findMSB(e)) + 1);
+                    owed = (rngNextInt(MAX_SPEED) < spd) ? 1u : 0u;
+                }
+            } else {
+                owed -= 1u;
+            }
+
+            if (owed == 0u) { storeCur(cur); cur = NO_WARRIOR; }
+            else            { g_fault = false; g_faultReason = DR_NONE; }
+        }
+        ++round;
+    }
+
+    if (round >= hardMax) {
+        uint er = (g_numSurv == 1u) ? END_SINGLE_WINNER : END_MAX_ROUND;
+        finishWar(gi, er, uint(round));
+        return;
+    }
+
+    // budget spent, not done -- persist and yield to the next dispatch
+    scratch[g_ghdr + GH_ROUND]  = uint(round);
+    scratch[g_ghdr + GH_NALIVE] = g_numAlive;
+    scratch[g_ghdr + GH_NSURV]  = g_numSurv;
+    scratch[g_ghdr + GH_RNGLO]  = uint(g_rng & 0xFFFFFFFFUL);
+    scratch[g_ghdr + GH_RNGHI]  = uint(g_rng >> 32);
+    scratch[g_ghdr + GH_ALIVEM] = g_aliveMask;
+    scratch[g_ghdr + GH_SGRPM]  = g_survGroupMask;
+}
+
+// Persistent-thread work queue: a fixed grid of workers, each pulling games from
+// a global counter until the batch is drained, so a worker whose game finishes
+// (or was already done) immediately picks up another instead of idling.
+void main() {
+    while (true) {
+        uint slot = atomicAdd(g_qhead, 1u);
+        if (slot >= pc.gameCount) return;      // gameCount == worklist length
+        runWar(q[QLIST + slot]);
+    }
+}

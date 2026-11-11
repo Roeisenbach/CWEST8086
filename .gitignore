@@ -1,0 +1,13 @@
+# generated
+build/
+release/
+/app.exe
+/cwnode.exe
+
+# per-user state the app writes beside itself
+/cwest.ini
+/corewars_layout.ini
+gpu-engine/pipeline_cache.bin
+gpu-engine/score.csv
+CGX-engine/scores.csv
+CGX-engine/last-run.txt

@@ -1,0 +1,131 @@
+    STOSW
+    JMP label1
+    JMP label4
+    JMP label2
+    JMP label3
+prcd1:
+    SUB AX, 0xBEC3
+    MOV BX, 0xE33F
+    MUL BX
+    XOR AX, 0xFAEB
+    MOV BX, AX
+    RET
+label1:
+    MOV CL, 0xA3
+    LOOP $
+    PUSH AX
+    MOV AX, 0xCCCC
+    MOV CX, 0xCCCC
+    DB 0x9B, 0x9B ;$1 NRG
+    XCHG CX, [0xBA0F]
+    XCHG AX, [0xBC0F]
+    CALL prcd1
+    POP AX
+    DB 0x83, 0xC0, 0x06 ;$1 ADD AX, 0x0006
+    MOV [0xE172], AX
+    MOV WORD [BX+0x4E], 0xE172
+    MOV WORD [BX+0x4C], 0x26FF
+    PUSH AX
+    MOV AX, CX
+    CALL prcd1
+    POP AX
+    DB 0x83, 0xC0, 0x02 ;$1 ADD AX, 0x0002
+    MOV [0x1234], AX
+    MOV WORD [BX+0x4E], 0x1234
+    MOV WORD [BX+0x4C], 0x26FF
+    MOV DI, 0x0000
+    MOV CX, 0xEE04
+    MOV WORD [0xF0EF], 0x1CFF
+    MOV WORD [0xF0ED], 0xCC29
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x11DF
+    MOV WORD [DI], 0x10FD
+    MOV WORD [DI+0x02], 0x1DFF
+    CALL FAR [DI]
+label2:
+    MOV WORD [0xDDEF], 0x1CFF
+    MOV WORD [0xDDED], 0xCC29
+    MOV CX, 0xEE04
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x817D
+    MOV WORD [SI], 0x0DFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+label3:
+    MOV WORD [0xEEEF], 0x1CFF
+    MOV WORD [0xEEED], 0xCC29
+    MOV CX, 0xEE04
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x593F
+    MOV WORD [SI], 0x1EFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+    MOV WORD [0xD3ED], 0x1CFF
+    MOV WORD [0xD3EB], 0xCC29
+    MOV CX, 0xEE04
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x9583
+    MOV WORD [SI], 0x03FB
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+    MOV WORD [0xCFFB], 0x1CFF
+    MOV WORD [0xCFF9], 0xCC29
+    MOV CX, 0xEE04
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x575E
+    MOV WORD [SI], 0x0009
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+label4:
+    MOV SI, CX
+    MOV CX, 0x009C
+    LOOP $
+    PUSH AX
+    MOV AX, 0xCCCC
+    MOV CX, 0xCCCC
+    DB 0x9B, 0x9B ;$1 NRG
+    XCHG CX, [0xB60F]
+    XCHG AX, [0xB80F]
+    CALL prcd1
+    POP AX
+    ADD DI, 0x00BC
+    MOV [0x2222], DI
+    MOV WORD [BX+0x4E], 0x2222
+    MOV WORD [BX+0x4C], 0x26FF
+    PUSH AX
+    MOV AX, CX
+    CALL prcd1
+    POP AX
+    ADD DI, 0x0021
+    MOV [0x3333], DI
+    MOV WORD [BX+0x4E], 0x3333
+    MOV WORD [BX+0x4C], 0x26FF
+    MOV WORD [0xDFEF], 0x1CFF
+    MOV WORD [0xDFED], 0xCC29
+    MOV SS, SI
+    MOV SI, 0x0000
+    MOV DI, 0x0000
+    MOV CX, 0xEE04
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x00DF
+    MOV WORD [SI], 0x0FFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]

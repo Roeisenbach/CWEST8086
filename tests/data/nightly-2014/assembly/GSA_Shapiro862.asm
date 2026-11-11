@@ -1,0 +1,118 @@
+    JMP label1
+    MOV SI, AX
+    ADD SI, WORD 0x005C
+    LEA DI, [SI+0x3D]
+    MOV CX, 0x0016
+    MOV BX, 0xDE3F
+loop1:
+    MOV WORD [DI], 0xCCCC
+    ADD DI, 0x0099
+    LOOP loop1
+    ADD DI, 0x0099
+    MOV WORD [DI], 0xCCCC
+    MOV AX, [0xC20F]
+    MUL BX
+    ADD AX, 0x2418
+    MOV BX, AX
+    ADD BX, 0x0047
+    MOV [0x4305], SI
+    MOV WORD [BX], 0x26FF
+    XOR DI, DI
+    MOV AX, 0x0300
+    MOV WORD [0xFF22], 0xC429
+    MOV WORD [0xFF24], 0x1DFF
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0xFF2A
+    MOV WORD [DI], 0xFF22
+    MOV WORD [DI+0x02], 0x1000
+    CALL FAR [DI]
+    MOV DI, 0x23A3
+    MOV CX, 0x0080
+loop2:
+    MOV WORD [DI], 0xCCCC
+    ADD DI, 0x0200
+    LOOP loop2
+    XOR DI, DI
+    MOV AX, 0x0102
+    MOV WORD [0xFF26], 0xC429
+    MOV WORD [0xFF28], 0x1DFF
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0xFF2E
+    MOV WORD [DI], 0xFF26
+    MOV WORD [DI+0x02], 0x1000
+    CALL FAR [DI]
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+label1:
+    MOV SI, AX
+    ADD SI, 0x00F2
+    LEA DI, [SI+0x3D]
+    MOV CX, 0x0016
+    MOV BX, 0xDE3F
+loop3:
+    MOV WORD [DI], 0xCCCC
+    ADD DI, 0x0099
+    LOOP loop3
+    ADD DI, 0x0099
+    MOV WORD [DI], 0xCCCC
+    MOV AX, [0xC20F]
+    MUL BX
+    ADD AX, 0x2418
+    MOV BX, AX
+    ADD BX, 0x0047
+    MOV [0x4305], SI
+    MOV WORD [BX], 0x26FF
+    XOR DI, DI
+    MOV AX, 0x0300
+    MOV WORD [0xFF22], 0xC429
+    MOV WORD [0xFF24], 0x1DFF
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0xFF2A
+    MOV WORD [DI], 0xFF22
+    MOV WORD [DI+0x02], 0x1000
+    CALL FAR [DI]
+    MOV DI, 0x23A3
+    MOV CX, 0x0080
+loop4:
+    MOV WORD [DI], 0xCCCC
+    ADD DI, 0x0200
+    LOOP loop4
+    XOR DI, DI
+    MOV AX, 0x0102
+    MOV WORD [0xFF26], 0xC429
+    MOV WORD [0xFF28], 0x1DFF
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0xFF2E
+    MOV WORD [DI], 0xFF26
+    MOV WORD [DI+0x02], 0x1000
+    CALL FAR [DI]
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3
+    INT3

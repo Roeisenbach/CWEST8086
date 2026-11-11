@@ -1,0 +1,161 @@
+    JMP label1
+    PUSH CS
+    POP ES
+    PUSH AX
+    MOV AX, 0xCCCC
+    MOV DX, 0xF7CC
+    MOV CH, 0xCC
+    XOR DI, DI
+    INT 0x87
+    POP AX
+    MOV DI, AX
+    ADD DI, 0x5000
+    MOV DX, 0xCCCC
+    MOV AX, DX
+    INT 0x86
+    SUB DI, 0xA000
+    INT 0x86
+    MOV CX, 0x0688
+    MOV WORD [0xECEF], 0x1CFF
+    MOV WORD [0xECED], 0xCC29
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x0DDF
+    MOV WORD [SI], 0x1CFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+    INT3
+    INT3
+    INT3
+    INT3
+    ADD [BX+SI], AL
+    ADD [BX+SI], AL
+    PUSH CS
+    POP ES
+    PUSH AX
+    MOV AX, 0xCCCC
+    MOV DX, 0xF7CC
+    MOV CH, 0xCC
+    XOR DI, DI
+    INT 0x87
+    POP AX
+    MOV DI, AX
+    ADD DI, 0x5000
+    MOV DX, 0xCCCC
+    MOV AX, DX
+    INT 0x86
+    SUB DI, 0xA000
+    INT 0x86
+    MOV CX, 0x0688
+    MOV WORD [0xECEF], 0x1CFF
+    MOV WORD [0xECED], 0xCC29
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x0DDF
+    MOV WORD [SI], 0x1CFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+    INT3
+    INT3
+    INT3
+    INT3
+label1:
+    ADD [BX+SI], AL
+    ADD [BX+SI], AL
+    PUSH CS
+    POP ES
+    PUSH AX
+    MOV AX, 0xCCCC
+    MOV DX, 0xF7CC
+    MOV CH, 0xCC
+    XOR DI, DI
+    INT 0x87
+    POP AX
+    MOV DI, AX
+    ADD DI, 0x5000
+    MOV DX, 0xCCCC
+    MOV AX, DX
+    INT 0x86
+    SUB DI, 0xA000
+    INT 0x86
+    MOV CX, 0x0688
+    MOV WORD [0xECEF], 0x1CFF
+    MOV WORD [0xECED], 0xCC29
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x0DDF
+    MOV WORD [SI], 0x1CFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+    INT3
+    INT3
+    INT3
+    INT3
+    ADD [BX+SI], AL
+    ADD [BX+SI], AL
+    PUSH CS
+    POP ES
+    PUSH AX
+    MOV AX, 0xCCCC
+    MOV DX, 0xF7CC
+    MOV CH, 0xCC
+    XOR DI, DI
+    INT 0x87
+    POP AX
+    MOV DI, AX
+    ADD DI, 0x5000
+    MOV DX, 0xCCCC
+    MOV AX, DX
+    INT 0x86
+    SUB DI, 0xA000
+    INT 0x86
+    MOV CX, 0x0688
+    MOV WORD [0xECEF], 0x1CFF
+    MOV WORD [0xECED], 0xCC29
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x0DDF
+    MOV WORD [SI], 0x1CFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]
+    INT3
+    INT3
+    INT3
+    INT3
+    ADD [BX+SI], AL
+    ADD [BX+SI], AL
+    PUSH CS
+    POP ES
+    PUSH AX
+    MOV AX, 0xCCCC
+    MOV DX, 0xF7CC
+    MOV CH, 0xCC
+    XOR DI, DI
+    INT 0x87
+    POP AX
+    MOV DI, AX
+    ADD DI, 0x5000
+    MOV DX, 0xCCCC
+    MOV AX, DX
+    INT 0x86
+    SUB DI, 0xA000
+    INT 0x86
+    MOV CX, 0x0688
+    MOV WORD [0xECEF], 0x1CFF
+    MOV WORD [0xECED], 0xCC29
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x0DDF
+    MOV WORD [SI], 0x1CFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]

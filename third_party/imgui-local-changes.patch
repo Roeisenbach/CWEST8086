@@ -1,0 +1,68 @@
+# Local changes to Dear ImGui, saved before imgui/.git was removed (2026-10-06).
+# Base: fd13a1e8923a0a7077b404fc36fd063b25a0c0b5 (HEAD -> docking, origin/docking) 2026-08-19 Merge branch 'master' into docking
+# Apply to a fresh checkout of that commit with:  git apply imgui-local-changes.patch
+# Files ADDED to the imgui folder (kept as-is, not in this patch):
+#   TextEditor.h
+#   imgui_TextEditor.cpp
+#   imgui_impl_opengl3.cpp
+
+diff --git a/imgui.cpp b/imgui.cpp
+index 98db04810..c1470d6e6 100644
+--- a/imgui.cpp
++++ b/imgui.cpp
+@@ -17835,7 +17835,8 @@ void ImGui::RenderPlatformWindowsDefault(void* platform_render_arg, void* render
+         if (viewport->Flags & ImGuiViewportFlags_IsMinimized)
+             continue;
+         if (platform_io.Platform_RenderWindow) platform_io.Platform_RenderWindow(viewport, platform_render_arg);
+-        if (platform_io.Renderer_RenderWindow) platform_io.Renderer_RenderWindow(viewport, renderer_render_arg);
++        if (platform_io.Renderer_RenderWindow) 
++            platform_io.Renderer_RenderWindow(viewport, renderer_render_arg);
+     }
+     for (int i = 1; i < platform_io.Viewports.Size; i++)
+     {
+diff --git a/imgui_demo.cpp b/imgui_demo.cpp
+index 5ed279d7a..5664eb99d 100644
+--- a/imgui_demo.cpp
++++ b/imgui_demo.cpp
+@@ -10288,10 +10288,14 @@ static void ShowExampleAppFullscreen(bool* p_open)
+     // We demonstrate using the full viewport area or the work area (without menu-bars, task-bars etc.)
+     // Based on your use case you may want one or the other.
+     const ImGuiViewport* viewport = ImGui::GetMainViewport();
+-    ImGui::SetNextWindowPos(use_work_area ? viewport->WorkPos : viewport->Pos);
+-    ImGui::SetNextWindowSize(use_work_area ? viewport->WorkSize : viewport->Size);
+ 
+-    if (ImGui::Begin("Example: Fullscreen window", p_open, flags))
++    const ImVec2 pos  = use_work_area ? viewport->WorkPos : viewport->Pos;
++    const ImVec2 size = use_work_area ? viewport->WorkSize : viewport->Size;
++
++    ImGui::SetNextWindowPos(pos);
++    ImGui::SetNextWindowSize(size);
++
++    if (ImGui::Begin("Example: Fullscreen window", p_open, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |  ImGuiWindowFlags_NoDocking))
+     {
+         IMGUI_DEMO_MARKER("Examples/Fullscreen window");
+         ImGui::Checkbox("Use work area instead of main area", &use_work_area);
+diff --git a/imgui_widgets.cpp b/imgui_widgets.cpp
+index 665cfc512..48d6cf6b5 100644
+--- a/imgui_widgets.cpp
++++ b/imgui_widgets.cpp
+@@ -3352,13 +3352,15 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
+     bool temp_input_is_active = temp_input_allowed && TempInputIsActive(id);
+     if (!temp_input_is_active)
+     {
+-        // Tabbing or Ctrl+Click on Slider turns it into an input box
++        // Tabbing, Ctrl+Click or a double-click on a Slider turns it into an
++        // input box (the double-click path matches DragScalar below).
+         const bool clicked = hovered && IsMouseClicked(0, ImGuiInputFlags_None, id);
+-        const bool make_active = (clicked || g.NavActivateId == id);
+-        if (make_active && clicked)
++        const bool double_clicked = (hovered && g.IO.MouseClickedCount[0] == 2 && TestKeyOwner(ImGuiKey_MouseLeft, id));
++        const bool make_active = (clicked || double_clicked || g.NavActivateId == id);
++        if (make_active && (clicked || double_clicked))
+             SetKeyOwner(ImGuiKey_MouseLeft, id);
+         if (make_active && temp_input_allowed)
+-            if ((clicked && g.IO.KeyCtrl) || (g.NavActivateId == id && (g.NavActivateFlags & ImGuiActivateFlags_PreferInput)))
++            if ((clicked && g.IO.KeyCtrl) || double_clicked || (g.NavActivateId == id && (g.NavActivateFlags & ImGuiActivateFlags_PreferInput)))
+                 temp_input_is_active = true;
+ 
+         // Store initial value (not used by main lib but available as a convenience but some mods e.g. to revert)

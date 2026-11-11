@@ -1,0 +1,152 @@
+    PUSH DS
+    PUSH ES
+    POP DS
+    MOV WORD [0x000A], 0x7D89
+    MOV WORD [0x000C], 0x311B
+    MOV WORD [0x000E], 0xCCCC
+    MOV WORD [0x0010], 0xCCCC
+    MOV BYTE [0x0008], 0x00
+    MOV WORD [0x0012], 0xCCCC
+    MOV WORD [0x0014], 0xCCCC
+    MOV CX, [0x0004]
+    ADD CX, 0x0511
+    MOV WORD [0x0016], 0xECE9
+    MOV WORD [0x0018], 0xCCCC
+    MOV WORD [0x001A], 0xCCCC
+    ADD CX, 0x0100
+    MOV WORD [0x001C], 0xFDE9
+    MOV SI, AX
+    MOV [0x0030], SI
+    ADD SI, 0x0112
+    MOV AX, [0x0004]
+    MOV [0x0020], AX
+    MOV [0x0000], SI
+    MOV WORD [0x0002], 0x1000
+    MOV WORD [0x001E], 0x368B
+    MOV [0x0020], SI
+    SUB AX, 0x0400
+    MOV WORD [0x0022], 0x85A3
+    SUB SI, 0x008B
+    MOV [0x0030], SI
+    JMP label1
+    REP MOVSW
+    MOV CX, DX
+    SUB [BX], AX
+    MOV BP, [BX]
+    MOV SP, BP
+    ADD SP, 0x0500
+    MOV DI, BP
+    INC DI
+    MOV SI, 0x0100
+    MOV WORD [BP+0x00], 0x1FFF
+    CALL FAR [BX]
+    REP MOVSW
+    MOV CX, DX
+    SUB [BX], AX
+    MOV BP, [BX]
+    MOV SP, BP
+    ADD SP, 0x0500
+    MOV DI, BP
+    INC DI
+    MOV SI, 0x0150
+    MOV WORD [BP+0x00], 0x1FFF
+    CALL FAR [BX]
+label1:
+    MOV [0x0040], SI
+    ADD WORD [0x0040], 0x0400
+    MOV BYTE [0x0040], 0xA3
+    MOV WORD [0x0350], 0xB60F
+    PUSH ES
+    PUSH CS
+    POP ES
+    MOV AX, 0x1FFF
+    MOV DX, 0xCCCC
+    MOV BX, 0xCCCC
+    MOV CX, 0xCCCC
+    INT 0x87
+    POP ES
+    MOV SI, [0x0030]
+    MOV DI, 0x0100
+    MOV CX, 0x0011
+    MOV BX, 0x0390
+    PUSH CS
+    POP DS
+    REP MOVSW
+    PUSH ES
+    POP DS
+    MOV DX, [0x0040]
+    ADD WORD [0x0040], 0x7E00
+    MOV [0x0390], DX
+    MOV SP, [0x0030]
+    ADD SP, 0x8200
+    MOV SI, 0x0100
+    JMP label2
+    MOV SI, [0x0030]
+    ADD SI, 0x001B
+    MOV CX, 0x0011
+    MOV DI, 0x0150
+    MOV BX, 0x0300
+    PUSH CS
+    POP DS
+    REP MOVSW
+    PUSH ES
+    POP DS
+    NOP
+    NOP
+    MOV DX, [0x0040]
+    ADD WORD [0x0040], 0x7E00
+    MOV [0x0300], DX
+    MOV SP, [0x0030]
+    MOV SI, 0x0150
+label2:
+    MOV BP, DX
+    MOV DI, BP
+    MOV DX, 0x0800
+    XCHG DX, SP
+    PUSH ES
+    POP DS
+    PUSH CS
+    POP SS
+    PUSH CS
+    POP ES
+    XCHG DX, SP
+    MOV [BX], DI
+    MOV WORD [BX+0x02], 0x1000
+    INC DI
+    MOV CX, [0x0030]
+    ADD CX, 0x011A
+    MOV [BX+0x04], CX
+    MOV WORD [BX+0x06], 0x1000
+    MOV CX, 0x0045
+    PUSH DS
+    PUSH CS
+    POP DS
+    LOOP $
+    CMP BX, 0x0300
+    JZ label3
+    MOV WORD [0xBC0F], 0xCCCC
+    MOV WORD [0xBA0F], 0xCCCC
+label3:
+    MOV WORD [0xB80F], 0xCCCC
+    MOV WORD [0xB60F], 0xCCCC
+    POP DS
+    MOV CX, 0x0080
+    AND SP, 0xFF00
+    ADD SP, 0x00A3
+loop1:
+    SUB SP, 0x00FC
+    CALL FAR [BX+0x04]
+    LOOP loop1
+    MOV BP, [BX]
+    MOV WORD [BP+0x00], 0x1FFF
+    MOV AX, 0x0500
+    MOV SP, BP
+    ADD SP, 0x0400
+    MOV DX, 0x0010
+    MOV CX, DX
+    CALL FAR [BX]
+    CALL FAR [BX]
+    CALL FAR [BX]
+    CALL FAR [BX]
+    CALL FAR [BX]
+    INT 0xAB

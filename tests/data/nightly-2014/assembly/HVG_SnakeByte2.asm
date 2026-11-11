@@ -1,0 +1,108 @@
+    PUSH ES
+    PUSH CS
+    POP ES
+    ADD AX, 0x007C
+    MOV [0x1589], AX
+    MOV AX, 0x86CD
+    MOV DX, 0xABF3
+    MOV BX, 0x26FF
+    MOV CX, 0x1589
+    INT 0x87
+    POP ES
+    MOV DI, [0x1589]
+    ADD DI, 0x0012
+    MOV [DI], ES
+    SUB DI, 0x008E
+    MOV SI, DI
+    ADD SI, WORD 0x0042
+    MOV AX, 0x0000
+    XCHG DI, AX
+    MOV CX, 0x001D
+    REP MOVSW
+    XCHG DI, AX
+    PUSH CS
+    PUSH CS
+    PUSH ES
+    POP DS
+    POP ES
+    POP SS
+    ADD DI, WORD 0x0042
+    MOV AX, 0xA5F3
+    SUB DI, 0x003A
+    MOV SP, DI
+    XOR SI, SI
+    MOV BP, DI
+    ADD BP, 0x00A0
+    MOV WORD [BP+0x00], 0x00A0
+    SUB BP, 0x00F0
+    MOV WORD [BP+0x00], 0x00A0
+    MOV DX, 0x0013
+    SUB DI, 0x3300
+    MOV CX, 0x001D
+label1:
+    PUSH DX
+    SUB SP, DX
+    PUSH DX
+    SUB SP, DX
+    MOV BX, [BP+0x00F0]
+    CMP BX, [BP+0x00]
+    JZ label1
+    STOSW
+    LEA BX, [DI-0x02]
+    JMP BX
+    MOV DI, [0x1589]
+    SUB DI, WORD 0x007C
+    MOV SI, DI
+    ADD SI, 0x00D6
+    MOV AX, 0x0000
+    MOV DX, 0x0000
+    MOV ES, DX
+    XCHG DI, AX
+    ADD DI, 0x0050
+    MOV CX, 0x001E
+    REP MOVSW
+    XCHG DI, AX
+    PUSH CS
+    PUSH CS
+    PUSH ES
+    POP DS
+    POP ES
+    POP SS
+    ADD DI, 0x00D6
+    SUB DI, 0x7500
+    MOV AX, 0xA5F3
+    MOV SP, DI
+    MOV SI, 0x0050
+    MOV BP, DI
+    ADD BP, 0x00A0
+    MOV WORD [BP+0x00], 0x00A0
+    SUB BP, 0x00F0
+    MOV WORD [BP+0x00], 0x00A0
+    MOV DX, 0x0013
+    SUB DI, 0x3300
+    MOV CX, 0x001E
+    STOSW
+    LEA BX, [DI-0x02]
+    JMP BX
+    SUB DI, 0x003B
+    MOV SP, DI
+    MOV SI, 0x0050
+    MOV BP, DI
+    ADD BP, 0x00A0
+    MOV WORD [BP+0x00], 0x00A0
+    SUB BP, 0x00F0
+    MOV WORD [BP+0x00], 0x00A0
+    MOV DX, 0x0013
+    SUB DI, 0x3300
+    MOV CX, 0x001E
+label2:
+    PUSH DX
+    SUB SP, DX
+    PUSH DX
+    SUB SP, DX
+    MOV BX, [BP+0x00F0]
+    CMP BX, [BP+0x00]
+    JZ label2
+    STOSW
+    LEA BX, [DI-0x02]
+    JMP BX

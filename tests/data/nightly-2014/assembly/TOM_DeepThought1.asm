@@ -1,0 +1,20 @@
+    MOV BX, BP
+    PUSH ES
+    MOV CX, SS
+    POP SS
+    MOV DI, [BP+0x00]
+    ADD DI, 0x0003
+    JMP DI
+    MOV WORD [0xECEF], 0x1CFF
+    MOV WORD [0xECED], 0xCC29
+    MOV SS, CX
+    MOV DI, 0x0000
+    MOV CX, 0x0704
+    PUSH SS
+    POP DS
+    PUSH CS
+    POP SS
+    MOV SP, 0x0DDF
+    MOV WORD [SI], 0x1CFD
+    MOV WORD [SI+0x02], 0x1CFF
+    CALL FAR [SI]

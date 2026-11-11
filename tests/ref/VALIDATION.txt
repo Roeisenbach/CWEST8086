@@ -1,0 +1,15 @@
+﻿CWEST8086 engine core -- C++ port vs Java reference (tests/ref/java/il/co/codeguru/corewars8086)
+regenerated Tue Sep 08 19:06:34 2026   (after the allocation-removal pass)
+
+war (survDir | zombDir | seed | combo | zspeed)                 rounds    match   write-journal      core-checksum
+--------------------------------------------------------------------------------------------------------------------------
+"tests/data/nightly-2014/survivors" "" 0 4 2                               200000    YES     12b06e0ee7ae7378   f229860ff68df1cf
+"tests/data/nightly-2014/survivors" "" 1 2 2                               2879      YES     19f5348677e22d16   7844c3631383a8a8
+"tests/data/nightly-2014/survivors" "" 12345 6 2                           147879    YES     379445feb18b01fd   784e0d36cf1375ee
+"tests/data/nightly-2014/survivors" "CGX-engine/zombies" 7 5 2             96070     YES     7a78520bab81f43a   da0f59b85e29c1fc
+"tests/data/nightly-2014/survivors" "CGX-engine/zombies" 999 8 4           200000    YES     207d66b3d31585ad   9ae0425a838944e4
+"CGX-engine/survivors" "CGX-engine/zombies" 555 10 3            200000    YES     110020f9d83d3faa   9ff46b5e24de0646
+"CGX-engine/survivors" "CGX-engine/zombies" 31337 3 2           28002     YES     f52c2c57a7f39445   37496a1ec4afeb23
+
+match = death order+reasons, round count, full ordered memory-write journal,
+        entire 1 MiB core image, and final scores are byte-identical.

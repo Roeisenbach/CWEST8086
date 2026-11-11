@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/User/Documents/corewars8086-master/src/main/java/il/co/codeguru/corewars8086/**)",
+      "Bash(git -C \"C:/Users/User/Documents/projects/dearImgui/contest wgpu\" log --oneline -5)",
+      "Bash(glslangValidator --target-env vulkan1.2 -S comp shaders/compute.comp -o shaders/compute.spv)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"glslang_exit=$?\")",
+      "Bash(timeout 560 ./bin/engine.exe 64 200000)",
+      "Bash(echo \"exit=$? \\(124=timeout\\)\")",
+      "Bash(timeout 590 ./bin/engine.exe 5000 200000)"
+    ]
+  }
+}
