@@ -1,4 +1,5 @@
-# Builds the release package: release/CWEST8086/ and release/CWEST8086-<version>-win64.zip.
+# Builds the release package: release/CWEST8086/, release/CWEST8086-<version>-win64.zip
+# and, when NSIS is installed, the installer release/CWEST8086-<version>-setup.exe.
 #
 # Everything is compiled fresh, at -O2, into build/release/ -- the release never
 # links the development objects in build/. The exe is a static, stripped GUI
@@ -115,3 +116,25 @@ if ($LASTEXITCODE -ne 0) { throw 'zip failed' }
 
 $size = (Get-ChildItem $outDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
 Write-Host ("== {0}  ({1:N1} MB unpacked, {2:N1} MB zipped)" -f $outDir, $size, ((Get-Item $zip).Length / 1MB))
+
+# ---- installer -------------------------------------------------------------------
+# release\CWEST8086-<version>-setup.exe, from tools\installer.nsi: installs the
+# folder above for the current Windows account, with a Start menu entry and an
+# uninstaller in Settings > Apps. Needs NSIS (winget install NSIS.NSIS); without
+# it the release is just the folder and the zip.
+$setup = Join-Path $root "release\$name-$version-setup.exe"
+$makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+if (-not $makensis) {
+    $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe",
+                  'C:\msys64\ucrt64\bin\makensis.exe') |
+        Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+}
+if ($makensis) {
+    if (Test-Path $setup) { Remove-Item -Force $setup }
+    Write-Host "  building the installer"
+    & $makensis /V2 "/DVERSION=$version" "/DSRC=$outDir" "/DOUTFILE=$setup" (Join-Path $PSScriptRoot 'installer.nsi')
+    if ($LASTEXITCODE -ne 0) { throw 'installer build failed' }
+    Write-Host ("== {0}  ({1:N1} MB)" -f $setup, ((Get-Item $setup).Length / 1MB))
+} else {
+    Write-Host "  no installer: NSIS not found (winget install NSIS.NSIS, then run this again)"
+}

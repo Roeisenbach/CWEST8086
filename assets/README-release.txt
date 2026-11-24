@@ -1,9 +1,23 @@
 CWEST8086 - Core Wars 8086: Editor, Simulator and Tournaments
 =============================================================
 
-Unzip anywhere and run CWEST8086.exe. Nothing is installed; the app keeps its
-settings (cwest.ini) and window layout (corewars_layout.ini) next to the exe,
-so put the folder somewhere you can write to (not Program Files).
+Two ways to get it, the same program either way:
+
+  CWEST8086-<version>-setup.exe   installs it as a program for your Windows
+      account: into %LOCALAPPDATA%\Programs\CWEST8086, with a Start menu entry
+      and (if you like) a desktop shortcut. No administrator rights needed.
+      Remove it from Settings > Apps like any other program. Running a newer
+      setup over it upgrades it and keeps your settings. Windows may warn
+      that the setup is from an unknown publisher (it is not signed): press
+      "More info", then "Run anyway".
+
+  CWEST8086-<version>-win64.zip   unzip anywhere and run CWEST8086.exe.
+      Nothing is installed.
+
+The app keeps its settings (cwest.ini) and window layout (corewars_layout.ini)
+next to the exe, so its folder has to be one you can write to (not Program
+Files). Your workspaces live wherever you put them; uninstalling never touches
+them.
 
 Requirements
 ------------
@@ -66,6 +80,9 @@ What is in this folder
   licenses\       licences of the libraries built into the app and of
                   cloudflared.exe, and in licenses\fonts\ the SIL Open Font
                   License of each font
+  uninstall.exe   (installed copies only) removes the program, its settings
+                  and the fonts folder; anything you added to
+                  CGX-engine\survivors or zombies is left in place
 
 Command line
 ------------

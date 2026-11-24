@@ -12,7 +12,8 @@ src/
   engine/             the 8086 war engine, assembler/disassembler, competition
                       runner, network packs, and cwnode.cpp (headless joiner)
 assets/               fonts/ (Google Fonts; fonts/licenses/ has each OFL), app.ico +
-                      app.rc (icon, version), README-release.txt
+                      app.rc (icon, version), README-release.txt, setup-side.bmp
+                      (the installer's side picture)
 third_party/          imgui/ (docking branch, locally modified -- see
                       imgui-local-changes.patch), glfw/ (MinGW libs only)
 gpu-engine/           the Vulkan competition engine: src/, shaders/, engine.exe
@@ -20,7 +21,8 @@ CGX-engine/           the CGX Java engine (the "Java" competition engine) and
                       its own tournament window; lane/ is the app's driver for it
 tests/                engine test harnesses, ref/ (the Java reference and the
                       Java side of the cross-checks), data/ (warrior corpora)
-tools/                build_objects.ps1, make_release.ps1, makeicon.py, shot.ps1
+tools/                build_objects.ps1, make_release.ps1, installer.nsi,
+                      makeicon.py, makesetupart.py, shot.ps1
 build/                objects and test binaries (generated)
 release/              the packaged release (generated)
 ```
@@ -43,6 +45,15 @@ MSYS2 UCRT64 (`C:\msys64\ucrt64\bin` on PATH for g++ and windres).
   Rebuilds everything from source at -O2 into `build/release/`, and writes
   `release/CWEST8086/` and `release/CWEST8086-<version>-win64.zip`. The version
   comes from `assets/app.rc`.
+- **Installer:** with [NSIS](https://nsis.sourceforge.io) installed
+  (`winget install NSIS.NSIS`), *Make Release* also writes
+  `release/CWEST8086-<version>-setup.exe` from `tools/installer.nsi`. To build it
+  on its own from an existing `release/CWEST8086/`: `makensis tools\installer.nsi`.
+  It installs per user into `%LOCALAPPDATA%\Programs\CWEST8086` (no admin
+  rights; the folder stays writable, which the app needs for its ini files),
+  with a Start menu entry, an optional desktop shortcut, and an uninstaller
+  listed in Settings > Apps. Installing over an existing copy upgrades it and
+  keeps its settings. `/S` installs silently.
 - **GPU engine:** open `gpu-engine/` in VS Code and run *Build-Vulkan* (needs
   the Vulkan SDK; it compiles the shader first).
 - **Java lane driver:** the app compiles `CGX-engine/lane/JavaLane.java` itself
