@@ -36,33 +36,45 @@ SetCompressorDictSize 64
 
 ; ---- inputs ---------------------------------------------------------------------
 !define APP      "CWEST8086"
-; the project root, one up from this script. ${__FILEDIR__} is the script's
-; folder as given to makensis: a full path from the Windows GUI/right-click
-; compile (which keeps its own working folder), possibly a relative one from a
-; command line, where makensis has already moved into the script's folder.
-!if /FileExists "${__FILEDIR__}/../assets/app.rc"
-  !define ROOT "${__FILEDIR__}/.."
+; Paths. On Windows they use \ throughout -- makensis there does not take /
+; in every compile-time check -- and on Linux/macOS /.
+!ifdef NSIS_WIN32_MAKENSIS
+  !define S "\"
+!else
+  !searchparse /noerrors "${__FILEDIR__}" ":\" DRIVE_PATH_REST   ; C:\... = Windows
+  !ifdef DRIVE_PATH_REST
+    !define S "\"
+  !else
+    !define S "/"
+  !endif
+!endif
+
+; The project root is one up from this script. On Windows, start from the
+; script's own full path: the right-click/GUI compile keeps its own working
+; folder. Elsewhere makensis has already moved into the script's folder.
+!if "${S}" == "\"
+  !define ROOT "${__FILEDIR__}\.."
 !else
   !define ROOT ".."
 !endif
 
 ; everything is found from where this script sits, so it has to stay in the
 ; project's tools\ folder (a copy in Downloads finds nothing)
-!if ! /FileExists "${ROOT}/assets/app.rc"
-  !error "installer.nsi has to be in the project's tools\ folder (this copy is in ${__FILEDIR__}). Run the one in your CWEST8086 project's tools\ folder."
+!if ! /FileExists "${ROOT}${S}assets${S}app.rc"
+  !error "installer.nsi has to be in the project's tools\ folder (this copy is in ${__FILEDIR__}; looked for ${ROOT}${S}assets${S}app.rc)."
 !endif
 
 !ifndef SRC
-  !define SRC "${ROOT}/release/${APP}"
+  !define SRC "${ROOT}${S}release${S}${APP}"
 !endif
-!if ! /FileExists "${SRC}/${APP}.exe"
-  !error "No release to pack: ${SRC}/${APP}.exe is missing. Run the Make Release task (tools\make_release.ps1) first -- with NSIS installed it builds the setup.exe too."
+!if ! /FileExists "${SRC}${S}${APP}.exe"
+  !error "No release to pack: ${SRC}${S}${APP}.exe is missing. Run the Make Release task (tools\make_release.ps1) first -- with NSIS installed it builds the setup.exe too."
 !endif
 
 !ifndef VERSION
   ; the line is   VALUE "ProductVersion",  "0.6.0.0"   -- take what follows the
   ; comma, drop the quotes and spaces, and keep the first three numbers
-  !searchparse /file "${ROOT}/assets/app.rc" `"ProductVersion",` RC_PV
+  !searchparse /file "${ROOT}${S}assets${S}app.rc" `"ProductVersion",` RC_PV
   !searchreplace RC_PV `${RC_PV}` `"` ``
   !searchreplace RC_PV `${RC_PV}` ` ` ``
   !searchparse `#${RC_PV}` `#` V_MAJ `.` V_MIN `.` V_PAT `.`
@@ -70,7 +82,7 @@ SetCompressorDictSize 64
 !endif
 
 !ifndef OUTFILE
-  !define OUTFILE "${ROOT}/release/${APP}-${VERSION}-setup.exe"
+  !define OUTFILE "${ROOT}${S}release${S}${APP}-${VERSION}-setup.exe"
 !endif
 
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
@@ -95,10 +107,10 @@ VIAddVersionKey /LANG=1033 "FileVersion"     "${VERSION}"
 VIAddVersionKey /LANG=1033 "FileDescription" "${APP} Setup"
 
 ; ---- pages ----------------------------------------------------------------------
-!define MUI_ICON   "${ROOT}/assets/app.ico"
-!define MUI_UNICON "${ROOT}/assets/app.ico"
-!if /FileExists "${ROOT}/assets/setup-side.bmp"                       ; tools/makesetupart.py
-  !define MUI_WELCOMEFINISHPAGE_BITMAP "${ROOT}/assets/setup-side.bmp"
+!define MUI_ICON   "${ROOT}${S}assets${S}app.ico"
+!define MUI_UNICON "${ROOT}${S}assets${S}app.ico"
+!if /FileExists "${ROOT}${S}assets${S}setup-side.bmp"                       ; tools/makesetupart.py
+  !define MUI_WELCOMEFINISHPAGE_BITMAP "${ROOT}${S}assets${S}setup-side.bmp"
 !endif
 !define MUI_ABORTWARNING
 !define MUI_COMPONENTSPAGE_NODESC
@@ -223,7 +235,7 @@ Section "${APP}" SecApp
           /x pipeline_cache.bin /x score.csv /x scores.csv /x scores.txt /x last-run.txt \
           /x survivors /x zombies \
           /x perf.txt /x perf_open.txt /x shot.txt /x shotvp.txt /x testclip.txt /x testpaste.txt \
-          "${SRC}\*.*"
+          "${SRC}${S}*.*"
   CreateDirectory "$INSTDIR\CGX-engine\survivors"
   CreateDirectory "$INSTDIR\CGX-engine\zombies"
 
