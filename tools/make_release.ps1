@@ -37,6 +37,39 @@ if ($running) {
     throw "close the copy running from $outDir first"
 }
 
+# ---- Java lane driver ----------------------------------------------------------
+# JavaLane.class is built, not checked in (.gitignore's build/ covers
+# CGX-engine\lane\build\), so a fresh clone has none until the app first runs
+# the Java engine. Compile it here when it is missing or older than its source,
+# for the Java version the CGX engine classes themselves need -- not for
+# whatever newer JDK happens to be installed. First, so a missing JDK fails
+# before the long C++ build.
+$laneSrc = 'CGX-engine\lane\JavaLane.java'
+$laneDir = 'CGX-engine\lane\build'
+$laneCls = "$laneDir\JavaLane.class"
+if (-not (Test-Path $laneCls) -or (Get-Item $laneSrc).LastWriteTime -gt (Get-Item $laneCls).LastWriteTime) {
+    # javac: JAVA_HOME, then PATH, then the usual install folders -- the order the app uses
+    $javac = $null
+    if ($env:JAVA_HOME -and (Test-Path "$env:JAVA_HOME\bin\javac.exe")) { $javac = "$env:JAVA_HOME\bin\javac.exe" }
+    if (-not $javac) { $javac = (Get-Command javac -ErrorAction SilentlyContinue).Path }
+    if (-not $javac) {
+        $javac = 'C:\Program Files\Java', 'C:\Program Files\Eclipse Adoptium', 'C:\Program Files\Microsoft' |
+            ForEach-Object { Get-ChildItem $_ -Directory -Filter 'jdk*' -ErrorAction SilentlyContinue } |
+            ForEach-Object { Join-Path $_.FullName 'bin\javac.exe' } |
+            Where-Object { Test-Path $_ } | Sort-Object | Select-Object -Last 1
+    }
+    if (-not $javac) {
+        throw "$laneSrc needs compiling and no JDK was found -- install one (winget install EclipseAdoptium.Temurin.21.JDK) or set JAVA_HOME"
+    }
+    # class file major version 62 = Java 18, and so on
+    $head = [IO.File]::ReadAllBytes((Join-Path $root 'CGX-engine\engine\Tourney.class'))
+    $javaRelease = ($head[6] * 256 + $head[7]) - 44
+    Write-Host "  compiling JavaLane.java for Java $javaRelease ($javac)"
+    New-Item -ItemType Directory $laneDir -Force | Out-Null
+    & $javac -nowarn --release $javaRelease -cp 'CGX-engine\engine;CGX-engine\lib\corewars8086-6.0.0.jar' -d $laneDir $laneSrc
+    if ($LASTEXITCODE -ne 0) { throw "$laneSrc did not compile (needs a JDK $javaRelease or newer)" }
+}
+
 # ---- compile -------------------------------------------------------------------
 if (Test-Path $objDir) { Remove-Item -Recurse -Force $objDir }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build_objects.ps1') -Out $objDir
@@ -123,7 +156,7 @@ Write-Host ("== {0}  ({1:N1} MB unpacked, {2:N1} MB zipped)" -f $outDir, $size, 
 # uninstaller in Settings > Apps. Needs NSIS (winget install NSIS.NSIS); without
 # it the release is just the folder and the zip.
 $setup = Join-Path $root "release\$name-$version-setup.exe"
-$makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+$makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Path
 if (-not $makensis) {
     $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe",
                   'C:\msys64\ucrt64\bin\makensis.exe') |
