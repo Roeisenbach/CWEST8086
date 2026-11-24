@@ -36,7 +36,15 @@ SetCompressorDictSize 64
 
 ; ---- inputs ---------------------------------------------------------------------
 !define APP      "CWEST8086"
-!define ROOT     ".."   ; makensis runs from the script's folder (tools\)
+; the project root, one up from this script. ${__FILEDIR__} is the script's
+; folder as given to makensis: a full path from the Windows GUI/right-click
+; compile (which keeps its own working folder), possibly a relative one from a
+; command line, where makensis has already moved into the script's folder.
+!if /FileExists "${__FILEDIR__}/../assets/app.rc"
+  !define ROOT "${__FILEDIR__}/.."
+!else
+  !define ROOT ".."
+!endif
 
 ; everything is found from where this script sits, so it has to stay in the
 ; project's tools\ folder (a copy in Downloads finds nothing)
