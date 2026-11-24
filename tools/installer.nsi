@@ -38,11 +38,17 @@ SetCompressorDictSize 64
 !define APP      "CWEST8086"
 !define ROOT     ".."   ; makensis runs from the script's folder (tools\)
 
+; everything is found from where this script sits, so it has to stay in the
+; project's tools\ folder (a copy in Downloads finds nothing)
+!if ! /FileExists "${ROOT}/assets/app.rc"
+  !error "installer.nsi has to be in the project's tools\ folder (this copy is in ${__FILEDIR__}). Run the one in your CWEST8086 project's tools\ folder."
+!endif
+
 !ifndef SRC
   !define SRC "${ROOT}/release/${APP}"
 !endif
 !if ! /FileExists "${SRC}/${APP}.exe"
-  !error "${SRC}/${APP}.exe not found -- build the release first (tools/make_release.ps1)"
+  !error "No release to pack: ${SRC}/${APP}.exe is missing. Run the Make Release task (tools\make_release.ps1) first -- with NSIS installed it builds the setup.exe too."
 !endif
 
 !ifndef VERSION
@@ -83,7 +89,9 @@ VIAddVersionKey /LANG=1033 "FileDescription" "${APP} Setup"
 ; ---- pages ----------------------------------------------------------------------
 !define MUI_ICON   "${ROOT}/assets/app.ico"
 !define MUI_UNICON "${ROOT}/assets/app.ico"
-!define MUI_WELCOMEFINISHPAGE_BITMAP "${ROOT}/assets/setup-side.bmp"   ; tools/makesetupart.py
+!if /FileExists "${ROOT}/assets/setup-side.bmp"                       ; tools/makesetupart.py
+  !define MUI_WELCOMEFINISHPAGE_BITMAP "${ROOT}/assets/setup-side.bmp"
+!endif
 !define MUI_ABORTWARNING
 !define MUI_COMPONENTSPAGE_NODESC
 
