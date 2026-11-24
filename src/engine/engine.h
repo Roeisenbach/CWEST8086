@@ -61,6 +61,7 @@ public:
     }
 
     s32 nextInt() { return next(32); }
+    u64 rawSeed() const { return m_seed; }   // for War::stateDigest
 
     // java.util.Random.nextInt(int bound)  (bound > 0)
     s32 nextInt(s32 bound) {
@@ -360,6 +361,31 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+//  Smart check (CWEST's own, never part of a real war)
+//
+//  `int 0x89` in source assembles to INT 87h, so a survivor that uses it plays
+//  exactly like one that wrote INT 87h. Only the smart check builds a second
+//  copy with CD 89 at those places and installs an override on the thread
+//  that plays it: INT 89h is then INT 87h searching for the override's AX:DX
+//  instead of the registers'. With no override installed -- every ordinary
+//  war, Debug, the tournament -- INT 89h faults like any other unknown
+//  interrupt, exactly as the reference engine does.
+// -----------------------------------------------------------------------------
+struct SmartCheckOverride {
+    s16 ax = 0, dx = 0;
+    // The probe: INT 89h finds nothing (it only uses up the bomb, as a search
+    // that misses does) and keeps what it could have searched -- the 64 KB of
+    // the ES segment -- one entry per call that had a bomb left. An entry is
+    // empty when part of the segment could not be read (a real search there
+    // would fault part-way, which a miss does not). Every candidate that
+    // matches nowhere in any entry plays exactly the probe's war.
+    bool probe = false;
+    std::vector<std::vector<u8>>* seen = nullptr;
+};
+// Per thread; nullptr (the default) switches INT 89h off again.
+void setSmartCheckOverride(const SmartCheckOverride* o);
+
+// -----------------------------------------------------------------------------
 //  Cpu  --  port of cpu/Cpu.java (+ OpcodeFetcher, IndirectAddressingDecoder,
 //  RegisterIndexingDecoder folded in).
 // -----------------------------------------------------------------------------
@@ -450,6 +476,8 @@ private:
     // --- virtual interrupts ---
     void int86();   // 64x stosdw if a bomb is left
     void int87();   // find/replace a 4-byte pattern if a bomb is left
+    void int89();   // the smart check's INT 87h (see SmartCheckOverride)
+    void smartBomb(s16 ax, s16 dx);
 };
 
 // -----------------------------------------------------------------------------
@@ -475,6 +503,10 @@ struct WarriorData {
 struct WarriorGroup {
     std::string               name;
     std::vector<WarriorData>   warriors;
+    // The front end's own identity for the group (its folder and name). The
+    // engine never reads it; a replay carries it so the debugger can tell two
+    // groups apart by more than their names.
+    std::string               key;
 };
 
 class Warrior {
@@ -553,7 +585,12 @@ class War {
 public:
     static constexpr s16 ARENA_SEGMENT = 0x1000;
     static constexpr s32 ARENA_SIZE    = RMAddr::PARAGRAPHS_IN_SEGMENT * RMAddr::PARAGRAPH_SIZE; // 0x10000
-    static constexpr int MAX_WARRIORS  = 20;
+    // The reference stops at 20 (Warrior[20]), which caps a war at nine groups of
+    // two plus a zombie or two. Nothing else in the engine depends on it, so this
+    // one holds more: up to the point where the arena itself runs out of room
+    // (MIN_GAP between warriors), and a war of 20 or fewer plays exactly as before.
+    static constexpr int MAX_WARRIORS  = 64;
+    static constexpr int REFERENCE_MAX_WARRIORS = 20;   // what the Java and GPU engines hold
     static constexpr int MAX_ROUND     = 200000;   // Competition.MAX_ROUND
     static constexpr s16 STACK_SIZE    = 2 * 1024; // per-warrior private stack
     static constexpr s16 GROUP_SHARED_MEMORY_SIZE = 1024;   // per-group shared block
@@ -622,6 +659,13 @@ public:
     // Slots below zero are skipped. Returns the number of scorers.
     int  collectScoreSlots(int* slots, float& share) const;
 
+    // A 64-bit hash of everything the rest of the war depends on: the core in
+    // use, every warrior's registers and whether it lives, and the random
+    // generator. Two wars between the same warriors with the same digest at
+    // the same round play out the same from there (the smart check uses it to
+    // stop a candidate's war the moment it is the probe's war again).
+    u64  stateDigest() const;
+
 private:
     void loadWarriorGroup(const WarriorGroup& g);
     void initCore();
@@ -632,7 +676,7 @@ private:
     // The mask is kept up to date as warriors die, so the count that isOver()
     // asks for on every round of a two-survivor war is a popcount and not a
     // walk over the whole roster.
-    long countAliveSurvivorGroups() const { return (long)__builtin_popcount(m_aliveGroupMask); }
+    long countAliveSurvivorGroups() const { return (long)__builtin_popcountll(m_aliveGroupMask); }
     void rebuildAliveGroups();
     void killWarrior(int idx, Fault reason);
     void compactLive();
@@ -669,7 +713,7 @@ private:
     int m_numWarriors = 0;
     int m_numWarriorsAlive = 0;
     int m_numSurvivorsAlive = 0;
-    u32 m_aliveGroupMask = 0;
+    u64 m_aliveGroupMask = 0;    // one bit per group id; a war holds at most 64 groups
     s32 m_nextFreeAddress = 0;
     s32 m_dirtyEnd = 0;          // high-water mark of anything written
     int m_current = 0;

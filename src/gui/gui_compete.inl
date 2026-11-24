@@ -34,88 +34,26 @@ static int                            g_CompStride = 1, g_CompPhase = 0;   // wh
 static int                            g_CompComboUsed = 0;  // groups per battle in the run on the board
 static std::string                    g_CompSender;         // this machine's name on the board
 
-// Offline mode: the shard file this machine is playing, if one is open.
-static cw::FieldPack                  g_CompShard;
-static bool                           g_CompShardOpen = false;
-static std::string                    g_CompShardPath;
-static std::string                    g_CompNetNote;        // last import / export / listen outcome
+static std::string                    g_CompNetNote;        // last listen / join outcome
 static bool                           g_CompRaise = false;  // bring the panel's tab to the front once
 
+// COMP_GPU (the graphics card alone) is gone; COMP_BOTH is "Busy (C++)".
 enum { COMP_CPU = 0, COMP_GPU = 1, COMP_BOTH = 2, COMP_JAVA = 3 };
-enum { MODE_LOCAL = 0, MODE_OFFLINE = 1, MODE_SERVER = 2, MODE_JOIN = 3 };
+// 1 was the offline mode (shard and result files), since removed; the numbers
+// stay as they were so a saved setting still means the same thing.
+enum { MODE_LOCAL = 0, MODE_SERVER = 2, MODE_JOIN = 3 };
 
-// BrowseForFolder lives in gui_options.inl, which main.cpp includes after this
-static std::string BrowseForFolder(HWND owner, const char* title);
-
-// ---- file dialogs ------------------------------------------------------------
-
-static std::string SaveFileDialog(HWND owner, const char* filter, const char* title,
-                                  const char* defExt, const std::string& suggested)
-{
-    char buf[MAX_PATH];
-    snprintf(buf, sizeof(buf), "%s", suggested.c_str());
-    OPENFILENAMEA ofn;
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = owner;
-    ofn.lpstrFilter = filter;
-    ofn.lpstrFile   = buf;
-    ofn.nMaxFile    = sizeof(buf);
-    ofn.lpstrTitle  = title;
-    ofn.lpstrDefExt = defExt;
-    ofn.Flags       = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetSaveFileNameA(&ofn)) return std::string();
-    return buf;
-}
-
-static std::vector<std::string> OpenFilesDialog(HWND owner, const char* filter, const char* title, bool multi)
-{
-    std::vector<std::string> result;
-    std::vector<char> buffer(64 * 1024, 0);
-    OPENFILENAMEA ofn;
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner   = owner;
-    ofn.lpstrFilter = filter;
-    ofn.lpstrFile   = buffer.data();
-    ofn.nMaxFile    = (DWORD)buffer.size();
-    ofn.lpstrTitle  = title;
-    ofn.Flags       = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR |
-                      OFN_HIDEREADONLY | (multi ? OFN_ALLOWMULTISELECT : 0);
-    if (!GetOpenFileNameA(&ofn)) return result;
-    const char* p = buffer.data();
-    std::string first(p);
-    p += first.size() + 1;
-    if (*p == 0) { result.push_back(first); return result; }
-    std::string dir = first;
-    if (!dir.empty() && dir[dir.size() - 1] != '\\') dir += '\\';
-    while (*p) { result.push_back(dir + p); p += strlen(p) + 1; }
-    return result;
-}
-
-static bool ReadWholeFile(const std::string& path, std::string& out)
-{
-    std::ifstream f(path.c_str(), std::ios::binary);
-    if (!f) return false;
-    out.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    return true;
-}
-
-static bool WriteWholeFile(const std::string& path, const std::string& text)
-{
-    std::ofstream f(path.c_str(), std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-    f.write(text.data(), (std::streamsize)text.size());
-    return (bool)f;
-}
-
-static std::string FileStem(const std::string& path)
-{
-    const size_t slash = path.find_last_of("\\/");
-    std::string n = slash == std::string::npos ? path : path.substr(slash + 1);
-    const size_t dot = n.find_last_of('.');
-    return dot == std::string::npos ? n : n.substr(0, dot);
-}
+// A run against folders: the picked groups play each folder as a field of its
+// own, and the board keeps a page per folder. Empty names = an ordinary run.
+static std::vector<std::string> g_CompFieldNames;
+static std::vector<int>         g_CompFieldOf;       // per group of g_CompGroups; -1 zombies
+static std::vector<std::string> g_CompFieldSubjects; // the groups that played every folder (their names)
+static std::vector<std::string> g_CompFieldSubjectKeys; // and who they are (PlayerKey): a clash in a folder
+                                                        // renames them for the war, so never match by name
+static int                      g_CompFieldView = 0;
+static bool                     g_CompForceCpu = false;
+struct FolderRunSpec { bool on = false; std::vector<RefKey> groups; std::vector<std::string> folders; };
+static FolderRunSpec            g_FolderRun;
 
 // ---- options ------------------------------------------------------------------
 
@@ -179,21 +117,10 @@ static void CompetitionStop()
     }
 }
 
-// Offline mode only: a result file carrying this machine's own name is its
-// saved run coming back in a merge, and stands in for the lanes rather than
-// doubling them. (A joiner that happens to share the host's name is renamed by
-// the host, so the rule never fires on the wire.)
-static bool CompetitionLanesSuperseded()
-{
-    return g_App.compMode == MODE_OFFLINE && g_NetPacks.count(g_CompSender) > 0;
-}
-
 // Games finished so far, every lane and every other machine counted.
 static int CompetitionGamesDone()
 {
-    int done = 0;
-    if (!CompetitionLanesSuperseded())
-        done += g_App.compProg.done.load() + g_Gpu.gamesRun + g_Java.gamesRun;
+    int done = g_App.compProg.done.load() + g_Gpu.gamesRun + g_Java.gamesRun;
     for (const auto& kv : g_NetPacks) done += kv.second.gamesRun;
     return done;
 }
@@ -235,9 +162,8 @@ static void CompetitionCombine()
     }
     g_CompLocal = local;
 
-    // Packs from elsewhere, on top of the lanes (or instead of them, when the
-    // lanes' own result file has been added back in an offline merge).
-    cw::CompeteResult r = CompetitionLanesSuperseded() ? g_CompIdentity : local;
+    // what the joined machines sent, on top of the lanes
+    cw::CompeteResult r = local;
     for (const auto& kv : g_NetPacks)
     {
         cw::addResultPack(r, kv.second);
@@ -283,7 +209,26 @@ static bool CompetitionLaunch(const std::vector<cw::WarriorGroup>& groups, const
     // on a slower GPU (or the other way round). The price is that exactly
     // which games were played depends on timing, so a split run is not
     // repeatable game-for-game the way a single-lane one is.
-    const bool split = (g_App.compBackend == COMP_BOTH);
+    // The Java engine and the graphics card hold 20 warriors a battle, as the
+    // reference does; the C++ engine holds more. A field whose battles can be
+    // bigger than that is played by C++ alone rather than half-failing.
+    int biggest = 0;
+    {
+        std::vector<int> sizes;
+        int zomb = 0;
+        for (const cw::WarriorGroup& g : groups)
+        {
+            if (cw::isZombieGroup(g)) zomb += (int)g.warriors.size();
+            else                      sizes.push_back((int)g.warriors.size());
+        }
+        std::sort(sizes.begin(), sizes.end(), std::greater<int>());
+        const int take = opt.comboSize > 0 ? ImMin(opt.comboSize, (int)sizes.size()) : (int)sizes.size();
+        for (int i = 0; i < take; i++) biggest += sizes[(size_t)i];
+        biggest += zomb;
+    }
+    const bool tooBigForOthers = biggest > cw::War::REFERENCE_MAX_WARRIORS;
+    const int backend = (g_CompForceCpu || tooBigForOthers) ? COMP_CPU : g_App.compBackend;
+    const bool split = (backend == COMP_BOTH);
     int cpuGames = openEnded ? 0 : target, gpuGames = openEnded ? 0 : target;
     int cpuStride = stride, cpuPhase = phase, gpuStride = stride, gpuPhase = phase;
     if (split)
@@ -294,8 +239,11 @@ static bool CompetitionLaunch(const std::vector<cw::WarriorGroup>& groups, const
     }
 
     g_App.compGpuNote.clear();
+    if (tooBigForOthers && !g_CompForceCpu && g_App.compBackend != COMP_CPU)
+        g_App.compGpuNote = "Battles of up to " + std::to_string(biggest) + " warriors: only the C++ engine holds more "
+                            "than " + std::to_string(cw::War::REFERENCE_MAX_WARRIORS) + ", so it plays them all";
     bool gpuUp = false;
-    if (g_App.compBackend == COMP_GPU || g_App.compBackend == COMP_BOTH)
+    if (backend == COMP_BOTH)
     {
         cw::CompeteOptions g = opt;
         g.seedStride = gpuStride;
@@ -316,7 +264,7 @@ static bool CompetitionLaunch(const std::vector<cw::WarriorGroup>& groups, const
     // The Java lane plays the phase exactly as handed -- the same battles the
     // CPU lane would have -- and if it cannot start the CPU plays them instead.
     bool javaUp = false;
-    if (g_App.compBackend == COMP_JAVA)
+    if (backend == COMP_JAVA)
     {
         cw::CompeteOptions j = opt;
         j.seedStride = stride;
@@ -326,9 +274,8 @@ static bool CompetitionLaunch(const std::vector<cw::WarriorGroup>& groups, const
         if (!javaUp) g_App.compGpuNote = "Java: " + why;
     }
 
-    const bool cpuLane = (g_App.compBackend == COMP_CPU || g_App.compBackend == COMP_BOTH)
-                      || (g_App.compBackend == COMP_GPU && !gpuUp)
-                      || (g_App.compBackend == COMP_JAVA && !javaUp);
+    const bool cpuLane = (backend == COMP_CPU || backend == COMP_BOTH || backend == COMP_GPU)
+                      || (backend == COMP_JAVA && !javaUp);
 
     g_App.compProg.done.store(0);
     g_App.compProg.cancel.store(false);
@@ -390,33 +337,155 @@ static void NetServerSeat(NetPeer& p)
     }
 }
 
+// A group as it fights in a run against folders: every survivor it has, active
+// or not -- picking the folders is the choice of who plays.
+static bool FieldGroupOf(const Player& pl, cw::WarriorGroup& g)
+{
+    g = cw::WarriorGroup();
+    g.name = pl.name;
+    g.key  = PlayerKey(pl);
+    for (int s = 0; s < kSlotCount; s++)
+    {
+        const Survivor& sv = pl.slots[s];
+        if (!sv.present || sv.bin.empty()) continue;
+        cw::WarriorData wd;
+        wd.name = pl.name + std::to_string(s + 1);
+        wd.code.assign(sv.bin.begin(), sv.bin.end());
+        wd.type = (s == 0) ? cw::WarriorType::SURVIVOR_1 : cw::WarriorType::SURVIVOR_2;
+        g.warriors.push_back(std::move(wd));
+    }
+    return !g.warriors.empty();
+}
+
+// Plays the remembered run against folders again.
+static void CompetitionRunFolderSpec()
+{
+    AppState& S = g_App;
+    std::vector<int> subjects;
+    for (const RefKey& k : g_FolderRun.groups)
+    {
+        const Ref r = RefOfKey(k);
+        if (r.player >= 0 && std::find(subjects.begin(), subjects.end(), r.player) == subjects.end())
+            subjects.push_back(r.player);
+    }
+    std::sort(subjects.begin(), subjects.end());
+    if (subjects.empty()) { S.status = "The groups of the run against folders are gone"; g_FolderRun.on = false; return; }
+
+    std::vector<cw::WarriorGroup> groups;
+    std::vector<int> fieldOf;
+    std::vector<std::string> names;
+    std::string skipped;
+    for (const std::string& folder : g_FolderRun.folders)
+    {
+        if (FolderIndex(folder) < 0) { skipped += (skipped.empty() ? "" : ", ") + folder + " (gone)"; continue; }
+        // the picked groups first, then the folder's own, in the order they load
+        std::vector<int> order = subjects;
+        for (int p : GroupsUnder(folder))
+            if (std::find(order.begin(), order.end(), p) == order.end()) order.push_back(p);
+        const int fieldIndex = (int)names.size();
+        int added = 0, opponents = 0;
+        std::vector<cw::WarriorGroup> fg;
+        std::vector<const Player*> fgFrom;
+        for (int p : order)
+        {
+            cw::WarriorGroup g;
+            if (!FieldGroupOf(S.players[p], g)) continue;
+            fg.push_back(std::move(g));
+            fgFrom.push_back(&S.players[p]);
+            added++;
+            if (std::find(subjects.begin(), subjects.end(), p) == subjects.end()) opponents++;
+        }
+        if (opponents == 0) { skipped += (skipped.empty() ? "" : ", ") + FolderLeaf(folder) + " (nobody to fight)"; continue; }
+        SeparateSameNames(fg, fgFrom);
+        for (cw::WarriorGroup& g : fg) { groups.push_back(std::move(g)); fieldOf.push_back(fieldIndex); }
+        names.push_back(folder);
+        (void)added;
+    }
+    if (names.empty()) { S.status = "Nothing to run" + (skipped.empty() ? std::string() : ": " + skipped); return; }
+
+    // the zombies, in every battle of every field, as always
+    {
+        cw::WarriorGroup z;
+        z.name = "ZoMbIeS";
+        for (const Zombie& zb : S.zombies)
+        {
+            if (!zb.runnable()) continue;
+            cw::WarriorData wd;
+            wd.name = zb.name.empty() ? zb.sv.name : zb.name;
+            wd.code.assign(zb.sv.bin.begin(), zb.sv.bin.end());
+            wd.type  = zb.heavy ? cw::WarriorType::ZOMBIE_H : cw::WarriorType::ZOMBIE;
+            wd.speed = zb.speed;
+            z.warriors.push_back(std::move(wd));
+        }
+        if (!z.warriors.empty()) { groups.push_back(std::move(z)); fieldOf.push_back(-1); }
+    }
+
+    cw::CompeteOptions opt;
+    CompetitionOptionsFromApp(opt);
+    opt.fieldCount = (int)names.size();
+    opt.groupField = fieldOf;
+    g_CompFieldNames = names;
+    g_CompFieldOf = fieldOf;
+    g_CompFieldSubjects.clear();
+    g_CompFieldSubjectKeys.clear();
+    for (int p : subjects)
+    {
+        g_CompFieldSubjects.push_back(S.players[p].name);
+        g_CompFieldSubjectKeys.push_back(PlayerKey(S.players[p]));
+    }
+    if (g_CompFieldView >= (int)names.size()) g_CompFieldView = 0;
+    g_NetPacks.clear();
+    g_NetPacksRev++;
+    g_CompSender = NetComputerName();
+    g_CompForceCpu = true;            // the other lanes do not know about separate fields
+    CompetitionLaunch(groups, opt, 1, 0, S.compGames, false);
+    g_CompForceCpu = false;
+    if (S.compRunning)
+    {
+        S.status = "Running " + std::to_string((int)subjects.size()) + " group(s) against " +
+                   std::to_string((int)names.size()) + " folder(s), each on its own" +
+                   (skipped.empty() ? std::string() : "  -- skipped " + skipped);
+        if (S.compBackend != COMP_CPU) S.compGpuNote = "Runs against folders play on the C++ engine";
+    }
+}
+
+// From a group's menu: these groups against each of these folders.
+static void CompetitionStartFolders(const std::vector<int>& groupsIn, const std::vector<std::string>& folders)
+{
+    AppState& S = g_App;
+    if (S.compRunning) { S.status = "Stop the running tournament first"; return; }
+    if (S.compMode != MODE_LOCAL)
+    {
+        S.status = "Runs against folders are played on this machine -- set the Competition panel to Local";
+        return;
+    }
+    g_FolderRun = FolderRunSpec();
+    for (int p : groupsIn) g_FolderRun.groups.push_back(GroupKey(p));
+    g_FolderRun.folders = folders;
+    g_FolderRun.on = true;
+    g_CompFieldView = 0;
+    S.showBoard = true;
+    g_CompRaise = true;
+    CompetitionRunFolderSpec();
+}
+
 // The Run button.
 static void CompetitionStart()
 {
     if (g_App.compRunning) return;
     AppState& S = g_App;
+    if (g_FolderRun.on && S.compMode == MODE_LOCAL) { CompetitionRunFolderSpec(); return; }
+    g_CompFieldNames.clear();
+    g_CompFieldOf.clear();
+    g_CompFieldSubjects.clear();
+    g_CompFieldSubjectKeys.clear();
+    g_CompForceCpu = false;
+    const bool needsWorkspace = (S.compMode != MODE_JOIN);
+    if (needsWorkspace && !HasWorkspace()) { S.status = "Open a workspace first (Ctrl+O)"; return; }
 
     cw::CompeteOptions opt;
     switch (S.compMode)
     {
-    case MODE_OFFLINE:
-        if (g_CompShardOpen)
-        {
-            CompetitionOptionsFromField(g_CompShard, opt);
-            char who[64];
-            snprintf(who, sizeof(who), " shard %d/%d", g_CompShard.phase + 1, g_CompShard.stride);
-            g_CompSender = NetComputerName() + who;
-            CompetitionLaunch(g_CompShard.groups, opt, g_CompShard.stride, g_CompShard.phase,
-                              g_CompShard.games, false);
-            return;
-        }
-        // no shard open: a plain run of the workspace, added to whatever has
-        // been merged so far
-        CompetitionOptionsFromApp(opt);
-        g_CompSender = NetComputerName();
-        CompetitionLaunch(BuildGroups(), opt, 1, 0, S.compGames, false);
-        return;
-
     case MODE_SERVER:
     {
         if (!NetServerUp())
@@ -506,7 +575,7 @@ static void CompetitionPoll()
 
     if (!S.compRunning)
     {
-        // packs added by hand in offline mode change the board without a run
+        // a joiner's last report can land after the run has ended
         if (g_NetPacksRev != g_CompPacksSeen)
         {
             g_CompPacksSeen = g_NetPacksRev;
@@ -590,7 +659,7 @@ static void CompetitionPoll()
     if (S.compMode == MODE_JOIN && g_NetClient.doneOwed)
     {
         // the last of what we played, then the host knows this lane is closed
-        if (g_NetClient.s != INVALID_SOCKET)
+        if (NetClientLinked())
         {
             CompetitionSendContribution();
             NetClientSend("done 1\nrun " + std::to_string(g_CompRunId) + "\nend\n");
@@ -617,129 +686,34 @@ static void CompetitionPoll()
     S.status = buf;
 }
 
-// ---- offline: shard and result files --------------------------------------------
-
-static void CompetitionExportShards()
-{
-    AppState& S = g_App;
-    std::vector<cw::WarriorGroup> groups = BuildGroups();
-    if (groups.empty()) { S.status = "Need at least one group with an assembled survivor"; return; }
-    const int n = ImClamp(S.compShards, 1, kNetStride);
-
-    const std::string dir = BrowseForFolder(g_Hwnd, "Folder for the shard files (one per machine)");
-    if (dir.empty()) return;
-
-    cw::FieldPack f = CompetitionFieldFromApp(groups);
-    f.stride = n;
-    int written = 0;
-    for (int p = 0; p < n; p++)
-    {
-        f.phase = p;
-        // games p, p+n, p+2n ... below the target; 0 stays limitless
-        f.games = S.compGames > 0 ? (S.compGames - p + n - 1) / n : 0;
-        char name[64];
-        snprintf(name, sizeof(name), "\\shard-%02d-of-%02d.cwf", p + 1, n);
-        if (WriteWholeFile(dir + name, cw::writeFieldPack(f))) written++;
-    }
-    char buf[200];
-    snprintf(buf, sizeof(buf), "%d shard file(s) written -- give one to each machine, then add their result files here", written);
-    g_CompNetNote = buf;
-    S.status = buf;
-}
-
-static void CompetitionOpenShard()
-{
-    std::vector<std::string> files = OpenFilesDialog(g_Hwnd,
-        "Shard files (*.cwf)\0*.cwf\0All files (*.*)\0*.*\0", "Open a shard to play on this machine", false);
-    if (files.empty()) return;
-    std::string text, why;
-    cw::FieldPack f;
-    if (!ReadWholeFile(files[0], text)) { g_CompNetNote = "could not read " + files[0]; return; }
-    if (!cw::parseFieldPack(text, f, why)) { g_CompNetNote = FileStem(files[0]) + ": " + why; return; }
-    g_CompShard = f;
-    g_CompShardOpen = true;
-    g_CompShardPath = files[0];
-    g_App.compResult = cw::CompeteResult();
-    g_CompIdentity = cw::CompeteResult();
-    g_CompLocal = cw::CompeteResult();
-    g_CompNetNote.clear();
-}
-
-static void CompetitionCloseShard()
-{
-    g_CompShardOpen = false;
-    g_CompShardPath.clear();
-    g_CompShard = cw::FieldPack();
-}
-
-static void CompetitionSaveResults()
-{
-    if (g_CompLocal.empty() || g_CompLocal.gamesRun == 0) { g_CompNetNote = "nothing has been played yet"; return; }
-    std::string suggested = "results-" + NetComputerName();
-    if (g_CompShardOpen) suggested = "results-" + FileStem(g_CompShardPath) + "-" + NetComputerName();
-    for (char& c : suggested) if (c == ' ') c = '_';
-    const std::string path = SaveFileDialog(g_Hwnd, "Result files (*.cwr)\0*.cwr\0All files (*.*)\0*.*\0",
-                                            "Save this machine's results", "cwr", suggested + ".cwr");
-    if (path.empty()) return;
-    if (WriteWholeFile(path, cw::writeResultPack(g_CompLocal, g_CompSender, g_CompRunId)))
-        g_CompNetNote = "saved " + FileStem(path) + " -- add it on the host";
-    else g_CompNetNote = "could not write " + path;
-}
-
-static void CompetitionAddResults()
-{
-    std::vector<std::string> files = OpenFilesDialog(g_Hwnd,
-        "Result files (*.cwr)\0*.cwr\0All files (*.*)\0*.*\0", "Add result files from other machines", true);
-    if (files.empty()) return;
-
-    // The names have to match a field: the open shard's, or the workspace's.
-    if (g_CompIdentity.empty() && !g_App.compRunning)
-    {
-        std::vector<cw::WarriorGroup> groups = g_CompShardOpen ? g_CompShard.groups : BuildGroups();
-        if (groups.empty()) { g_CompNetNote = "load the field first, so the names have somewhere to land"; return; }
-        cw::prepareResult(groups, g_CompIdentity);
-        g_CompPending = g_CompIdentity;
-        g_CompLocal = g_CompIdentity;
-        g_CompGroups = groups;
-    }
-
-    int added = 0, strangers = 0;
-    std::string bad;
-    for (const std::string& path : files)
-    {
-        std::string text, why;
-        cw::ResultPack rp;
-        if (!ReadWholeFile(path, text) || !cw::parseResultPack(text, rp, why))
-        {
-            bad += (bad.empty() ? "" : ", ") + FileStem(path);
-            continue;
-        }
-        if (rp.sender.empty()) rp.sender = FileStem(path);
-        // count strangers against a scratch copy so a pack from another field
-        // can be refused whole
-        cw::CompeteResult probe = g_CompIdentity;
-        const int unknown = cw::addResultPack(probe, rp);
-        if (unknown > 0 && unknown == (int)rp.name.size()) { strangers++; continue; }
-        g_NetPacks[rp.sender] = std::move(rp);
-        added++;
-    }
-    g_NetPacksRev++;
-    char buf[240];
-    snprintf(buf, sizeof(buf), "%d result file(s) added%s%s", added,
-             strangers ? ("  -- " + std::to_string(strangers) + " from a different field, skipped").c_str() : "",
-             bad.empty() ? "" : ("  -- could not read " + bad).c_str());
-    g_CompNetNote = buf;
-}
-
 // ---- drawing ----------------------------------------------------------------------
 
 // The colour a name wears in the arena, matched back to the workspace so the
 // board and the fight read as the same thing. A field that came over the wire
-// or from a shard file has no workspace behind it, so its groups take the
+// has no workspace behind it, so its groups take the
 // player palette in field order -- the colours a host with the same folder
 // loaded would have given them.
 static unsigned CompColorOf(const cw::CompeteResult& R, size_t row, bool isGroup)
 {
+    // A field played here knows each group's workspace identity, so two groups
+    // of one name keep their own colours; only results from elsewhere match by
+    // name.
+    {
+        const int g = isGroup ? (int)row : (row < R.warriorGroup.size() ? R.warriorGroup[row] : -1);
+        if (g >= 0 && g_CompGroups.size() == R.groupName.size() && (size_t)g < g_CompGroups.size())
+        {
+            const int p = PlayerOfKey(g_CompGroups[(size_t)g].key);
+            if (p >= 0)
+            {
+                const Player& pl = g_App.players[(size_t)p];
+                if (isGroup) return pl.tint;
+                int sl = 0;
+                for (size_t i = 0; i < row; i++) if (R.warriorGroup[i] == g) sl++;
+                sl = ImMin(sl, kSlotCount - 1);
+                return pl.twoTone ? (sl == 1 ? pl.tint2 : pl.tint) : SlotTint(pl.tint, sl);
+            }
+        }
+    }
     const std::string& name = isGroup ? R.groupName[row] : R.warriorName[row];
     for (size_t p = 0; p < g_App.players.size(); p++)
     {
@@ -764,10 +738,26 @@ static unsigned CompColorOf(const cw::CompeteResult& R, size_t row, bool isGroup
 
 struct CompRow { std::string name; double score; int survived; unsigned tint; };
 
-// Bars from the left, best on top -- or, flipped, columns from the floor that
-// climb to the right. Fitted, the bars share the whole panel between them --
-// never thinner than 3 px, so a very big field scrolls -- and the stats come
-// up on hover like the timeline lanes.
+// Text on a bar: the bar can be any colour, bright or dark, so the text gets
+// a drop shadow one pixel down and to the right, in the opposite tone -- dark
+// under light text, light under dark text -- and reads on all of them.
+static void AddBarText(ImDrawList* dl, ImVec2 pos, ImU32 col, const char* text, bool up = false)
+{
+    const ImVec4 c = ImGui::ColorConvertU32ToFloat4(col);
+    const float lum = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    const ImU32 shadow = (lum > 0.5f) ? IM_COL32(0, 0, 0, 170) : IM_COL32(255, 255, 255, 170);
+    pos = ImVec2(ImTrunc(pos.x), ImTrunc(pos.y));
+    if (!g_App.compBarShadow)                       // Options > Competition can turn it off
+    {
+        if (up) AddTextUp(dl, pos, col, text); else dl->AddText(pos, col, text);
+        return;
+    }
+    const float o = ImMax(1.0f, ImFloor(g_Scale + 0.5f));
+    const ImVec2 sp(pos.x + o, pos.y + o);
+    if (up) { AddTextUp(dl, sp, shadow, text); AddTextUp(dl, pos, col, text); }
+    else    { dl->AddText(sp, shadow, text);    dl->AddText(pos, col, text); }
+}
+
 static void DrawCompBars(const std::vector<CompRow>& rows, double best, int gamesRun, bool vertical, bool fit,
                          bool showLabels)
 {
@@ -871,8 +861,9 @@ static void DrawCompBars(const std::vector<CompRow>& rows, double best, int game
             const bool inside = len > ts.x + 16 * g_Scale;
             // outside only while there is track left above the column for it
             const bool above = !inside && (a.y - 8 * g_Scale - ts.x) > valFoot + 4 * g_Scale;
-            AddTextUp(dl, ImVec2(tx, above ? a.y - 8 * g_Scale : b.y - 8 * g_Scale),
-                      HexU(inside ? Col::Bg0 : Col::Text), r.name.c_str());
+            if (inside) AddBarText(dl, ImVec2(tx, b.y - 8 * g_Scale), HexU(Col::Bg0), r.name.c_str(), true);
+            else        AddTextUp(dl, ImVec2(tx, above ? a.y - 8 * g_Scale : b.y - 8 * g_Scale),
+                                  HexU(Col::Text), r.name.c_str());
             AddTextUp(dl, ImVec2(tx, valFoot), HexU(Col::TextDim), val);
         }
         else if (labels)
@@ -880,9 +871,9 @@ static void DrawCompBars(const std::vector<CompRow>& rows, double best, int game
             // the name rides on the bar, and steps outside it when it would not fit
             const ImVec2 ts = ImGui::CalcTextSize(r.name.c_str());
             const bool inside = len > ts.x + 16 * g_Scale;
-            dl->AddText(ImVec2(a.x + (inside ? 8 * g_Scale : len + 8 * g_Scale),
-                               a.y + (thick - gap - ts.y) * 0.5f),
-                        HexU(inside ? Col::Bg0 : Col::Text), r.name.c_str());
+            const ImVec2 at(a.x + (inside ? 8 * g_Scale : len + 8 * g_Scale), a.y + (thick - gap - ts.y) * 0.5f);
+            if (inside) AddBarText(dl, at, HexU(Col::Bg0), r.name.c_str());
+            else        dl->AddText(at, HexU(Col::Text), r.name.c_str());
             char val[48];
             snprintf(val, sizeof(val), "%.2f", r.score);
             const ImVec2 vs = ImGui::CalcTextSize(val);
@@ -896,8 +887,11 @@ static void DrawCompBars(const std::vector<CompRow>& rows, double best, int game
             snprintf(rk, sizeof(rk), "%d", n - i);
             const ImVec2 rs = ImGui::CalcTextSize(rk);
             if (rs.x < thick)
-                dl->AddText(ImVec2(a.x + (thick - gap - rs.x) * 0.5f, b.y - rs.y - 2 * g_Scale),
-                            HexU(len > rs.y + 4 * g_Scale ? Col::Bg0 : Col::TextDim), rk);
+            {
+                const ImVec2 at(a.x + (thick - gap - rs.x) * 0.5f, b.y - rs.y - 2 * g_Scale);
+                if (len > rs.y + 4 * g_Scale) AddBarText(dl, at, HexU(Col::Bg0), rk);
+                else                          dl->AddText(at, HexU(Col::TextDim), rk);
+            }
         }
     }
 
@@ -914,6 +908,354 @@ static void DrawCompBars(const std::vector<CompRow>& rows, double best, int game
     ImGui::EndChild();
 }
 
+// ---- seed search ------------------------------------------------------------------
+//
+// Random wars between the groups you pick, as Debug would fight them, until
+// the survivors you pick are the ones standing at the end. Each seed that did
+// it is kept; one click opens that war in Debug.
+
+struct SeekState
+{
+    bool open = false;
+    std::set<std::string>    play;            // "folder|name" of the groups that fight
+    std::set<std::string>    win;             // "folder|name|slot" of the survivors that must stand
+    bool                     onlyThem = true; // and nobody else
+    // the run
+    std::vector<std::thread> threads;
+    std::atomic<bool>        stop{false};
+    std::atomic<long long>   tried{0};
+    std::atomic<int>         running{0};
+    std::mutex               lock;
+    std::vector<long long>   found;
+    double                   startedAt = 0.0;
+    std::vector<cw::WarriorGroup> field;      // what the workers fight, frozen at Search
+    std::vector<int>         want;            // scoring slots that must be alive
+    int                      scoring = 0;     // scoring warriors in the field
+    int                      zombieSpeed = 2, maxRounds = 0;
+    std::vector<RefKey>      players;         // the groups, to hand to Debug
+    std::string              note;
+};
+static SeekState g_Seek;
+
+static std::string SeekGroupKey(const Player& pl) { return ToLower(pl.folder) + "|" + ToLower(pl.name); }
+
+static void SeekSetPlay(const Player& pl, bool on)
+{
+    const std::string key = SeekGroupKey(pl);
+    if (on) { g_Seek.play.insert(key); return; }
+    g_Seek.play.erase(key);
+    for (int s = 0; s < kSlotCount; s++) g_Seek.win.erase(key + "|" + std::to_string(s));
+}
+
+// "Who plays" as the workspace's own tree. It keeps its own folds -- the
+// groups bar's are not this list's business -- and every folder has a box that
+// takes in (or out) everything inside it.
+static void SeekPlayTree(const std::string& parent)
+{
+    AppState& S = g_App;
+    for (int fi : FolderChildren(parent))
+    {
+        if (fi >= (int)S.folders.size()) continue;
+        const std::string path = S.folders[fi].path;
+        const std::vector<int> under = GroupsUnder(path);
+        int on = 0;
+        for (int p : under) if (g_Seek.play.count(SeekGroupKey(S.players[p]))) on++;
+        ImGui::PushID(path.c_str());
+        bool all = !under.empty() && on == (int)under.size();
+        const bool mixed = on > 0 && !all;
+        ImGui::BeginDisabled(under.empty());
+        if (mixed) ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+        if (ImGui::Checkbox("##all", &all))
+            for (int p : under) SeekSetPlay(S.players[p], all);
+        if (mixed) ImGui::PopItemFlag();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(under.empty() ? "No groups in here" : "Every group in %s (folders inside it too)",
+                              path.c_str());
+        ImGui::SameLine(0, 4 * g_Scale);
+        const bool empty = FolderChildren(path).empty() && GroupsIn(path).empty();
+        const bool open = ImGui::TreeNodeEx("##node", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                                      (empty ? ImGuiTreeNodeFlags_Leaf : 0),
+                                            "%s  (%d)", FolderLeaf(path).c_str(), (int)under.size());
+        if (open)
+        {
+            SeekPlayTree(path);
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    for (int p : GroupsIn(parent))
+    {
+        const Player& pl = S.players[p];
+        bool on = g_Seek.play.count(SeekGroupKey(pl)) > 0;
+        ImGui::PushID(p);
+        if (ImGui::Checkbox(pl.name.c_str(), &on)) SeekSetPlay(pl, on);
+        ImGui::PopID();
+    }
+}
+
+static void SeedSearchStop()
+{
+    g_Seek.stop.store(true);
+    for (std::thread& t : g_Seek.threads) if (t.joinable()) t.join();
+    g_Seek.threads.clear();
+}
+
+static void SeekWorker(unsigned long long rngSeed)
+{
+    cw::War war(nullptr, nullptr, g_Seek.zombieSpeed);
+    std::vector<const cw::WarriorGroup*> ptrs;
+    for (const cw::WarriorGroup& g : g_Seek.field) ptrs.push_back(&g);
+    std::vector<int> slots((size_t)cw::War::MAX_WARRIORS + 4);
+    std::vector<char> alive((size_t)ImMax(1, g_Seek.scoring));
+    std::mt19937_64 rng(rngSeed);
+    while (!g_Seek.stop.load(std::memory_order_relaxed))
+    {
+        const long long seed = (long long)(rng() & 0x7FFFFFFFULL);
+        war.reset();
+        war.setSeed(seed);
+        try { war.loadWarriorGroups(ptrs); }
+        catch (const cw::CpuFault&) { g_Seek.tried.fetch_add(1); continue; }
+        war.runToEnd(g_Seek.maxRounds);
+        float share = 0.0f;
+        const int n = war.collectScoreSlots(slots.data(), share);
+        std::fill(alive.begin(), alive.end(), 0);
+        for (int i = 0; i < n; i++)
+            if (slots[(size_t)i] >= 0 && slots[(size_t)i] < (int)alive.size()) alive[(size_t)slots[(size_t)i]] = 1;
+        bool ok = true;
+        for (int s : g_Seek.want) if (!alive[(size_t)s]) ok = false;
+        if (ok && g_Seek.onlyThem && n != (int)g_Seek.want.size()) ok = false;
+        g_Seek.tried.fetch_add(1);
+        if (ok)
+        {
+            std::lock_guard<std::mutex> lk(g_Seek.lock);
+            if (g_Seek.found.size() < 2000) g_Seek.found.push_back(seed);
+        }
+    }
+    g_Seek.running.fetch_sub(1);
+}
+
+static void SeedSearchStart()
+{
+    AppState& S = g_App;
+    SeedSearchStop();
+    g_Seek.field.clear();
+    g_Seek.want.clear();
+    g_Seek.players.clear();
+    g_Seek.scoring = 0;
+    g_Seek.note.clear();
+    // the war exactly as Debug would build it with only these groups active:
+    // the groups in workspace order, every survivor they have, then the zombies
+    std::vector<const Player*> seekFrom;
+    for (const Player& pl : S.players)
+    {
+        if (!g_Seek.play.count(SeekGroupKey(pl))) continue;
+        cw::WarriorGroup g;
+        g.name = pl.name;
+        g.key  = PlayerKey(pl);
+        for (int s = 0; s < kSlotCount; s++)
+        {
+            const Survivor& sv = pl.slots[s];
+            if (!sv.present || sv.bin.empty()) continue;
+            cw::WarriorData wd;
+            wd.name = pl.name + std::to_string(s + 1);
+            wd.code.assign(sv.bin.begin(), sv.bin.end());
+            wd.type = (s == 0) ? cw::WarriorType::SURVIVOR_1 : cw::WarriorType::SURVIVOR_2;
+            wd.slot = g_Seek.scoring++;
+            if (g_Seek.win.count(SeekGroupKey(pl) + "|" + std::to_string(s))) g_Seek.want.push_back(wd.slot);
+            g.warriors.push_back(std::move(wd));
+        }
+        if (g.warriors.empty()) continue;
+        g_Seek.field.push_back(std::move(g));
+        seekFrom.push_back(&pl);
+        RefKey k; k.kind = 0; k.folder = pl.folder; k.name = pl.name; k.slot = -1;
+        g_Seek.players.push_back(k);
+    }
+    SeparateSameNames(g_Seek.field, seekFrom);     // as Debug names them
+    int warriors = g_Seek.scoring;
+    {
+        cw::WarriorGroup z;
+        z.name = "ZoMbIeS";
+        for (const Zombie& zb : S.zombies)
+        {
+            if (!zb.runnable()) continue;
+            cw::WarriorData wd;
+            wd.name = zb.name.empty() ? zb.sv.name : zb.name;
+            wd.code.assign(zb.sv.bin.begin(), zb.sv.bin.end());
+            wd.type  = zb.heavy ? cw::WarriorType::ZOMBIE_H : cw::WarriorType::ZOMBIE;
+            wd.speed = zb.speed;
+            wd.slot  = -1;
+            z.warriors.push_back(std::move(wd));
+            warriors++;
+        }
+        if (!z.warriors.empty()) g_Seek.field.push_back(std::move(z));
+    }
+    if (g_Seek.players.empty())   { g_Seek.note = "Pick the groups that fight"; return; }
+    if (g_Seek.want.empty())      { g_Seek.note = "Pick the survivors that must win"; return; }
+    if (warriors > cw::War::MAX_WARRIORS)
+    { g_Seek.note = "That is " + std::to_string(warriors) + " warriors -- a war holds " + std::to_string(cw::War::MAX_WARRIORS); return; }
+
+    g_Seek.zombieSpeed = S.zombieSpeed;
+    g_Seek.maxRounds = S.maxRounds;
+    {
+        std::lock_guard<std::mutex> lk(g_Seek.lock);
+        g_Seek.found.clear();
+    }
+    g_Seek.tried.store(0);
+    g_Seek.stop.store(false);
+    g_Seek.startedAt = AppNow();
+    const int hw = (int)std::thread::hardware_concurrency();
+    const int n = S.compThreads > 0 ? S.compThreads : ImMax(1, hw - 1);
+    const unsigned long long base = (unsigned long long)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (unsigned long long)(AppNow() * 1e6);
+    g_Seek.running.store(n);
+    for (int i = 0; i < n; i++) g_Seek.threads.emplace_back(SeekWorker, base + (unsigned long long)i * 0xBF58476D1CE4E5B9ULL);
+}
+
+// The found war in Debug: exactly the searched groups active, and the seed.
+static void SeekOpenInDebug(long long seed)
+{
+    AppState& S = g_App;
+    std::set<std::string> keys;
+    for (const RefKey& k : g_Seek.players) keys.insert(ToLower(k.folder) + "|" + ToLower(k.name));
+    for (Player& pl : S.players)
+    {
+        const bool in = keys.count(SeekGroupKey(pl)) > 0;
+        pl.enabled = in;
+        for (Survivor& sv : pl.slots) if (sv.present) sv.enabled = in;
+    }
+    snprintf(S.seedText, sizeof(S.seedText), "SEED!@#=%lld", seed);
+    S.showArena = true;
+    GameArm(/*keepSeed=*/true);
+    S.status = "Opened seed " + std::to_string(seed) + " in Debug -- only the searched groups are active now";
+}
+
+static void DrawSeedSearchWindow()
+{
+    AppState& S = g_App;
+    // workers that ran out of reasons to run (all stopped) are joined here
+    if (g_Seek.running.load() == 0 && !g_Seek.threads.empty()) SeedSearchStop();
+    if (!g_Seek.open) return;
+    if (!S.compSeekTool) { g_Seek.open = false; return; }
+
+    ImGui::SetNextWindowSize(ImVec2(560 * g_Scale, 460 * g_Scale), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Seed search", &g_Seek.open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking))
+    {
+        ImGui::End();
+        return;
+    }
+    const bool running = g_Seek.running.load() > 0;
+    if (!HasWorkspace()) { ImGui::TextDisabled("Open a workspace first."); ImGui::End(); return; }
+
+    ImGui::BeginDisabled(running);
+    const float colW = (ImGui::GetContentRegionAvail().x - 8 * g_Scale) * 0.5f;
+    const float listH = ImMax(120.0f * g_Scale, ImGui::GetContentRegionAvail().y - 150 * g_Scale);
+
+    // who plays
+    ImGui::BeginGroup();
+    ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+    ImGui::TextColored(Hex(Col::TextDim), "WHO PLAYS");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("the active ones"))
+    {
+        g_Seek.play.clear();
+        for (const Player& pl : S.players) if (pl.enabled) g_Seek.play.insert(SeekGroupKey(pl));
+    }
+    ImGui::BeginChild("##seekplay", ImVec2(colW, listH), ImGuiChildFlags_Borders);
+    SeekPlayTree(std::string());
+    ImGui::EndChild();
+    ImGui::EndGroup();
+
+    ImGui::SameLine(0, 8 * g_Scale);
+
+    // who wins
+    ImGui::BeginGroup();
+    ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+    ImGui::TextColored(Hex(Col::TextDim), "WHO MUST WIN");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::Checkbox("and nobody else", &g_Seek.onlyThem);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("On: these survivors are the only ones standing at the end.\n"
+                          "Off: these are standing, whoever else is too.");
+    ImGui::BeginChild("##seekwin", ImVec2(colW, listH), ImGuiChildFlags_Borders);
+    int warriors = 0;
+    for (const Player& pl : S.players)
+    {
+        const std::string key = SeekGroupKey(pl);
+        if (!g_Seek.play.count(key)) continue;
+        for (int s = 0; s < kSlotCount; s++)
+        {
+            const Survivor& sv = pl.slots[s];
+            if (!sv.present || sv.bin.empty()) continue;
+            warriors++;
+            const std::string wk = key + "|" + std::to_string(s);
+            bool on = g_Seek.win.count(wk) > 0;
+            ImGui::PushID(wk.c_str());
+            const unsigned tint = pl.twoTone ? (s == 1 ? pl.tint2 : pl.tint) : SlotTint(pl.tint, s);
+            ImGui::PushStyleColor(ImGuiCol_CheckMark, Hex(tint));
+            if (ImGui::Checkbox((pl.name + std::to_string(s + 1)).c_str(), &on))
+            {
+                if (on) g_Seek.win.insert(wk); else g_Seek.win.erase(wk);
+            }
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+    }
+    if (g_Seek.play.empty()) ImGui::TextDisabled("Pick groups on the left");
+    ImGui::EndChild();
+    ImGui::EndGroup();
+    ImGui::EndDisabled();
+
+    int zombies = 0;
+    for (const Zombie& z : S.zombies) if (z.runnable()) zombies++;
+    ImGui::TextColored(Hex(warriors + zombies > cw::War::MAX_WARRIORS ? Col::Warn : Col::TextDim),
+                       "%d warriors + %d active zombie(s) per war, seed text and rounds as in Debug",
+                       warriors, zombies);
+
+    // run
+    if (running)
+    {
+        if (ImGui::Button("Stop", ImVec2(110 * g_Scale, 0))) { g_Seek.stop.store(true); }
+    }
+    else if (ImGui::Button("Search", ImVec2(110 * g_Scale, 0))) SeedSearchStart();
+    ImGui::SameLine();
+    {
+        const long long tried = g_Seek.tried.load();
+        size_t nFound;
+        { std::lock_guard<std::mutex> lk(g_Seek.lock); nFound = g_Seek.found.size(); }
+        const double secs = running ? AppNow() - g_Seek.startedAt : 0.0;
+        if (!g_Seek.note.empty()) ImGui::TextColored(Hex(Col::Warn), "%s", g_Seek.note.c_str());
+        else if (tried > 0)
+            ImGui::TextColored(Hex(running ? Col::Accent2 : Col::TextDim), "%lld wars, %d found%s",
+                               tried, (int)nFound,
+                               secs > 0.5 ? ("  --  " + std::to_string((int)(tried / secs)) + " wars/s").c_str() : "");
+        else ImGui::TextDisabled("Random seeds, every core but one");
+    }
+
+    // what it found
+    std::vector<long long> found;
+    { std::lock_guard<std::mutex> lk(g_Seek.lock); found = g_Seek.found; }
+    ImGui::BeginChild("##seekfound", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    if (found.empty()) ImGui::TextDisabled("Seeds of the wars that matched land here. Click one to open it in Debug.");
+    for (size_t i = 0; i < found.size(); i++)
+    {
+        char lbl[48];
+        snprintf(lbl, sizeof(lbl), "%lld##f%d", found[i], (int)i);
+        if (ImGui::Selectable(lbl)) SeekOpenInDebug(found[i]);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click: open this war in Debug\nRight-click: copy the seed");
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
+        {
+            char t[48];
+            snprintf(t, sizeof(t), "SEED!@#=%lld", found[i]);
+            ImGui::SetClipboardText(t);
+            S.status = std::string("Copied ") + t;
+        }
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
 static void DrawLeaderboardPanel()
 {
     AppState& S = g_App;
@@ -922,93 +1264,172 @@ static void DrawLeaderboardPanel()
 
     // ---- controls ---------------------------------------------------------
     const bool joined   = (S.compMode == MODE_JOIN);
-    const bool shardRun = (S.compMode == MODE_OFFLINE && g_CompShardOpen);
-    const bool limitless = shardRun ? (g_CompShard.games <= 0) : (S.compGames <= 0);
-    const int total = shardRun ? ImMax(1, g_CompShard.games) : ImMax(1, S.compGames);
+    const bool limitless = (S.compGames <= 0);
+    const int total = ImMax(1, S.compGames);
     const int done  = CompetitionGamesDone();
 
     // The controls sit on a strip of their own, like the Debug panel's
-    // transport bar: a caption before each field rather than a label after it.
+    // transport bar. No captions: each field says what it holds inside its own
+    // value ("1000 games", "auto threads"), and the engine / mode pickers name
+    // themselves. The related fields are joined into trains.
+    const ImVec2 barO = ImGui::GetCursorScreenPos();
+    const float  barPadY = ImGui::GetStyle().WindowPadding.y;
+    const float  bandBottom = barO.y + kBarH * g_Scale + barPadY;
     {
-        const ImVec2 o = ImGui::GetCursorScreenPos();
         const ImVec2 wp = ImGui::GetWindowPos();
-        const float  barH = ImGui::GetFrameHeight() + 14 * g_Scale;
         ImDrawList* bdl = ImGui::GetWindowDrawList();
-        bdl->AddRectFilled(ImVec2(wp.x, o.y - ImGui::GetStyle().WindowPadding.y),
-                           ImVec2(wp.x + ImGui::GetWindowWidth(), o.y + barH - 7 * g_Scale), HexU(Col::Bg1));
-        bdl->AddLine(ImVec2(wp.x, o.y + barH - 7 * g_Scale), ImVec2(wp.x + ImGui::GetWindowWidth(), o.y + barH - 7 * g_Scale),
+        bdl->AddRectFilled(ImVec2(wp.x, barO.y - barPadY),
+                           ImVec2(wp.x + ImGui::GetWindowWidth(), bandBottom), HexU(Col::Bg1));
+        bdl->AddLine(ImVec2(wp.x, bandBottom), ImVec2(wp.x + ImGui::GetWindowWidth(), bandBottom),
                      HexU(Col::Line));
     }
-    auto caption = [](const char* t) {
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(Hex(Col::TextDim), "%s", t);
-        ImGui::SameLine(0, 6 * g_Scale);
-    };
+    const float group  = 10.0f * g_Scale;
+    const float runW   = 76.0f * g_Scale;
+    const float gamesW = 112.0f * g_Scale, thrW = 104.0f * g_Scale, perW = 100.0f * g_Scale;
+    const float seedW  = 150.0f * g_Scale;
+    const float engW   = 104.0f * g_Scale, modeW = 88.0f * g_Scale;
+    // The seed is the first thing to go when the panel is narrow; Options has
+    // it too, and it can be switched off for good there.
+    // the smart check's button is there only while some group uses int 0x89
+    const bool  smartBtn = HasWorkspace() && AnyGroupUsesInt89();
+    const float smartW   = ImGui::CalcTextSize("Smart check").x + 22.0f * g_Scale;
+    const float without = runW + group + gamesW + thrW + perW + group + engW + modeW +
+                          (S.compSeekTool ? group + kBarH * g_Scale : 0.0f) +
+                          (smartBtn ? group + smartW : 0.0f);
+    const bool  showSeed = S.compSeedInBar && ImGui::GetContentRegionAvail().x >= without + group + seedW;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(10 * g_Scale, (kBarH * g_Scale - ImGui::GetFontSize()) * 0.5f));
+    // the one button that matters here wears the accent; Stop wears danger
+    {
+        const unsigned c = S.compRunning ? Col::Danger : Col::Accent;
+        const bool needsWs = !joined;
+        ImGui::BeginDisabled(!S.compRunning && (joined || (needsWs && !HasWorkspace())));
+        ImGui::PushStyleColor(ImGuiCol_Button, Hex(c, 0.88f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Hex(c));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, Hex(c, 0.75f));
+        ImGui::PushStyleColor(ImGuiCol_Text, Hex(0xFFFFFF));
+        if (S.compRunning) { if (ImGui::Button("Stop", ImVec2(runW, 0))) CompetitionStop(); }
+        else               { if (ImGui::Button("Run",  ImVec2(runW, 0))) CompetitionStart(); }
+        ImGui::PopStyleColor(4);
+        ImGui::EndDisabled();
+        if (joined && !S.compRunning && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Joined machines start when the host presses Run");
+        else if (needsWs && !HasWorkspace() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Open a workspace first (Ctrl+O)");
+        else if (g_FolderRun.on && !S.compRunning && S.compMode == MODE_LOCAL && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Runs the groups against the folders again (the board above the graph\n"
+                              "has the switch back to an ordinary run)");
+    }
 
     ImGui::BeginDisabled(S.compRunning);
-    ImGui::BeginDisabled(joined || shardRun);
-    caption("Games");
-    ImGui::SetNextItemWidth(96 * g_Scale);
-    ImGui::DragInt("##games", &S.compGames, 5.0f, 0, 2000000, S.compGames ? "%d" : "limitless");
+    ImGui::SameLine(0, group);
+    ImGui::BeginDisabled(joined);
+    {
+        TrainField tf = TrainFieldBegin(gamesW, 0, 3);
+        ImGui::DragInt("##games", &S.compGames, 5.0f, 0, 2000000, S.compGames ? "%d games" : "limitless");
+        TrainFieldEnd(tf);
+    }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How many battles to play. 0 keeps going until you press Stop.");
+        ImGui::SetTooltip("Games - how many battles to play. 0 keeps going until you press Stop.");
     ImGui::EndDisabled();
-    ImGui::SameLine(0, 14 * g_Scale);
-    caption("Threads");
-    ImGui::SetNextItemWidth(64 * g_Scale);
-    ImGui::DragInt("##threads", &S.compThreads, 0.2f, 0, 128, S.compThreads ? "%d" : "auto");
+    ImGui::SameLine(0, 0);
+    {
+        TrainField tf = TrainFieldBegin(thrW, 1, 3);
+        ImGui::DragInt("##threads", &S.compThreads, 0.2f, 0, 128, S.compThreads ? "%d threads" : "auto threads");
+        TrainFieldEnd(tf);
+    }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("0 spreads the run over every core the machine has (%d here)",
+        ImGui::SetTooltip("Threads - 0 spreads the run over every core the machine has (%d here)",
                           (int)std::thread::hardware_concurrency());
-    ImGui::SameLine(0, 14 * g_Scale);
-    ImGui::BeginDisabled(joined || shardRun);
-    caption("Per battle");
-    ImGui::SetNextItemWidth(90 * g_Scale);
-    ImGui::DragInt("##perbattle", &S.compCombo, 0.1f, 0, 20, S.compCombo ? "%d groups" : "all");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How many groups are drawn into each war.\n"
-                          "A war holds 20 warriors, so a field of more than about nine\n"
-                          "groups cannot all fight at once -- draw a few per battle and\n"
-                          "let the seeds cover the combinations. 0 puts everyone in.");
-    ImGui::SameLine(0, 14 * g_Scale);
-    caption("Seed");
-    if (shardRun || joined)
+    ImGui::SameLine(0, 0);
+    ImGui::BeginDisabled(joined);
     {
-        // the pack decides the seed; show it rather than a field that does nothing
-        char sv[32];
-        snprintf(sv, sizeof(sv), "%lld", (long long)(shardRun ? g_CompShard.seed : g_NetClient.field.seed));
-        ImGui::SetNextItemWidth(130 * g_Scale);
-        ImGui::InputText("##compseedro", sv, sizeof(sv), ImGuiInputTextFlags_ReadOnly);
-    }
-    else
-    {
-        ImGui::SetNextItemWidth(130 * g_Scale);
-        ImGui::InputTextWithHint("##compseed", "same as Debug", S.compSeedText, sizeof(S.compSeedText));
+        TrainField tf = TrainFieldBegin(perW, 2, 3);
+        ImGui::DragInt("##perbattle", &S.compCombo, 0.1f, 0, 20, S.compCombo ? "%d per war" : "all per war");
+        TrainFieldEnd(tf);
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The seed the first war is fought from; war k uses it + k.\n"
-                          "Text or a number, resolved the way the reference does.\n"
-                          "Empty: the Debug panel's seed.  -> %lld",
-                          (long long)SeedFromText(CompSeedText()));
+        ImGui::SetTooltip("Groups per battle - how many are drawn into each war.\n"
+                          "The C++ engine fits about 15 groups of two in one war (the\n"
+                          "arena runs out of room after that); Java and Busy hold 20\n"
+                          "warriors, about nine groups, and leave bigger battles to C++.\n"
+                          "Draw a few per battle and let the seeds cover the\n"
+                          "combinations. 0 puts everyone in.");
+    if (showSeed)
+    {
+        // a seed is just a number or a word, so this one keeps a small tag
+        ImGui::SameLine(0, group);
+        const ImVec2 sp = ImGui::GetCursorScreenPos();
+        ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+        const ImVec2 tagSz = ImGui::CalcTextSize("SEED");
+        ImGui::PopFont();
+        const float tagW = tagSz.x + 18 * g_Scale;
+        {
+            // the tag is the train's first carriage, the field its second
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(sp, ImVec2(sp.x + tagW, sp.y + kBarH * g_Scale), HexU(Col::Bg3, 0.7f),
+                              7.0f * g_Scale, ImDrawFlags_RoundCornersLeft);
+            ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+            dl->AddText(ImVec2(sp.x + 9 * g_Scale, sp.y + (kBarH * g_Scale - tagSz.y) * 0.5f),
+                        HexU(Col::TextDim), "SEED");
+            ImGui::PopFont();
+            ImGui::Dummy(ImVec2(tagW, kBarH * g_Scale));
+        }
+        ImGui::SameLine(0, 0);
+        TrainField tf = TrainFieldBegin(seedW - tagW, 1, 2);
+        if (joined)
+        {
+            // the host decides the seed; show it rather than a field that does nothing
+            char sv[32];
+            snprintf(sv, sizeof(sv), "%lld", (long long)g_NetClient.field.seed);
+            ImGui::InputText("##compseedro", sv, sizeof(sv), ImGuiInputTextFlags_ReadOnly);
+        }
+        else
+            ImGui::InputTextWithHint("##compseed", S.seedText[0] ? S.seedText : "Debug's",
+                                     S.compSeedText, sizeof(S.compSeedText));
+        TrainFieldEnd(tf);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The seed the first war is fought from; war k uses it + k.\n"
+                              "Text or a number, resolved the way the reference does.\n"
+                              "Empty: the Debug panel's seed.  -> %lld\n\n"
+                              "Hidden when the panel is narrow; always in Options > Competition.",
+                              (long long)SeedFromText(CompSeedText()));
+    }
     ImGui::EndDisabled();
-    ImGui::SameLine(0, 14 * g_Scale);
-    caption("Engine");
-    ImGui::SetNextItemWidth(104 * g_Scale);
-    static const char* kBackends[] = { "CPU", "GPU", "CPU + GPU", "Java" };
-    ImGui::Combo("##engine", &S.compBackend, kBackends, 4);
+    ImGui::SameLine(0, group);
+    {
+        // C++ and Java always; Busy only once Options has allowed it
+        const char* names[3] = { "C++", "Java", "Busy (C++)" };
+        const int   ids[3]   = { COMP_CPU, COMP_JAVA, COMP_BOTH };
+        const int   n = S.compAllowBusy ? 3 : 2;
+        int cur = 0;
+        for (int i = 0; i < n; i++) if (ids[i] == S.compBackend) cur = i;
+        TrainField tf = TrainFieldBegin(engW, 0, 2);
+        if (ImGui::Combo("##engine", &cur, names, n)) S.compBackend = ids[cur];
+        TrainFieldEnd(tf);
+    }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The GPU lane is gpu-engine\\engine.exe -- the same engine as a\n"
-                          "compute shader, run as a separate process so a driver reset\n"
-                          "cannot take the editor with it.\n"
-                          "CPU + GPU splits this machine's share: the CPU plays the\n"
-                          "even-numbered battles and the GPU the odd ones.\n"
-                          "Java plays the same battles on the CGX Java engine\n"
-                          "(CGX-engine\\engine) instead. Needs Java 17 or newer.");
-    ImGui::SameLine(0, 14 * g_Scale);
-    caption("Mode");
-    ImGui::SetNextItemWidth(90 * g_Scale);
-    static const char* kModes[] = { "Local", "Offline", "Server", "Join" };
-    if (ImGui::Combo("##mode", &S.compMode, kModes, 4))
+        ImGui::SetTooltip("C++   this app's own engine, on every core.\n"
+                          "Java  the same battles on the CGX Java engine\n"
+                          "      (CGX-engine\\engine). Needs Java 17 or newer.%s",
+                          S.compAllowBusy ? "\nBusy  C++ and the graphics card together, half the battles\n"
+                                            "      each -- runs the machine hot (see Options)."
+                                          : "\n\nOptions > Competition can add Busy (C++): the C++ engine\n"
+                                            "and the graphics card together.");
+    ImGui::SameLine(0, 0);
+    static const char* kModes[] = { "Local", "Server", "Join" };
+    static const int   kModeIds[] = { MODE_LOCAL, MODE_SERVER, MODE_JOIN };
+    bool modeChanged = false;
+    {
+        int cur = 0;
+        for (int i = 0; i < 3; i++) if (kModeIds[i] == S.compMode) cur = i;
+        TrainField tf = TrainFieldBegin(modeW, 1, 2);
+        modeChanged = ImGui::Combo("##mode", &cur, kModes, 3);
+        TrainFieldEnd(tf);
+        S.compMode = kModeIds[cur];
+    }
+    if (modeChanged)
     {
         // leaving a mode drops its wire; the board it built stays
         if (S.compMode != MODE_SERVER) NetServerStop();
@@ -1017,8 +1438,6 @@ static void DrawLeaderboardPanel()
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Local    this machine only.\n"
-                          "Offline  write one shard file per machine, carry them over,\n"
-                          "         bring the result files back and add them up here.\n"
                           "Server   host: other machines join over the network and play\n"
                           "         their share the moment you press Run.\n"
                           "Join     play a share of a tournament somebody else is hosting.\n"
@@ -1027,29 +1446,49 @@ static void DrawLeaderboardPanel()
                           "battles never overlap and the standings are a plain sum.");
     ImGui::EndDisabled();
 
-    ImGui::SameLine(0, 16 * g_Scale);
-    // the one button that matters here wears the accent; Stop wears danger
-    if (S.compRunning || !joined)
+    // the seed search, when Options puts it on the toolbar
+    if (S.compSeekTool)
     {
-        const unsigned c = S.compRunning ? Col::Danger : Col::Accent;
-        ImGui::PushStyleColor(ImGuiCol_Button, Hex(c, 0.88f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Hex(c));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, Hex(c, 0.75f));
-        ImGui::PushStyleColor(ImGuiCol_Text, Hex(0xFFFFFF));
-        if (S.compRunning) { if (ImGui::Button("Stop", ImVec2(84 * g_Scale, 0))) CompetitionStop(); }
-        else               { if (ImGui::Button("Run",  ImVec2(84 * g_Scale, 0))) CompetitionStart(); }
-        ImGui::PopStyleColor(4);
+        ImGui::SameLine(0, group);
+        const float bs = kBarH * g_Scale;
+        BtnState b = BareButton("##seek", ImVec2(bs, bs));
+        ImDrawList* bdl = ImGui::GetWindowDrawList();
+        bdl->AddRectFilled(b.mn, b.mx, HexU(g_Seek.open ? Col::Bg4 : b.hovered ? Col::Bg3 : Col::Bg2), 7 * g_Scale);
+        const ImVec2 c((b.mn.x + b.mx.x) * 0.5f - 1.5f * g_Scale, (b.mn.y + b.mx.y) * 0.5f - 1.5f * g_Scale);
+        const ImU32 ink = HexU(g_Seek.running.load() > 0 ? Col::Accent : (b.hovered ? Col::Text : Col::TextDim));
+        bdl->AddCircle(c, 5.0f * g_Scale, ink, 0, 1.6f * g_Scale);
+        bdl->AddLine(ImVec2(c.x + 3.6f * g_Scale, c.y + 3.6f * g_Scale), ImVec2(c.x + 7.5f * g_Scale, c.y + 7.5f * g_Scale),
+                     ink, 2.0f * g_Scale);
+        if (b.hovered) ImGui::SetTooltip("Seed search\nPlays random wars between the groups you pick and keeps\n"
+                                         "the seeds of the ones the survivors you pick won");
+        if (b.clicked) g_Seek.open = !g_Seek.open;
     }
-    ImGui::Dummy(ImVec2(0, 4 * g_Scale));
+    // the smart check: which AX:DX an int 0x89 should look for
+    if (smartBtn)
+    {
+        ImGui::SameLine(0, group);
+        ImGui::PushStyleColor(ImGuiCol_Button, Hex(SmartCheckIsOpen() ? Col::Bg4 : Col::Bg2));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Hex(Col::Bg3));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, Hex(Col::Bg4));
+        ImGui::PushStyleColor(ImGuiCol_Text, Hex(SmartCheckIsRunning() ? Col::Accent : Col::Text));
+        if (ImGui::Button("Smart check", ImVec2(smartW, kBarH * g_Scale))) SmartCheckToggle();
+        ImGui::PopStyleColor(4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Smart check\nA group's int 0x89 is INT 87h in a real war. This plays it against the\n"
+                              "active groups once for every AX:DX it could search for -- every 4 bytes\n"
+                              "of the other warriors -- and ranks them by the points it takes.");
+    }
+    ImGui::PopStyleVar();   // the toolbar's frame padding
+
+    // out of the band, onto the panel proper
+    ImGui::SetCursorScreenPos(ImVec2(barO.x, bandBottom + barPadY));
 
     if (!S.compGpuNote.empty())
     {
-        ImGui::SameLine(0, 12 * g_Scale);
         ImGui::TextColored(Hex(Col::Warn), "%s", S.compGpuNote.c_str());
     }
     else if (g_Gpu.result.gamesRun > 0 || g_Gpu.running)
     {
-        ImGui::SameLine(0, 12 * g_Scale);
         const double gr = g_Gpu.seconds > 0.0 ? g_Gpu.gamesRun / g_Gpu.seconds : 0.0;
         if (g_Gpu.gamesRun > 0)
             ImGui::TextColored(Hex(Col::Accent), "GPU %d war(s), %.0f games/s", g_Gpu.gamesRun, gr);
@@ -1091,170 +1530,165 @@ static void DrawLeaderboardPanel()
     }
 
     // ---- the distributed row ------------------------------------------------
-    if (S.compMode == MODE_OFFLINE)
+    if (S.compMode == MODE_SERVER)
     {
-        ImGui::BeginDisabled(S.compRunning);
-        if (g_CompShardOpen)
+        const bool up = NetServerUp();
+        if (!up && !CloudflaredPresent())
         {
-            ImGui::TextColored(Hex(Col::Accent), "shard %d of %d", g_CompShard.phase + 1, g_CompShard.stride);
+            // no tunnel program, no server: say what to get and where it goes
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(Hex(Col::Warn), "Server mode needs cloudflared.exe next to app.exe.");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("cloudflared is Cloudflare's free tunnel program -- no account needed.\n"
+                                  "It gives this machine a public https address for the tournament, so\n"
+                                  "others join from anywhere: no router setup, and it works on campus Wi-Fi.\n\n"
+                                  "Download cloudflared-windows-amd64.exe, rename it to cloudflared.exe\n"
+                                  "and put it in this folder:\n  %s", ExeDir().c_str());
             ImGui::SameLine(0, 8 * g_Scale);
-            int warriors = 0;
-            for (const cw::WarriorGroup& g : g_CompShard.groups) warriors += (int)g.warriors.size();
-            if (g_CompShard.games > 0)
-                ImGui::TextColored(Hex(Col::TextDim), "%d groups, %d warriors, %d games  --  %s",
-                                   (int)g_CompShard.groups.size(), warriors, g_CompShard.games, g_CompShard.title.c_str());
-            else
-                ImGui::TextColored(Hex(Col::TextDim), "%d groups, %d warriors, until Stop  --  %s",
-                                   (int)g_CompShard.groups.size(), warriors, g_CompShard.title.c_str());
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g_CompShardPath.c_str());
-            ImGui::SameLine(0, 8 * g_Scale);
-            if (ImGui::SmallButton("Close shard")) CompetitionCloseShard();
+            if (ImGui::SmallButton("Get cloudflared..."))
+                ShellExecuteA(g_Hwnd, "open", kCloudflaredPage, NULL, NULL, SW_SHOWNORMAL);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Opens Cloudflare's download page in your browser");
+            ImGui::SameLine(0, 4 * g_Scale);
+            if (ImGui::SmallButton("Open app folder"))
+                ShellExecuteA(g_Hwnd, "open", ExeDir().c_str(), NULL, NULL, SW_SHOWNORMAL);
         }
         else
         {
-            ImGui::SetNextItemWidth(80 * g_Scale);
-            ImGui::DragInt("shards", &S.compShards, 0.1f, 1, kNetStride);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("One shard file per machine. Each plays every %dth battle, offset by its number.",
-                                  ImMax(1, S.compShards));
-            ImGui::SameLine(0, 6 * g_Scale);
-            if (ImGui::Button("Export shards...")) CompetitionExportShards();
-            ImGui::SameLine(0, 12 * g_Scale);
-            if (ImGui::Button("Open shard...")) CompetitionOpenShard();
-        }
-        ImGui::SameLine(0, 12 * g_Scale);
-        ImGui::BeginDisabled(g_CompLocal.empty() || g_CompLocal.gamesRun == 0);
-        if (ImGui::Button("Save results...")) CompetitionSaveResults();
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("What this machine played, as a file to carry back to the host.");
-        ImGui::SameLine(0, 6 * g_Scale);
-        if (ImGui::Button("Add results...")) CompetitionAddResults();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Result files from the other machines. Each is added into the board;\n"
-                              "adding the same one twice replaces it, never doubles it.");
-        if (!g_NetPacks.empty())
-        {
-            ImGui::SameLine(0, 8 * g_Scale);
-            int games = 0;
-            for (const auto& kv : g_NetPacks) games += kv.second.gamesRun;
-            ImGui::TextColored(Hex(Col::Accent2), "%d file(s) merged, %d games", (int)g_NetPacks.size(), games);
-            if (ImGui::IsItemHovered())
+            if (up)
             {
-                ImGui::BeginTooltip();
-                for (const auto& kv : g_NetPacks)
-                    ImGui::Text("%s  --  %d games in %.0fs", kv.first.c_str(), kv.second.gamesRun, kv.second.seconds);
-                ImGui::EndTooltip();
+                ImGui::BeginDisabled(S.compRunning);
+                if (ImGui::Button("Stop listening")) NetServerStop();
+                ImGui::EndDisabled();
             }
-            ImGui::SameLine(0, 6 * g_Scale);
-            if (ImGui::SmallButton("Clear")) { g_NetPacks.clear(); g_NetPacksRev++; }
-        }
-        ImGui::EndDisabled();
-    }
-    else if (S.compMode == MODE_SERVER)
-    {
-        ImGui::BeginDisabled(NetServerUp());
-        ImGui::SetNextItemWidth(70 * g_Scale);
-        ImGui::InputInt("port", &S.compNetPort, 0, 0);
-        S.compNetPort = ImClamp(S.compNetPort, 1, 65535);
-        ImGui::EndDisabled();
-        ImGui::SameLine(0, 6 * g_Scale);
-        if (NetServerUp())
-        {
-            ImGui::BeginDisabled(S.compRunning);
-            if (ImGui::Button("Stop listening")) NetServerStop();
-            ImGui::EndDisabled();
-            ImGui::SameLine(0, 12 * g_Scale);
-            static std::vector<NetAddr> addrs;
-            static double addrsAt = -100.0;
-            if (AppNow() - addrsAt > 30.0) { addrs = NetLocalAddresses(); addrsAt = AppNow(); }
-            // The best guess is on the panel itself -- in a tooltip nobody found it.
-            if (addrs.empty())
-                ImGui::TextColored(Hex(Col::Accent), "listening on port %d", g_NetServer.port);
-            else
-                ImGui::TextColored(Hex(Col::Accent), "listening -- joiners type  %s : %d",
-                                   addrs[0].ip.c_str(), g_NetServer.port);
-            if (ImGui::IsItemHovered())
+            else if (ImGui::Button("Listen"))
             {
-                ImGui::BeginTooltip();
-                ImGui::TextUnformatted("This machine's addresses, most likely first:");
-                for (const NetAddr& a : addrs)
-                    ImGui::Text("  %-15s  %s%s", a.ip.c_str(), a.adapter.c_str(),
-                                a.rank == 2 ? "  (virtual -- other PCs cannot reach it)" : "");
-                if (addrs.empty()) ImGui::TextUnformatted("  (none found)");
-                ImGui::Spacing();
-                ImGui::Text("TCP port %d must be let through this machine's firewall.", g_NetServer.port);
-                ImGui::EndTooltip();
+                std::string why;
+                if (NetServerStart(S.compNetPort, why)) g_CompNetNote.clear();
+                else g_CompNetNote = why;
             }
-            ImGui::SameLine(0, 12 * g_Scale);
-            if (g_NetServer.peers.empty())
-                ImGui::TextColored(Hex(Col::TextDim), "nobody has joined yet");
-            else
+            if (!up && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Starts the tunnel and shows the address joiners paste. Machines that join\n"
+                                  "sit in a lobby until you press Run; one that joins mid-run is handed a\n"
+                                  "share straight away.");
+            // who may join: set in Options, shown here
             {
-                int playing = 0;
-                for (const NetPeer& p : g_NetServer.peers) if (p.running) playing++;
-                ImGui::TextColored(Hex(Col::Accent2), "%d joined%s", (int)g_NetServer.peers.size(),
-                                   playing ? (", " + std::to_string(playing) + " playing").c_str() : "");
+                const int who = up ? g_NetServer.protect : ImClamp(S.compNetProtect, 0, 2);
+                static const char* kWho[] = { "anyone may join", "password-protected", "you accept each joiner" };
+                ImGui::SameLine(0, 12 * g_Scale);
+                ImGui::TextColored(Hex(who == NET_OPEN ? Col::TextDim : Col::Accent2), "%s", kWho[who]);
                 if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Who may join is set under Options > Competition > Shared tournaments%s",
+                                      up ? "\n(a change there counts from the next Listen)" : "");
+                if (!up && who == NET_PASSWORD && !S.compNetPassword[0])
                 {
-                    ImGui::BeginTooltip();
-                    for (const NetPeer& p : g_NetServer.peers)
+                    ImGui::SameLine(0, 8 * g_Scale);
+                    ImGui::TextColored(Hex(Col::Warn), "-- no password set yet");
+                }
+            }
+
+            if (up)
+            {
+                // the address, or where the tunnel is
+                const std::string url = NetTunnelUrl();
+                if (!url.empty())
+                {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(Hex(Col::TextDim), "joiners paste");
+                    ImGui::SameLine();
+                    ImGui::TextColored(Hex(Col::Accent), "%s", url.c_str());
+                    ImGui::SameLine(0, 6 * g_Scale);
+                    if (ImGui::SmallButton("Copy"))
                     {
-                        if (p.phase < 0)
-                            ImGui::Text("%s  (%s)  -- no seat left", p.name.c_str(), p.addr.c_str());
-                        else if (p.running || p.gamesRun)
-                            ImGui::Text("%s  (%s)  phase %d  --  %d games, %.0f games/s%s",
-                                        p.name.c_str(), p.addr.c_str(), p.phase, p.gamesRun, p.rate,
-                                        p.running ? "" : ", done");
-                        else
-                            ImGui::Text("%s  (%s)  phase %d  --  waiting", p.name.c_str(), p.addr.c_str(), p.phase);
+                        ImGui::SetClipboardText(url.c_str());
+                        S.status = "Copied the tournament's address";
                     }
-                    ImGui::EndTooltip();
+                }
+                else if (g_Tunnel.running.load())
+                {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(Hex(Col::TextDim), "starting the tunnel... %.0fs", AppNow() - g_Tunnel.startedAt);
+                }
+                else
+                {
+                    std::string last;
+                    { std::lock_guard<std::mutex> lk(g_Tunnel.mu); last = g_Tunnel.lastLine; }
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(Hex(Col::Warn), "the tunnel stopped%s%s", last.empty() ? "" : ": ", last.c_str());
+                    ImGui::SameLine(0, 6 * g_Scale);
+                    if (ImGui::SmallButton("Restart tunnel"))
+                    {
+                        std::string why;
+                        if (!NetTunnelStart(g_NetServer.port, why)) g_CompNetNote = why;
+                    }
+                }
+
+                // who is in
+                int in = 0, playing = 0;
+                for (const NetPeer& p : g_NetServer.peers)
+                    if (p.admitted) { in++; if (p.running) playing++; }
+                ImGui::SameLine(0, 14 * g_Scale);
+                if (in == 0)
+                    ImGui::TextColored(Hex(Col::TextDim), "nobody has joined yet");
+                else
+                {
+                    ImGui::TextColored(Hex(Col::Accent2), "%d joined%s", in,
+                                       playing ? (", " + std::to_string(playing) + " playing").c_str() : "");
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::BeginTooltip();
+                        for (const NetPeer& p : g_NetServer.peers)
+                        {
+                            if (!p.admitted) continue;
+                            if (p.phase < 0)
+                                ImGui::Text("%s  (%s)  -- no seat left", p.name.c_str(), p.addr.c_str());
+                            else if (p.running || p.gamesRun)
+                                ImGui::Text("%s  (%s)  phase %d  --  %d games, %.0f games/s%s",
+                                            p.name.c_str(), p.addr.c_str(), p.phase, p.gamesRun, p.rate,
+                                            p.running ? "" : ", done");
+                            else
+                                ImGui::Text("%s  (%s)  phase %d  --  waiting", p.name.c_str(), p.addr.c_str(), p.phase);
+                        }
+                        ImGui::EndTooltip();
+                    }
+                }
+
+                // "ask me": the ones at the door
+                for (size_t i = 0; i < g_NetServer.peers.size(); i++)
+                {
+                    NetPeer& p = g_NetServer.peers[i];
+                    if (!p.pending) continue;
+                    ImGui::PushID((int)i);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored(Hex(Col::Accent), "%s  (%s)  wants to join", p.name.c_str(), p.addr.c_str());
+                    ImGui::SameLine(0, 8 * g_Scale);
+                    if (ImGui::SmallButton("Accept")) NetServerAdmit(p);
+                    ImGui::SameLine(0, 4 * g_Scale);
+                    if (ImGui::SmallButton("Deny")) NetServerTurnAway(p, "the host turned you away");
+                    ImGui::PopID();
                 }
             }
         }
-        else if (ImGui::Button("Listen"))
-        {
-            std::string why;
-            if (NetServerStart(S.compNetPort, why)) g_CompNetNote.clear();
-            else g_CompNetNote = why;
-        }
-        if (!NetServerUp() && !g_NetServer.note.empty())
+        if (!up && !g_NetServer.note.empty())
         {
             ImGui::SameLine(0, 12 * g_Scale);
             ImGui::TextColored(Hex(Col::Warn), "%s", g_NetServer.note.c_str());
         }
-        if (ImGui::IsItemHovered() && !NetServerUp())
-            ImGui::SetTooltip("Open the port. Machines that join sit in a lobby until you press Run;\n"
-                              "one that joins mid-run is handed a share straight away.");
-
-        // Joiners that keep knocking are nearly always this machine's firewall.
-        static std::string firewallNote;
-        if (ImGui::SmallButton("Allow in firewall..."))
-            firewallNote = NetAllowThroughFirewall(S.compNetPort);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Lets joiners through Windows Defender Firewall (asks for admin approval):\n"
-                              "  - removes the inbound rules Windows made for this program -- cancelling\n"
-                              "    its first \"allow access\" prompt leaves a Block rule that beats any allow\n"
-                              "  - adds \"CWEST8086 server\": TCP port %d, from the local network only\n\n"
-                              "Antivirus suites with their own firewall (ESET, Kaspersky, Norton...)\n"
-                              "need the same done in their settings.", S.compNetPort);
-        if (!firewallNote.empty())
-        {
-            ImGui::SameLine(0, 8 * g_Scale);
-            ImGui::TextColored(Hex(Col::TextDim), "%s", firewallNote.c_str());
-        }
     }
     else if (S.compMode == MODE_JOIN)
     {
-        const bool linked = (g_NetClient.s != INVALID_SOCKET) || g_NetClient.state == NET_CONNECTING;
+        const bool linked = g_NetClient.state == NET_CONNECTING || g_NetClient.state == NET_WAITING ||
+                            g_NetClient.state == NET_RUNNING;
         ImGui::BeginDisabled(linked);
-        ImGui::SetNextItemWidth(160 * g_Scale);
-        ImGui::InputText("host", S.compNetHost, sizeof(S.compNetHost));
+        ImGui::SetNextItemWidth(300 * g_Scale);
+        ImGui::InputTextWithHint("##joinaddr", "https://....trycloudflare.com", S.compNetHost, sizeof(S.compNetHost));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The address on the host's panel -- paste it here.\n"
+                              "(host:port reaches a host on this same machine.)");
         ImGui::SameLine(0, 6 * g_Scale);
-        ImGui::SetNextItemWidth(70 * g_Scale);
-        ImGui::InputInt("port##join", &S.compNetPort, 0, 0);
-        S.compNetPort = ImClamp(S.compNetPort, 1, 65535);
+        ImGui::SetNextItemWidth(110 * g_Scale);
+        ImGui::InputTextWithHint("##joinpw", "password", S.compNetPassword, sizeof(S.compNetPassword),
+                                 ImGuiInputTextFlags_Password);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only if the host set one.");
         ImGui::EndDisabled();
         ImGui::SameLine(0, 6 * g_Scale);
         if (linked)
@@ -1268,7 +1702,7 @@ static void DrawLeaderboardPanel()
         else if (ImGui::Button("Connect"))
         {
             std::string why;
-            if (!NetClientConnect(S.compNetHost, S.compNetPort, why)) g_NetClient.note = why;
+            if (!NetClientConnect(S.compNetHost, why)) { g_NetClient.state = NET_FAILED; g_NetClient.note = why; }
         }
         ImGui::SameLine(0, 12 * g_Scale);
         const unsigned tone = g_NetClient.state == NET_FAILED ? Col::Warn
@@ -1306,14 +1740,12 @@ static void DrawLeaderboardPanel()
         if (joined)
             ImGui::TextColored(Hex(Col::TextDim),
                 "Connect to a host. The field, the seed and this machine's share all come from there.");
-        else if (S.compMode == MODE_OFFLINE)
-            ImGui::TextColored(Hex(Col::TextDim),
-                "Export a shard file per machine, or open one to play here. Result files from every "
-                "machine add up on the host.");
         else
             ImGui::TextColored(Hex(Col::TextDim),
-                "Enable some groups and press Run. Each war is played from its own seed and every "
-                "survivor still standing at the end splits a point.");
+                HasWorkspace()
+                    ? "Make some groups active and press Run. Each war is played from its own seed and "
+                      "every survivor still standing at the end splits a point."
+                    : "Open a workspace first (Ctrl+O).");
         ImGui::End();
         return;
     }
@@ -1340,7 +1772,7 @@ static void DrawLeaderboardPanel()
                            S.compThreads ? S.compThreads : (int)std::thread::hardware_concurrency());
     }
     ImGui::SameLine(0, 16 * g_Scale);
-    const int others = (int)g_NetPacks.size() - (CompetitionLanesSuperseded() ? 1 : 0);
+    const int others = (int)g_NetPacks.size();
     if (hostBoard)
         ImGui::TextColored(Hex(S.compRunning ? Col::Accent2 : Col::TextDim),
                            "host's board: %d war(s) %s in %.0fs  --  %.0f games/s",
@@ -1362,15 +1794,128 @@ static void DrawLeaderboardPanel()
         ImGui::TextColored(Hex(Col::Warn), "engine built without -O2: about 4x slower than it should be");
     }
 
+    // ---- a run against folders: a page per folder ---------------------------
+    const bool fields = !g_CompFieldNames.empty() && !hostBoard &&
+                        g_CompFieldOf.size() == R.groupName.size();
+    if (fields)
+    {
+        if (g_CompFieldView >= (int)g_CompFieldNames.size()) g_CompFieldView = 0;
+        S.compFieldShow = ImClamp(S.compFieldShow, 0, 2);
+        // how the picked group(s) did in each folder: their share of its points,
+        // how many groups played there, and their places on its board
+        const size_t nf = g_CompFieldNames.size();
+        std::vector<double> subjShare(nf, 0.0), total(nf, 0.0);
+        std::vector<int> players(nf, 0), subjIn(nf, 0);
+        // by identity: where a folder holds a group of the same name, both fight
+        // under "Name [folder]" and the board's name is not the subject's any more
+        const bool keyed = g_CompGroups.size() == R.groupName.size() && !g_CompFieldSubjectKeys.empty();
+        auto isSubject = [&](size_t g) {
+            if (keyed)
+                return std::find(g_CompFieldSubjectKeys.begin(), g_CompFieldSubjectKeys.end(), g_CompGroups[g].key) != g_CompFieldSubjectKeys.end();
+            return std::find(g_CompFieldSubjects.begin(), g_CompFieldSubjects.end(), R.groupName[g]) != g_CompFieldSubjects.end();
+        };
+        for (size_t g = 0; g < R.groupName.size(); g++)
+        {
+            const int f = g_CompFieldOf[g];
+            if (f < 0 || f >= (int)nf) continue;
+            total[(size_t)f] += R.groupScore[g];
+            players[(size_t)f]++;
+            if (isSubject(g)) { subjShare[(size_t)f] += R.groupScore[g]; subjIn[(size_t)f]++; }
+        }
+        // a group's place in its folder: one more than the groups that beat it
+        auto placeOf = [&](size_t g) {
+            int place = 1;
+            for (size_t h = 0; h < R.groupName.size(); h++)
+                if (h != g && g_CompFieldOf[h] == g_CompFieldOf[g] && R.groupScore[h] > R.groupScore[g]) place++;
+            return place;
+        };
+
+        // the run's own controls: what each folder button shows, and the way out
+        ImGui::TextColored(Hex(Col::TextDim), "Against folders, show:");
+        ImGui::SameLine();
+        ImGui::RadioButton("Share", &S.compFieldShow, 0);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The picked group(s)' share of the folder's points");
+        ImGui::SameLine();
+        ImGui::RadioButton("vs average", &S.compFieldShow, 1);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The share against an even split: the share times the number of groups in the folder.\n"
+                              "100%% is exactly average, 200%% twice the average group's points.");
+        ImGui::SameLine();
+        ImGui::RadioButton("Place", &S.compFieldShow, 2);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the picked group(s) finished on the folder's board, of how many");
+        ImGui::SameLine(0, 16 * g_Scale);
+        ImGui::BeginDisabled(S.compRunning);
+        if (ImGui::SmallButton("Ordinary run"))
+        {
+            g_FolderRun.on = false;
+            g_CompFieldNames.clear();
+            g_CompFieldOf.clear();
+            S.status = "Run plays the active groups again";
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Leave the run against folders: Run goes back to the active groups");
+
+        // the folders, flowing onto as many lines as they need
+        const float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+        const ImGuiStyle& st = ImGui::GetStyle();
+        if (!g_CompFieldNames.empty()) ImGui::Spacing();
+        for (size_t f = 0; f < nf; f++)
+        {
+            const double pct = total[f] > 0.0 ? subjShare[f] / total[f] * 100.0 : 0.0;
+            // against an even split: each subject's share over 1/players
+            const double rel = (subjIn[f] > 0 && players[f] > 0) ? pct * players[f] / subjIn[f] : 0.0;
+            std::string places;
+            for (size_t g = 0; g < R.groupName.size(); g++)
+                if (g_CompFieldOf[g] == (int)f && isSubject(g))
+                    places += (places.empty() ? "#" : ", #") + std::to_string(placeOf(g));
+            char val[96];
+            if (S.compFieldShow == 1)      snprintf(val, sizeof(val), "%.0f%%", rel);
+            else if (S.compFieldShow == 2) snprintf(val, sizeof(val), "%s/%d", places.empty() ? "-" : places.c_str(), players[f]);
+            else                           snprintf(val, sizeof(val), "%.1f%%", pct);
+            char lbl[200];
+            snprintf(lbl, sizeof(lbl), "%s  %s##field%d", FolderLeaf(g_CompFieldNames[f]).c_str(), val, (int)f);
+
+            if (f > 0)
+            {
+                const float w = ImGui::CalcTextSize(lbl, nullptr, true).x + st.FramePadding.x * 2.0f;
+                if (ImGui::GetItemRectMax().x + st.ItemSpacing.x + w <= right) ImGui::SameLine();
+            }
+            const bool on = (g_CompFieldView == (int)f);
+            ImGui::PushStyleColor(ImGuiCol_Button, Hex(on ? Col::Accent : Col::Bg2, on ? 0.85f : 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Hex(on ? Col::Accent : Col::Bg3));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, Hex(on ? Col::Accent : Col::Bg4, on ? 0.75f : 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, Hex(on ? 0xFFFFFF : Col::Text));
+            if (ImGui::SmallButton(lbl)) g_CompFieldView = (int)f;
+            ImGui::PopStyleColor(4);
+            if (ImGui::IsItemHovered())
+            {
+                std::string who;
+                for (const std::string& s : g_CompFieldSubjects) who += (who.empty() ? "" : ", ") + s;
+                ImGui::SetTooltip("%s\n%s: %.1f%% of the points (%.0f%% of average), place %s of %d groups",
+                                  g_CompFieldNames[f].c_str(), who.c_str(), pct, rel,
+                                  places.empty() ? "-" : places.c_str(), players[f]);
+            }
+        }
+    }
+    auto inView = [&](int group) {
+        if (!fields) return true;
+        return group >= 0 && group < (int)g_CompFieldOf.size() && g_CompFieldOf[(size_t)group] == g_CompFieldView;
+    };
+
     std::vector<CompRow> rows;
     if (S.compByGroup)
+    {
         for (size_t i = 0; i < R.groupName.size(); i++)
-            rows.push_back({ R.groupName[i], R.groupScore[i], R.groupSurvived[i],
-                             CompColorOf(R, i, true) });
+            if (inView((int)i))
+                rows.push_back({ R.groupName[i], R.groupScore[i], R.groupSurvived[i],
+                                 CompColorOf(R, i, true) });
+    }
     else
         for (size_t i = 0; i < R.warriorName.size(); i++)
-            rows.push_back({ R.warriorName[i], R.warriorScore[i], R.warriorSurvived[i],
-                             CompColorOf(R, i, false) });
+            if (inView(R.warriorGroup[i]))
+                rows.push_back({ R.warriorName[i], R.warriorScore[i], R.warriorSurvived[i],
+                                 CompColorOf(R, i, false) });
 
     std::sort(rows.begin(), rows.end(),
               [](const CompRow& a, const CompRow& b) { return a.score > b.score; });
@@ -1396,7 +1941,10 @@ static void DrawLeaderboardPanel()
         ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 26 * g_Scale);
         ImGui::TableSetupColumn(S.compByGroup ? "Group" : "Survivor");
         ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, 58 * g_Scale);
-        ImGui::TableSetupColumn("Share", ImGuiTableColumnFlags_WidthFixed, 52 * g_Scale);
+        // in a run against folders, "vs average" turns the share into a ratio
+        // to an even split of the page's points
+        const bool vsAvg = fields && S.compFieldShow == 1;
+        ImGui::TableSetupColumn(vsAvg ? "vs avg" : "Share", ImGuiTableColumnFlags_WidthFixed, 52 * g_Scale);
         ImGui::TableHeadersRow();
 
         for (size_t i = 0; i < rows.size(); i++)
@@ -1410,8 +1958,9 @@ static void DrawLeaderboardPanel()
             ImGui::TableNextColumn();
             ImGui::Text("%.2f", rows[i].score);
             ImGui::TableNextColumn();
-            ImGui::TextColored(Hex(Col::TextDim), "%.1f%%",
-                               sum > 0.0 ? rows[i].score / sum * 100.0 : 0.0);
+            const double share = sum > 0.0 ? rows[i].score / sum * 100.0 : 0.0;
+            if (vsAvg) ImGui::TextColored(Hex(Col::TextDim), "%.0f%%", share * (double)rows.size());
+            else       ImGui::TextColored(Hex(Col::TextDim), "%.1f%%", share);
         }
         ImGui::EndTable();
     }

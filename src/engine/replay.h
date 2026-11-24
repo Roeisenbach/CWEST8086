@@ -115,6 +115,7 @@ struct Replay {
     std::vector<u16>         homeSS;
     std::vector<u16>         homeES;
     std::vector<std::string> groupName;
+    std::vector<std::string> groupKey;        // WarriorGroup::key, per group
 
     u64    cycleCount() const { return cycles.size(); }
     // the bytes the given cycle executed (kOpBytes of them), or nullptr

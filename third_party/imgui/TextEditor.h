@@ -264,6 +264,13 @@ public:
 	void Undo(int aSteps = 1);
 	void Redo(int aSteps = 1);
 
+	// Rewrites characters [aFromChar, aToChar) of one line (byte indices into
+	// the line) WITHOUT an undo record: for text that is derived from the rest
+	// of the line and is re-derived after every edit, undo included. The cursor,
+	// the selection and every undo record on that line are shifted along, so
+	// undo keeps landing where it should when the derived part changes length.
+	void ReplaceDerivedText(int aLine, int aFromChar, int aToChar, const std::string& aText);
+
 	static const Palette& GetDarkPalette();
 	static const Palette& GetLightPalette();
 	static const Palette& GetRetroBluePalette();
@@ -322,6 +329,7 @@ private:
 	int GetPageSize() const;
 	std::string GetText(const Coordinates& aStart, const Coordinates& aEnd) const;
 	Coordinates GetActualCursorCoordinates() const;
+	void ClampStateToText();
 	Coordinates SanitizeCoordinates(const Coordinates& aValue) const;
 	void Advance(Coordinates& aCoordinates) const;
 	void DeleteRange(const Coordinates& aStart, const Coordinates& aEnd);

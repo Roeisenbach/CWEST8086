@@ -96,14 +96,20 @@ void runCompetition(const std::vector<WarriorGroup>& groups, const CompeteOption
     // standings a couple of array increments rather than a name lookup.
     std::vector<WarriorGroup> field;      // drawn into each battle
     std::vector<WarriorGroup> always;     // zombies: present in every battle
+    std::vector<int>          fieldOf;    // per entry of `field`: which separate field it is in
     {
         size_t slot = 0;
-        for (const WarriorGroup& g : groups) {
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const WarriorGroup& g = groups[gi];
             WarriorGroup copy = g;
             for (WarriorData& w : copy.warriors)
                 w.slot = isZombie(w.type) ? -1 : (int)slot++;
             if (isZombieGroup(g)) always.push_back(std::move(copy));
-            else                  field.push_back(std::move(copy));
+            else {
+                field.push_back(std::move(copy));
+                const int f = (opt.fieldCount > 1 && gi < opt.groupField.size()) ? opt.groupField[gi] : 0;
+                fieldOf.push_back(f);
+            }
         }
     }
     if (field.empty()) {
@@ -111,8 +117,22 @@ void runCompetition(const std::vector<WarriorGroup>& groups, const CompeteOption
         return;
     }
 
+    // The separate fields, as lists of indices into `field`. One field (the
+    // usual case) is simply all of them.
+    const int nFields = opt.fieldCount > 1 ? opt.fieldCount : 1;
+    std::vector<std::vector<int>> members((size_t)nFields);
+    for (int i = 0; i < (int)field.size(); ++i) {
+        const int f = fieldOf[(size_t)i];
+        if (f >= 0 && f < nFields) members[(size_t)f].push_back(i);
+    }
+    for (const std::vector<int>& m : members)
+        if (m.empty()) { out.note = "a field has no groups in it"; return; }
+
     const int fieldSize = (int)field.size();
-    int comboSize = (opt.comboSize > 0 && opt.comboSize < fieldSize) ? opt.comboSize : fieldSize;
+    int maxMembers = 0;
+    for (const std::vector<int>& m : members) if ((int)m.size() > maxMembers) maxMembers = (int)m.size();
+    int comboSize = (opt.comboSize > 0 && opt.comboSize < maxMembers) ? opt.comboSize : maxMembers;
+    (void)fieldSize;
 
     std::vector<const WarriorGroup*> alwaysPtrs;
     for (const WarriorGroup& g : always) alwaysPtrs.push_back(&g);
@@ -185,8 +205,8 @@ void runCompetition(const std::vector<WarriorGroup>& groups, const CompeteOption
         War war(nullptr, nullptr, opt.zombieSpeed);
 
         Scratch sc;
-        sc.order.resize((size_t)fieldSize);
-        sc.ptrs.reserve((size_t)comboSize + alwaysPtrs.size());
+        sc.order.resize((size_t)maxMembers);
+        sc.ptrs.reserve((size_t)maxMembers + alwaysPtrs.size());
         sc.slots.resize((size_t)War::MAX_WARRIORS);
 
         // These hold what this worker has scored *since its last fold*, not its
@@ -210,9 +230,14 @@ void runCompetition(const std::vector<WarriorGroup>& groups, const CompeteOption
                 // lanes cover the tournament exactly once between them without
                 // having to agree on anything but the stride.
                 const s64 g = (s64)opt.seedPhase + (s64)k * (s64)opt.seedStride;
-                drawCombo(opt.pairingSeed, (int)g, fieldSize, comboSize, sc.order.data());
+                // With separate fields, battle g belongs to field g % n alone.
+                const std::vector<int>& pool = members[(size_t)(nFields > 1 ? (int)(g % nFields) : 0)];
+                const int poolSize = (int)pool.size();
+                const int take = comboSize < poolSize ? comboSize : poolSize;
+                drawCombo(opt.pairingSeed, (int)g, poolSize, take, sc.order.data());
                 sc.ptrs.clear();
-                for (int i = 0; i < comboSize; ++i) sc.ptrs.push_back(&field[(size_t)sc.order[(size_t)i]]);
+                for (int i = 0; i < take; ++i)
+                    sc.ptrs.push_back(&field[(size_t)pool[(size_t)sc.order[(size_t)i]]]);
                 for (const WarriorGroup* z : alwaysPtrs) sc.ptrs.push_back(z);
 
                 const s64 seed = opt.firstSeed + g;

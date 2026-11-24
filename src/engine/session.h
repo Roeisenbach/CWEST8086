@@ -105,6 +105,9 @@ public:
     }
     int  groupCount() const { return (int)m_replay.groupName.size(); }
     const std::string& groupName(int gi) const { return m_replay.groupName[(size_t)gi]; }
+    std::string groupKey(int gi) const {
+        return (gi >= 0 && gi < (int)m_replay.groupKey.size()) ? m_replay.groupKey[(size_t)gi] : std::string();
+    }
 
     int survivorsAlive() const;
     size_t replayBytes() const { return m_replay.bytes(); }

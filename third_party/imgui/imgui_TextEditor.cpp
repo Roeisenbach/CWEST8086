@@ -217,8 +217,14 @@ void TextEditor::Advance(Coordinates & aCoordinates) const
 	}
 }
 
-void TextEditor::DeleteRange(const Coordinates & aStart, const Coordinates & aEnd)
+void TextEditor::DeleteRange(const Coordinates & aStartIn, const Coordinates & aEndIn)
 {
+	// CWEST: never trust a range from outside -- a selection left over from a
+	// longer text used to reach past the last line here (Ctrl+V crash).
+	Coordinates aStart = SanitizeCoordinates(aStartIn);
+	Coordinates aEnd = SanitizeCoordinates(aEndIn);
+	if (aEnd < aStart)
+		std::swap(aStart, aEnd);
 	assert(aEnd >= aStart);
 	assert(!mReadOnly);
 
@@ -719,6 +725,8 @@ void TextEditor::HandleKeyboardInputs()
 			Undo();
 		else if (!IsReadOnly() && ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Y))
 			Redo();
+		else if (!IsReadOnly() && ctrl && shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Z))
+			Redo();                     // Ctrl+Shift+Z, the other usual spelling of redo
 		else if (!ctrl && !alt && ImGui::IsKeyPressed(ImGuiKey_UpArrow))
 			MoveUp(1, shift);
 		else if (!ctrl && !alt && ImGui::IsKeyPressed(ImGuiKey_DownArrow))
@@ -941,7 +949,14 @@ void TextEditor::Render()
 			if (errorIt != mErrorMarkers.end())
 			{
 				auto end = ImVec2(lineStartScreenPos.x + contentSize.x + 2.0f * scrollX, lineStartScreenPos.y + mCharAdvance.y);
-				drawList->AddRectFilled(start, end, mPalette[(int)PaletteIndex::ErrorMarker]);
+				// A soft wash over the line and a solid bar at its edge, rather than
+				// a slab of colour the code has to be read through.
+				const ImU32 mk = mPalette[(int)PaletteIndex::ErrorMarker];
+				const ImU32 mkSolid = mk | IM_COL32_A_MASK;
+				const ImU32 mkWash = (mk & ~IM_COL32_A_MASK) | ((ImU32)(((mk >> IM_COL32_A_SHIFT) & 0xFF) * 0.45f) << IM_COL32_A_SHIFT);
+				drawList->AddRectFilled(start, end, mkWash);
+				drawList->AddRectFilled(ImVec2(lineStartScreenPos.x + mTextStart - 4.0f, start.y),
+					ImVec2(lineStartScreenPos.x + mTextStart - 2.0f, end.y), mkSolid);
 
 				if (ImGui::IsMouseHoveringRect(lineStartScreenPos, end))
 				{
@@ -951,12 +966,15 @@ void TextEditor::Render()
 					head.w = 1.0f;
 					ImGui::BeginTooltip();
 					ImGui::PushStyleColor(ImGuiCol_Text, head);
-					ImGui::Text("Error at line %d:", errorIt->first);
+					ImGui::Text("%s at line %d:", errorIt->second.rfind("warning", 0) == 0 ? "Warning" : "Error",
+						errorIt->first);
 					ImGui::PopStyleColor();
 					ImGui::Separator();
 					ImGui::PushStyleColor(ImGuiCol_Text,
 						ImGui::ColorConvertU32ToFloat4(mPalette[(int)PaletteIndex::Default]));
-					ImGui::Text("%s", errorIt->second.c_str());
+					ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
+					ImGui::TextUnformatted(errorIt->second.c_str());
+					ImGui::PopTextWrapPos();
 					ImGui::PopStyleColor();
 					ImGui::EndTooltip();
 				}
@@ -1160,6 +1178,20 @@ void TextEditor::Render(const char* aTitle, const ImVec2& aSize, bool aBorder)
 	mWithinRender = false;
 }
 
+// CWEST: after the text is replaced, the cursor, the selection and a drag in
+// progress must all point inside the new text (they used to keep the old
+// survivor's coordinates, and a paste over that selection crashed).
+void TextEditor::ClampStateToText()
+{
+	mState.mCursorPosition = SanitizeCoordinates(mState.mCursorPosition);
+	mState.mSelectionStart = SanitizeCoordinates(mState.mSelectionStart);
+	mState.mSelectionEnd = SanitizeCoordinates(mState.mSelectionEnd);
+	if (mState.mSelectionStart > mState.mSelectionEnd)
+		std::swap(mState.mSelectionStart, mState.mSelectionEnd);
+	mInteractiveStart = SanitizeCoordinates(mInteractiveStart);
+	mInteractiveEnd = SanitizeCoordinates(mInteractiveEnd);
+}
+
 void TextEditor::SetText(const std::string & aText)
 {
 	mLines.clear();
@@ -1183,6 +1215,7 @@ void TextEditor::SetText(const std::string & aText)
 
 	mUndoBuffer.clear();
 	mUndoIndex = 0;
+	ClampStateToText();
 
 	Colorize();
 }
@@ -1214,6 +1247,7 @@ void TextEditor::SetTextLines(const std::vector<std::string> & aLines)
 
 	mUndoBuffer.clear();
 	mUndoIndex = 0;
+	ClampStateToText();
 
 	Colorize();
 }
@@ -2010,6 +2044,46 @@ void TextEditor::Redo(int aSteps)
 		mUndoBuffer[mUndoIndex++].Redo(this);
 }
 
+void TextEditor::ReplaceDerivedText(int aLine, int aFromChar, int aToChar, const std::string& aText)
+{
+	if (aLine < 0 || aLine >= (int)mLines.size())
+		return;
+	Line& line = mLines[aLine];
+	aToChar = std::min(aToChar, (int)line.size());
+	aFromChar = std::max(0, std::min(aFromChar, aToChar));
+
+	const int oldEndCol = GetCharacterColumn(aLine, aToChar);
+	line.erase(line.begin() + aFromChar, line.begin() + aToChar);
+	Line glyphs;
+	for (char c : aText)
+		glyphs.push_back(Glyph((Char)c, PaletteIndex::Default));
+	line.insert(line.begin() + aFromChar, glyphs.begin(), glyphs.end());
+	const int newEndCol = GetCharacterColumn(aLine, aFromChar + (int)aText.size());
+	const int delta = newEndCol - oldEndCol;
+
+	if (delta != 0)
+	{
+		// everything past the replaced run moved by delta columns
+		auto shift = [&](Coordinates& c) {
+			if (c.mLine == aLine && c.mColumn >= oldEndCol)
+				c.mColumn = std::max(0, c.mColumn + delta);
+		};
+		auto shiftState = [&](EditorState& s) {
+			shift(s.mCursorPosition); shift(s.mSelectionStart); shift(s.mSelectionEnd);
+		};
+		shiftState(mState);
+		shift(mInteractiveStart);
+		shift(mInteractiveEnd);
+		for (UndoRecord& u : mUndoBuffer)
+		{
+			shift(u.mAddedStart); shift(u.mAddedEnd);
+			shift(u.mRemovedStart); shift(u.mRemovedEnd);
+			shiftState(u.mBefore); shiftState(u.mAfter);
+		}
+	}
+	Colorize(aLine, 1);
+}
+
 const TextEditor::Palette & TextEditor::GetDarkPalette()
 {
 	const static Palette p = { {
@@ -2267,6 +2341,7 @@ void TextEditor::ColorizeInternal()
 		auto withinString = false;
 		auto withinSingleLineComment = false;
 		auto withinSpecialComment = false;
+		auto altMarkerAt = -1;			// where this line's ";$N" began, -1 for none
 		auto withinPreproc = false;
 		auto firstChar = true;			// there is no other non-whitespace characters in the line before
 		auto concatenate = false;		// '\' on the very end of the line
@@ -2280,6 +2355,7 @@ void TextEditor::ColorizeInternal()
 			{
 				withinSingleLineComment = false;
 				withinSpecialComment = false;
+				altMarkerAt = -1;
 				withinPreproc = false;
 				firstChar = true;
 			}
@@ -2338,14 +2414,31 @@ void TextEditor::ColorizeInternal()
 						auto& startStr = mLanguageDefinition.mCommentStart;
 						auto& singleStartStr = mLanguageDefinition.mSingleLineComment;
 
-						if (singleStartStr.size() > 0 &&
+						// The ";$N" marker itself ends at its last digit; what follows
+						// is the instruction again, coloured as code.
+						if (withinSpecialComment && currentIndex > altMarkerAt + (int)singleStartStr.size() &&
+							!isdigit((unsigned char)c))
+							withinSpecialComment = false;
+
+						if (!withinSingleLineComment && !withinSpecialComment &&
+							singleStartStr.size() > 0 &&
 							currentIndex + singleStartStr.size() <= line.size() &&
 							equals(singleStartStr.begin(), singleStartStr.end(), from, from + singleStartStr.size(), pred))
 						{
-							withinSingleLineComment = true;
-							// ";$" marks which encoding a db line stands for
+							// "db ... ;$N text": the text after the marker IS the
+							// instruction (the db in front is only how it is spelled in
+							// bytes, rewritten from it), so the text is coloured as code
+							// and the db part before it as a note.
 							const size_t marker = (size_t)currentIndex + singleStartStr.size();
-							withinSpecialComment = (marker < line.size() && line[marker].mChar == '$');
+							if (altMarkerAt < 0 && marker < line.size() && line[marker].mChar == '$')
+							{
+								withinSpecialComment = true;
+								altMarkerAt = currentIndex;
+								for (int k = 0; k < currentIndex; k++)
+									line[k].mComment = true;
+							}
+							else
+								withinSingleLineComment = true;
 						}
 						else if (!withinSingleLineComment && currentIndex + startStr.size() <= line.size() &&
 							equals(startStr.begin(), startStr.end(), from, from + startStr.size(), pred))

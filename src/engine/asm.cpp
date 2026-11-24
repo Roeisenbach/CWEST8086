@@ -1,7 +1,9 @@
 // =============================================================================
 //  8086 assembler -- see asm.h
 // =============================================================================
+#include <unordered_map>
 #include "asm.h"
+#include "disasm.h"
 
 #include <algorithm>
 #include <cctype>
@@ -92,6 +94,7 @@ struct Operand {
     int  sizeHint = 0;          // operand width: 0 unset, 1 byte, 2 word
     int  dispHint = 0;          // width forced on the displacement itself
     bool isFar = false;         // CALL / JMP through a far pointer
+    int  jumpHint = 0;          // JMP SHORT x = 1, JMP NEAR x = 2
     int  farSeg = -1;           // segment half of a SEG:OFF immediate
     std::string label;          // unresolved symbol (branch target or disp)
     bool labelIsDisp = false;
@@ -179,10 +182,21 @@ bool parseMem(const std::string& inner, Operand& o, std::string& err) {
         if (u.rfind("BYTE ", 0) == 0) { o.dispHint = 1; u = trim(u.substr(5)); }
         else if (u.rfind("WORD ", 0) == 0) { o.dispHint = 2; u = trim(u.substr(5)); }
 
+        const bool baseIdx = (u == "BX" || u == "BP" || u == "SI" || u == "DI");
+        if (baseIdx && t.first < 0) {
+            err = "a register can't be subtracted in an address: [BX-SI] isn't one";
+            return false;
+        }
         if      (u == "BX") o.bx = true;
         else if (u == "BP") o.bp = true;
         else if (u == "SI") o.si = true;
         else if (u == "DI") o.di = true;
+        else if (regIndex(R8, 8, u) >= 0 || regIndex(R16, 8, u) >= 0 || regIndex(SEG4, 4, u) >= 0) {
+            // [AX], [CX+2]: taken for a label before, which quietly made [0]
+            err = u + " can't address memory on the 8086 - only BX, BP, SI and DI can: "
+                      "[BX], [BP+SI], [DI+4], [1234h]";
+            return false;
+        }
         else {
             long long v;
             if (parseNumber(u, v)) { o.disp += t.first * v; o.hasDisp = true; }
@@ -215,6 +229,8 @@ bool parseOperand(const std::string& raw, Operand& o, std::string& err) {
     if      (eatKeyword(s, u, "BYTE")) o.sizeHint = 1;
     else if (eatKeyword(s, u, "WORD")) o.sizeHint = 2;
     eatKeyword(s, u, "PTR");
+    if      (eatKeyword(s, u, "SHORT")) o.jumpHint = 1;
+    else if (eatKeyword(s, u, "NEAR"))  o.jumpHint = 2;
     const bool far = eatKeyword(s, u, "FAR");
 
     if (!s.empty() && s.front() == '[') {
@@ -392,6 +408,16 @@ std::vector<std::vector<u8>> encodeVariants(const std::string& insnText, int atO
         for (const auto& prev : out) if (prev == e.b) return;
         out.push_back(e.b);
     };
+
+    // Two operands of different widths ("mov al, bx") have no encoding: the
+    // width bit would silently reinterpret one of them as the other size.
+    if (p.nOps == 2 && A.kind != OK::Seg && B.kind != OK::Seg) {
+        const int wa = widthOf(A), wb = widthOf(B);
+        if (wa && wb && wa != wb && !(M == "IN" || M == "OUT") &&
+            !(B.kind == OK::Reg8 && B.reg == 1 && (M == "ROL" || M == "ROR" || M == "RCL" || M == "RCR" ||
+                                                   M == "SHL" || M == "SAL" || M == "SHR" || M == "SAR")))
+            return out;
+    }
 
     // ---- virtual opcodes -------------------------------------------------
     if (M == "BRK") { Enc e; e.u8v(0xEB); e.u8v(0x00); push(e); return out; }
@@ -615,7 +641,8 @@ std::vector<std::vector<u8>> encodeVariants(const std::string& insnText, int atO
 
     // ---- shifts -----------------------------------------------------------
     for (int sh = 0; sh < 8; sh++) {
-        if (sh == 6 || M != SHF[sh]) continue;
+        // SAL is SHL by another name
+        if (sh == 6 || (M != SHF[sh] && !(sh == 4 && M == "SAL"))) continue;
         if (p.nOps != 2) return out;
         const bool wide = widthOf(A) == 2;
         const bool byCl = (B.kind == OK::Reg8 && B.reg == 1);
@@ -633,7 +660,7 @@ std::vector<std::vector<u8>> encodeVariants(const std::string& insnText, int atO
         Enc e; e.u8v(op); e.u8v((int)d); push(e);
     };
     for (const CcName& cc : CC) {
-        if (M != cc.n || p.nOps != 1 || A.kind != OK::Imm) continue;
+        if (M != cc.n || p.nOps != 1 || A.kind != OK::Imm || A.jumpHint == 2) continue;
         rel8(0x70 + cc.code, A.imm);
         return out;
     }
@@ -650,9 +677,12 @@ std::vector<std::vector<u8>> encodeVariants(const std::string& insnText, int atO
             Enc e; e.u8v(0xEA); e.u16v((int)A.imm); e.u16v(A.farSeg); push(e); return out;
         }
         if (A.kind == OK::Imm) {
-            rel8(0xEB, A.imm);
-            const long long d = A.imm - (atOffset + 3);
-            Enc e; e.u8v(0xE9); e.u16v((int)d); push(e);
+            // SHORT keeps only the 2-byte form, NEAR only the 3-byte one
+            if (A.jumpHint != 2) rel8(0xEB, A.imm);
+            if (A.jumpHint != 1) {
+                const long long d = A.imm - (atOffset + 3);
+                Enc e; e.u8v(0xE9); e.u16v((int)d); push(e);
+            }
             return out;
         }
         if (A.kind == OK::Mem)   { Enc e; e.u8v(0xFF); if (emitRm(e, A, A.isFar ? 5 : 4)) push(e); return out; }
@@ -686,6 +716,408 @@ std::vector<std::vector<u8>> encodeVariants(const std::string& insnText, int atO
 
     return out;
 }
+
+// ---------------------------------------------------------------------------
+//  Diagnostics -- why a line has no encoding, in terms of the rule it broke and
+//  the form the instruction does take; and the warnings for lines that do
+//  assemble but will not behave the way they read.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool inList(const std::string& m, const char* const* list) {
+    for (; *list; ++list) if (m == *list) return true;
+    return false;
+}
+
+const char* const kAluNames[]   = { "ADD","OR","ADC","SBB","AND","SUB","XOR","CMP", nullptr };
+const char* const kShiftNames[] = { "ROL","ROR","RCL","RCR","SHL","SAL","SHR","SAR", nullptr };
+const char* const kOneOpNames[] = { "INC","DEC","NOT","NEG","MUL","IMUL","DIV","IDIV", nullptr };
+const char* const kLoopNames[]  = { "LOOP","LOOPZ","LOOPE","LOOPNZ","LOOPNE","JCXZ", nullptr };
+const char* const kStringOps[]  = { "MOVSB","MOVSW","CMPSB","CMPSW","STOSB","STOSW","LODSB","LODSW",
+                                    "SCASB","SCASW", nullptr };
+const char* const kNoOperand[]  = { "NOP","CBW","CWD","WAIT","PUSHF","POPF","SAHF","LAHF","MOVSB","MOVSW",
+                                    "CMPSB","CMPSW","STOSB","STOSW","LODSB","LODSW","SCASB","SCASW",
+                                    "INT3","INTO","IRET","XLAT","XLATB","HLT","CMC","CLC","STC","CLI",
+                                    "STI","CLD","STD","LOCK","DAA","DAS","AAA","AAS","BRK","NRG", nullptr };
+const char* const kOther[]      = { "MOV","TEST","XCHG","PUSH","POP","LEA","LES","LDS","JMP","CALL",
+                                    "RET","RETN","RETF","INT","IN","OUT","ESC","AAM","AAD","REP","REPE",
+                                    "REPZ","REPNE","REPNZ", nullptr };
+
+bool isJcc(const std::string& m) {
+    for (const CcName& c : CC) if (m == c.n) return true;
+    return false;
+}
+
+bool knownMnemonic(const std::string& m) {
+    return inList(m, kAluNames) || inList(m, kShiftNames) || inList(m, kOneOpNames) ||
+           inList(m, kLoopNames) || inList(m, kNoOperand) || inList(m, kOther) || isJcc(m);
+}
+
+// The forms an instruction takes, the way a reference card puts them.
+std::string usageOf(const std::string& m) {
+    if (m == "MOV")  return "MOV reg/mem, reg/mem/imm (not mem, mem) | MOV seg, reg16/mem | MOV reg16/mem, seg";
+    if (inList(m, kAluNames)) return m + " reg/mem, reg/mem/imm (not mem, mem)";
+    if (m == "TEST") return "TEST reg/mem, reg/imm";
+    if (m == "XCHG") return "XCHG reg, reg/mem";
+    if (inList(m, kOneOpNames)) return m + " reg/mem (memory needs BYTE or WORD)";
+    if (m == "PUSH") return "PUSH reg16 / seg / WORD [mem]";
+    if (m == "POP")  return "POP reg16 / seg (not CS) / WORD [mem]";
+    if (inList(m, kShiftNames)) return m + " reg/mem, 1 | " + m + " reg/mem, CL";
+    if (isJcc(m) || inList(m, kLoopNames)) return m + " label (short: -128..+127 bytes away)";
+    if (m == "JMP")  return "JMP label | JMP reg16 / [mem] | JMP FAR [mem] | JMP seg:off";
+    if (m == "CALL") return "CALL label | CALL reg16 / [mem] | CALL FAR [mem] | CALL seg:off";
+    if (m == "LEA" || m == "LES" || m == "LDS") return m + " reg16, [mem]";
+    if (m == "INT")  return "INT n (0..255; CodeGuru's are INT 86h and INT 87h)";
+    if (m == "RET" || m == "RETN" || m == "RETF") return m + " | " + m + " n";
+    if (m == "IN")   return "IN AL/AX, imm8 | IN AL/AX, DX";
+    if (m == "OUT")  return "OUT imm8, AL/AX | OUT DX, AL/AX";
+    if (m.rfind("REP", 0) == 0) return m + " MOVSB / STOSW / CMPSB / ... (one string instruction)";
+    if (inList(m, kNoOperand)) return m + " (no operands)";
+    return m;
+}
+
+std::string regName(const Operand& o) {
+    if (o.kind == OK::Reg8)  return R8[o.reg & 7];
+    if (o.kind == OK::Reg16) return R16[o.reg & 7];
+    if (o.kind == OK::Seg)   return SEG4[o.reg & 3];
+    return "";
+}
+
+int editDistance(const std::string& a, const std::string& b) {
+    std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); ++j) prev[j] = (int)j;
+    for (size_t i = 1; i <= a.size(); ++i) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= b.size(); ++j)
+            cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1) });
+        prev.swap(cur);
+    }
+    int d = prev[b.size()];
+    // two letters swapped ("MVO") is one slip, not two
+    if (a.size() == b.size()) {
+        int diff = 0; size_t at = 0;
+        for (size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) { if (!diff) at = i; ++diff; }
+        if (diff == 2 && at + 1 < a.size() && a[at] == b[at + 1] && a[at + 1] == b[at]) d = 1;
+    }
+    return d;
+}
+
+std::string closestMnemonic(const std::string& m) {
+    std::string best;
+    int bestD = 3;
+    auto consider = [&](const char* const* list) {
+        for (; *list; ++list) { const int d = editDistance(m, *list); if (d < bestD) { bestD = d; best = *list; } }
+    };
+    consider(kAluNames); consider(kShiftNames); consider(kOneOpNames); consider(kLoopNames);
+    consider(kNoOperand); consider(kOther);
+    for (const CcName& c : CC) { const int d = editDistance(m, c.n); if (d < bestD) { bestD = d; best = c.n; } }
+    return (m.size() >= 2) ? best : std::string();
+}
+
+// The CPU an instruction (or register) first appeared on, when it is not the 8086.
+const char* laterCpu(const std::string& m) {
+    static const char* const k186[] = { "PUSHA","POPA","ENTER","LEAVE","BOUND","INS","INSB","INSW",
+                                        "OUTS","OUTSB","OUTSW", nullptr };
+    static const char* const k286[] = { "ARPL","CLTS","LAR","LSL","LGDT","LIDT","LLDT","LMSW","LTR","SGDT",
+                                        "SIDT","SLDT","SMSW","STR","VERR","VERW", nullptr };
+    static const char* const k386[] = { "MOVZX","MOVSX","BSF","BSR","BT","BTC","BTR","BTS","SHLD","SHRD",
+                                        "CWDE","CDQ","PUSHAD","POPAD","PUSHFD","POPFD","IRETD","JECXZ",
+                                        "LOOPD","LFS","LGS","LSS","MOVSD","CMPSD","STOSD","LODSD","SCASD",
+                                        "INSD","OUTSD", nullptr };
+    static const char* const k486[] = { "BSWAP","XADD","CMPXCHG","INVD","WBINVD","INVLPG", nullptr };
+    static const char* const kP5[]  = { "CPUID","RDTSC","RDMSR","WRMSR","CMPXCHG8B","SYSENTER","SYSEXIT",
+                                        "SYSCALL","SYSRET","UD2","RDPMC", nullptr };
+    if (inList(m, k186)) return "the 80186";
+    if (inList(m, k286)) return "the 80286";
+    if (inList(m, k386) || (m.size() > 3 && m.compare(0, 3, "SET") == 0)) return "the 386";
+    if (inList(m, k486)) return "the 486";
+    if (inList(m, kP5) || (m.size() > 4 && m.compare(0, 4, "CMOV") == 0)) return "the Pentium";
+    return nullptr;
+}
+
+// Code written for something other than this 8086: 32-bit registers, later
+// CPUs' instructions, the FPU, another assembler's directives. Checked before
+// symbols are looked up, so "mov eax, 1" says why rather than "unknown: eax".
+std::string foreignReason(const std::string& text) {
+    const std::string t = trim(text);
+    const std::string U = upper(t);
+    const size_t sp = mnemEnd(t);
+    const std::string M = upper(sp == std::string::npos ? t : t.substr(0, sp));
+    {
+        static const char* const k32[] = { "EAX","EBX","ECX","EDX","ESI","EDI","ESP","EBP", nullptr };
+        std::string tok;
+        for (size_t i = (sp == std::string::npos ? t.size() : sp); i <= U.size(); ++i) {
+            const char c = i < U.size() ? U[i] : ' ';
+            if (isalnum((unsigned char)c)) { tok.push_back(c); continue; }
+            if (inList(tok, k32))
+                return tok + " is a 32-bit register (386 and later) - the 8086 has only " + tok.substr(1);
+            if (tok == "FS" || tok == "GS")
+                return tok + " arrived with the 386 - the 8086's segment registers are ES, CS, SS and DS";
+            tok.clear();
+        }
+    }
+    if (const char* cpu = laterCpu(M)) {
+        std::string hint;
+        if (M == "PUSHA" || M == "POPA") hint = " - push or pop the registers one by one";
+        if (M == "MOVZX") hint = " - MOV the byte into the low half and zero the high half (MOV AH, 0)";
+        if (M == "LEAVE") hint = " - MOV SP, BP / POP BP";
+        return M + " is an instruction of " + cpu + ", not the 8086 - CodeGuru runs 8086 code only" + hint;
+    }
+    if (M.size() > 1 && M[0] == 'F' && (M == "FLD" || M == "FST" || M == "FSTP" || M == "FADD" ||
+        M == "FSUB" || M == "FMUL" || M == "FDIV" || M == "FILD" || M == "FIST" || M == "FINIT" ||
+        M == "FWAIT" || M == "FXCH" || M == "FCOM"))
+        return M + " is an x87 floating-point instruction - CodeGuru's 8086 has no FPU";
+    static const char* const kDirectives[] = { "ORG","SEGMENT","ENDS","ASSUME","PROC","ENDP","END","TIMES",
+                                               "RESB","RESW","DD","DQ","DT","ALIGN","BITS","USE16","SECTION",
+                                               "GLOBAL","EXTERN","INCLUDE","MACRO","ENDM","OFFSET", nullptr };
+    if (inList(M, kDirectives))
+        return M + " is an assembler directive this assembler doesn't have - it knows DB, DW, EQU and %define"
+               + std::string(M == "ORG" ? " (code is placed wherever the arena puts it)" : "");
+    if (M.rfind("REP", 0) == 0 && sp != std::string::npos) {
+        const std::string op = upper(trim(t.substr(sp)));
+        if (knownMnemonic(op) && !inList(op, kStringOps))
+            return M + " repeats a string instruction only (MOVSB, STOSW, CMPSB, ...) - not " + op;
+    }
+    if (!knownMnemonic(M)) {
+        const std::string near = closestMnemonic(M);
+        return "unknown instruction: " + M + (near.empty() ? std::string() : " - did you mean " + near + "?");
+    }
+    return std::string();
+}
+
+std::string explainFailure(const std::string& text, int at) {
+    const std::string t = trim(text);
+    const size_t sp = mnemEnd(t);
+    const std::string M = upper(sp == std::string::npos ? t : t.substr(0, sp));
+    {
+        const std::string why = foreignReason(t);
+        if (!why.empty()) return why;
+    }
+
+    Parsed p = parseInsn(t);
+    if (!p.ok) {
+        if (p.err == "too many operands")
+            return "too many operands - an 8086 instruction takes at most two: " + usageOf(M);
+        return p.err.empty() ? ("can't read the operands of " + M) : p.err;
+    }
+
+    const Operand& A = p.a;
+    const Operand& B = p.b;
+    const std::string use = usageOf(M);
+    auto badAddress = [](const Operand& o) {
+        if (o.kind != OK::Mem) return false;
+        int rm, mod, db;
+        return !memRm(o, rm, mod, db);
+    };
+    if (badAddress(A) || badAddress(B))
+        return "not an 8086 address - it can add one of BX / BP, one of SI / DI and a number: "
+               "[BX+SI+4], [BP-2], [DI], [1234h] (no [BX+BP], no [SI+DI])";
+
+    // ---- no operands ----------------------------------------------------
+    if (inList(M, kNoOperand) && p.nOps > 0) {
+        if (inList(M, kStringOps))
+            return M + " takes no operands - it always works on DS:SI and ES:DI (and AL/AX)";
+        return M + " takes no operands";
+    }
+
+    // ---- two-operand data instructions -----------------------------------
+    const bool isData = (M == "MOV" || M == "TEST" || M == "XCHG" || inList(M, kAluNames));
+    if (isData) {
+        if (p.nOps != 2) return M + " takes two operands: " + use;
+        if (A.kind == OK::Imm)
+            return "the first operand is where " + M + " puts its result, so it can't be a number: " + use;
+        if (A.kind == OK::Mem && B.kind == OK::Mem)
+            return "memory to memory isn't possible on the 8086 - go through a register "
+                   "(MOV AX, [SI] / MOV [DI], AX)";
+        const int wa = widthOf(A), wb = widthOf(B);
+        if (A.kind != OK::Seg && B.kind != OK::Seg && wa && wb && wa != wb)
+            return "operand sizes differ: " + (regName(A).empty() ? std::string("the memory operand") : regName(A)) +
+                   " is " + (wa == 1 ? "8" : "16") + "-bit, " +
+                   (regName(B).empty() ? std::string("the memory operand") : regName(B)) +
+                   " is " + (wb == 1 ? "8" : "16") + "-bit";
+        if (A.kind == OK::Seg || B.kind == OK::Seg) {
+            if (M != "MOV") return M + " can't use a segment register - only MOV, PUSH and POP can";
+            if (A.kind == OK::Seg && B.kind == OK::Seg)
+                return "no MOV from one segment register to another - go through a general register "
+                       "(MOV AX, " + regName(B) + " / MOV " + regName(A) + ", AX)";
+            if (A.kind == OK::Seg && B.kind == OK::Imm)
+                return "no MOV of a number into a segment register - MOV AX, " + trim(t.substr(t.rfind(',') + 1)) +
+                       " / MOV " + regName(A) + ", AX";
+            if ((A.kind == OK::Seg && B.kind == OK::Reg8) || (B.kind == OK::Seg && A.kind == OK::Reg8))
+                return "segment registers are 16-bit - use a 16-bit register";
+        }
+        if (M == "XCHG" && (B.kind == OK::Imm))
+            return "XCHG swaps two places, so neither can be a number: " + use;
+        if (M == "XCHG" && A.kind == OK::Mem && B.kind == OK::Mem)
+            return "XCHG can't swap two memory operands: " + use;
+        if (M == "TEST" && B.kind == OK::Mem && A.kind == OK::Mem)
+            return "TEST can't compare two memory operands: " + use;
+        if (B.kind == OK::Imm && A.kind == OK::Mem && A.sizeHint == 0)
+            return "the size is unknown - write BYTE [...] or WORD [...] so " + M +
+                   " knows whether it works on a byte or a word";
+        if (A.kind == OK::Label || B.kind == OK::Label)
+            return "'" + (A.kind == OK::Label ? A.label : B.label) +
+                   "' isn't a register, memory or a number here: " + use;
+        return "these operands don't fit " + M + ": " + use;
+    }
+
+    // ---- one-operand groups -----------------------------------------------
+    if (inList(M, kOneOpNames)) {
+        if (M == "IMUL" && p.nOps >= 2)
+            return "IMUL with more than one operand is the 80186 - on the 8086 it is IMUL reg/mem "
+                   "(AX = AL * operand, or DX:AX = AX * operand)";
+        if (p.nOps != 1) return M + " takes one operand: " + use;
+        if (A.kind == OK::Imm)
+            return (M == "MUL" || M == "IMUL" || M == "DIV" || M == "IDIV")
+                ? M + " works on AL/AX with a register or memory, not a number - MOV it into a register first"
+                : M + " needs a register or memory, not a number";
+        if (A.kind == OK::Seg) return M + " can't use a segment register";
+        if (A.kind == OK::Mem && A.sizeHint == 0)
+            return "the size is unknown - write " + M + " BYTE [...] or " + M + " WORD [...]";
+        return use;
+    }
+
+    // ---- PUSH / POP ---------------------------------------------------------
+    if (M == "PUSH" || M == "POP") {
+        if (p.nOps != 1) return M + " takes one operand - one " + M + " per line: " + use;
+        if (A.kind == OK::Imm)
+            return M == "PUSH" ? "PUSH of a number is the 80186 - on the 8086: MOV AX, n / PUSH AX"
+                               : "POP needs somewhere to put the word, not a number: " + use;
+        if (A.kind == OK::Reg8) return M + " moves 16-bit words - " + regName(A) + " is 8-bit; use " +
+                                       std::string(R16[A.reg & 3]);
+        if (M == "POP" && A.kind == OK::Seg && A.reg == 1)
+            return "POP CS isn't an 8086 instruction - CS changes with a far JMP, CALL or RETF";
+        if (A.kind == OK::Mem && A.sizeHint == 1) return M + " moves words, not bytes: " + use;
+        return use;
+    }
+
+    // ---- shifts ---------------------------------------------------------------
+    if (inList(M, kShiftNames)) {
+        if (p.nOps == 1) return M + " needs a count: " + M + " " + trim(t.substr(sp)) + ", 1  or  " + M + " " +
+                                trim(t.substr(sp)) + ", CL";
+        if (p.nOps != 2) return use;
+        if (A.kind == OK::Imm) return "the first operand is what gets shifted, so it can't be a number: " + use;
+        if (B.kind == OK::Imm && B.imm != 1)
+            return "shifting by " + std::to_string(B.imm) + " in one go is the 80186 - on the 8086 shift by 1, "
+                   "or put the count in CL: MOV CL, " + std::to_string(B.imm) + " / " + M + " " +
+                   trim(t.substr(sp, t.find(',') - sp)) + ", CL";
+        if (B.kind != OK::Imm && !(B.kind == OK::Reg8 && B.reg == 1))
+            return "the count must be 1 or CL: " + use;
+        if (A.kind == OK::Mem && A.sizeHint == 0)
+            return "the size is unknown - write " + M + " BYTE [...] or " + M + " WORD [...]";
+        if (A.kind == OK::Seg) return M + " can't shift a segment register";
+        return use;
+    }
+
+    // ---- branches -------------------------------------------------------------
+    if (isJcc(M) || inList(M, kLoopNames)) {
+        if (p.nOps != 1) return M + " takes one target: " + use;
+        if (A.kind == OK::Imm && A.jumpHint == 2)
+            return "a NEAR conditional jump is the 386 - on the 8086 conditional jumps are short only";
+        if (A.kind == OK::Imm) {
+            const long long d = A.imm - (at + 2);
+            if (d < -128 || d > 127) {
+                std::string inv;
+                if (isJcc(M)) {
+                    // the opposite condition jumps over a JMP that can reach
+                    for (const CcName& c : CC) if (c.n == M) {
+                        for (const CcName& o : CC) if (o.code == (c.code ^ 1)) { inv = o.n; break; }
+                        break;
+                    }
+                    return M + " reaches only -128..+127 bytes; the target is " + std::to_string(d) +
+                           " away. Jump over a JMP instead: " + inv + " skip / JMP target / skip:";
+                }
+                return M + " reaches only -128..+127 bytes; the target is " + std::to_string(d) +
+                       " away. Use DEC CX / JNZ over a JMP, or move the loop closer";
+            }
+        }
+        if (A.kind != OK::Imm) return M + " goes to a label or an address, not through a register or memory: " + use;
+        return use;
+    }
+    if (M == "JMP" || M == "CALL") {
+        if (p.nOps != 1) return M + " takes one target: " + use;
+        if (A.kind == OK::Reg8) return M + " through a register needs a 16-bit one: " + use;
+        if (A.kind == OK::Seg) return M + " can't go through a segment register: " + use;
+        if (M == "JMP" && A.kind == OK::Imm && A.jumpHint == 1) {
+            const long long d = A.imm - (at + 2);
+            return "JMP SHORT reaches only -128..+127 bytes; the target is " + std::to_string(d) +
+                   " away - drop SHORT";
+        }
+        return use;
+    }
+    if (M == "LEA" || M == "LES" || M == "LDS") {
+        if (p.nOps != 2) return M + " takes two operands: " + use;
+        if (A.kind != OK::Reg16) return M + " loads a 16-bit general register: " + use;
+        if (B.kind != OK::Mem)
+            return "the second operand of " + M + " must be memory in brackets - " + M + " " + regName(A) +
+                   ", [label] or " + M + " " + regName(A) + ", [BX+4]";
+        return use;
+    }
+    if (M == "INT") {
+        if (p.nOps != 1 || A.kind != OK::Imm) return use;
+        if (A.imm < 0 || A.imm > 255) return "an interrupt number is 0..255: " + use;
+        return use;
+    }
+    if (M.rfind("REP", 0) == 0) {
+        if (p.nOps == 0) return M + " needs its string instruction on the same line: " + use;
+        return M + " repeats a string instruction only: " + use;
+    }
+    if (M == "IN" || M == "OUT") return "operands don't fit: " + use;
+    return "can't assemble " + t + " - " + use;
+}
+
+// A line that assembles but will not do what it reads like: an immediate or a
+// displacement cut down to fit, or an opcode CodeGuru's engine refuses.
+std::string lineWarning(const std::string& text, const std::vector<u8>& bytes) {
+    Parsed p = parseInsn(text);
+    if (p.ok && p.nOps == 2 && p.b.kind == OK::Imm && p.b.farSeg < 0) {
+        const int w = widthOf(p.a);
+        const long long v = p.b.imm;
+        char cut[16];
+        if (w == 1 && (v < -128 || v > 255)) {
+            snprintf(cut, sizeof(cut), "0x%02X", (unsigned)(v & 0xFF));
+            return std::to_string(v) + " doesn't fit in 8 bits - it is cut to " + cut;
+        }
+        if (w == 2 && (v < -32768 || v > 65535)) {
+            snprintf(cut, sizeof(cut), "0x%04X", (unsigned)(v & 0xFFFF));
+            return std::to_string(v) + " doesn't fit in 16 bits - it is cut to " + cut;
+        }
+    }
+    if (p.ok) {
+        for (const Operand* o : { &p.a, &p.b })
+            if (o->kind == OK::Mem && (o->disp < -32768 || o->disp > 65535))
+                return "the address offset " + std::to_string(o->disp) + " doesn't fit in 16 bits";
+        if (p.mnem == "INT" && p.a.kind == OK::Imm && (p.a.imm < 0 || p.a.imm > 255))
+            return "an interrupt number is 0..255";
+        if (p.mnem == "INT" && p.a.kind == OK::Imm && p.a.imm != 0x86 && p.a.imm != 0x87 && p.a.imm != 0x89)
+            return "CodeGuru has no DOS or BIOS: only INT 86h and INT 87h exist (and int 0x89, which is INT 87h for the smart check) - a warrior that runs this dies";
+        // memory with no size, and nothing else on the line to give it one
+        const Operand* mem = (p.a.kind == OK::Mem) ? &p.a : (p.b.kind == OK::Mem ? &p.b : nullptr);
+        const std::string& m = p.mnem;
+        // a shift's CL is only its count, so it says nothing about the size
+        const bool shift = inList(m, kShiftNames);
+        const bool sized = (p.a.kind == OK::Reg8 || p.a.kind == OK::Reg16 || p.a.kind == OK::Seg ||
+                            (!shift && (p.b.kind == OK::Reg8 || p.b.kind == OK::Reg16 || p.b.kind == OK::Seg)));
+        const bool sizeMatters = m == "MOV" || m == "TEST" || inList(m, kAluNames) ||
+                                 inList(m, kOneOpNames) || inList(m, kShiftNames);
+        if (mem && mem->sizeHint == 0 && !sized && sizeMatters)
+            return "the size isn't given, so this works on a BYTE - write " + m +
+                   " BYTE [...] or " + m + " WORD [...] to say which";
+    }
+    if (!bytes.empty()) {
+        u8 win[8] = { 0 };
+        for (size_t k = 0; k < bytes.size() && k < 8; ++k) win[k] = bytes[k];
+        const Insn in = disasm(win, (int)std::min<size_t>(bytes.size(), 8));
+        if (in.invalid)
+            return "the engine treats this as an invalid opcode - a warrior that reaches it dies";
+        if (in.unsupported)
+            return "legal 8086, but CodeGuru's engine doesn't support " + std::string(in.mnem[0] ? in.mnem : "it") +
+                   " - a warrior that reaches it dies";
+    }
+    return std::string();
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 //  Constant expressions -- the value of an EQU, and of a db / dw item
@@ -1011,6 +1443,15 @@ AsmResult assemble(const std::string& src, const AsmOptions& opt) {
                 ++i;
                 continue;
             }
+            if (isdigit(c0)) {
+                // a number is one token however it is spelled: "100h" must not
+                // read as 100 followed by a symbol called h
+                size_t j = i;
+                while (j < ops.size() && (isalnum((unsigned char)ops[j]) || ops[j] == '_')) ++j;
+                out += ops.substr(i, j - i);
+                i = j;
+                continue;
+            }
             if (!isalpha(c0) && c0 != '_' && c0 != '.') { out.push_back(ops[i++]); continue; }
 
             size_t j = i;
@@ -1078,6 +1519,19 @@ AsmResult assemble(const std::string& src, const AsmOptions& opt) {
             if (!r.equName.empty() && !r.equDone && !labels.count(r.equName)) labels[r.equName] = 0;
     };
 
+    // encodeVariants is the expensive part, and the sizing passes and the
+    // emit ask it the same (text, address) questions over and over: answer
+    // each once per assemble() call.
+    std::unordered_map<std::string, std::vector<std::vector<u8>>> encMemo;
+    auto encodeMemo = [&](const std::string& text, int at) -> const std::vector<std::vector<u8>>& {
+        std::string key = text;
+        key.push_back((char)1);   // never in source text
+        key += std::to_string(at);
+        auto it = encMemo.find(key);
+        if (it != encMemo.end()) return it->second;
+        return encMemo.emplace(std::move(key), encodeVariants(text, at)).first->second;
+    };
+
     for (int iter = 0; iter < 8; ++iter) {
         bool changed = false;
         labels.clear();
@@ -1093,7 +1547,7 @@ AsmResult assemble(const std::string& src, const AsmOptions& opt) {
             r.offset = at;
             if (!r.isDb && !r.body.empty()) {
                 std::string unk;
-                std::vector<std::vector<u8>> v = encodeVariants(bodyWithLabels(r, iter > 0, &unk), at);
+                const std::vector<std::vector<u8>>& v = encodeMemo(bodyWithLabels(r, iter > 0, &unk), at);
                 // size the encoding we are actually going to emit: a ";$N" line
                 // may pick a longer or shorter one than the canonical form, and
                 // sizing the wrong one shifts every label after it
@@ -1154,24 +1608,58 @@ AsmResult assemble(const std::string& src, const AsmOptions& opt) {
         } else if (!r.body.empty()) {
             std::string unk;
             const std::string text = bodyWithLabels(r, true, &unk);
-            std::vector<std::vector<u8>> v = encodeVariants(text, al.offset);
+            const std::vector<std::vector<u8>>& v = encodeMemo(text, al.offset);
             if (!v.empty()) {
                 const size_t pick = (r.altIndex > 0 && (size_t)r.altIndex < v.size())
                                   ? (size_t)r.altIndex : 0;
-                res.bytes.insert(res.bytes.end(), v[pick].begin(), v[pick].end());
+                if (r.altIndex >= (int)v.size()) {
+                    // a ";$N" that names an encoding the instruction does not have
+                    res.diags.push_back({ r.line, true, v.size() == 1
+                        ? ("this instruction has only one encoding - ;$" + std::to_string(r.altIndex) +
+                           " can't pick another (write it without the db and ;$)")
+                        : ("this instruction has " + std::to_string(v.size()) + " encodings, ;$0 to ;$" +
+                           std::to_string(v.size() - 1) + " - ;$" + std::to_string(r.altIndex) + " isn't one") });
+                    res.ok = false;
+                }
+                std::vector<u8> enc = v[pick];
+                // `int 0x89`, CWEST's smart-check bomb: a real war only knows
+                // INT 87h, so that is what it assembles to; the place is kept
+                // for the smart check, which plays a copy with CD 89 there.
+                if (enc.size() == 2 && enc[0] == 0xCD && enc[1] == 0x89) {
+                    res.smartSites.push_back((int)res.bytes.size() + opt.org);
+                    enc[1] = 0x87;
+                }
+                res.bytes.insert(res.bytes.end(), enc.begin(), enc.end());
+                const std::string w = lineWarning(text, enc);
+                if (!w.empty()) { res.diags.push_back({ r.line, false, w }); res.hasWarning = true; }
             } else {
                 // Every row is visited exactly once here, so this is the place
                 // to complain: a line that encodes to nothing used to be
-                // dropped without a word, shifting everything after it.
+                // dropped without a word, shifting everything after it. Say
+                // which rule it broke rather than only that it failed.
+                // a word that looks like a missing label is often code for some
+                // other CPU ("mov eax, 1", "fld st0") -- say that instead
+                const std::string foreign = unk.empty() ? std::string() : foreignReason(r.body);
                 res.diags.push_back({ r.line, true,
-                                      unk.empty() ? ("cannot assemble: " + r.body)
-                                                  : ("unknown symbol: " + unk) });
+                                      unk.empty() ? explainFailure(text, al.offset)
+                                                  : !foreign.empty() ? foreign
+                                                  : ("unknown symbol: " + unk + " - not a label, an EQU or a register") });
                 res.ok = false;
             }
         }
         al.length = (int)res.bytes.size() + opt.org - al.offset;
         res.lines.push_back(al);
     }
+    for (const Row& r : rows)
+        if (!r.equName.empty()) {
+            AsmSymbol s;
+            s.name = r.equName;
+            s.line = r.line;
+            s.resolved = r.equDone;
+            auto it = labels.find(r.equName);
+            if (it != labels.end()) s.value = it->second;
+            res.equs.push_back(s);
+        }
     return res;
 }
 

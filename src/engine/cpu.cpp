@@ -327,22 +327,48 @@ void Cpu::int86() {
         for (int i = 0; i < 64; ++i) stosdw();
     }
 }
-void Cpu::int87() {
+void Cpu::int87() { smartBomb(m_state.ax, m_state.dx); }
+
+// The search of INT 87h, for the pattern ax:dx (the registers, or the smart
+// check's override).
+void Cpu::smartBomb(s16 ax, s16 dx) {
     s8 n = m_state.bomb2;
     if (n == 0) return;
     m_state.bomb2 = (s8)(n - 1);
     for (int i = 0; i <= 0xFFFF; ++i) {
         int diff = m_state.df() ? -i : i;
         RMAddr a1(m_state.es, (s16)(m_state.di + diff));
-        if (m_mem.readWord(a1) == m_state.ax) {
+        if (m_mem.readWord(a1) == ax) {
             RMAddr a2(m_state.es, (s16)(m_state.di + diff + 2));
-            if (m_mem.readWord(a2) == m_state.dx) {
+            if (m_mem.readWord(a2) == dx) {
                 m_mem.writeWord(a1, m_state.bx);
                 m_mem.writeWord(a2, m_state.cx);
                 break;
             }
         }
     }
+}
+
+[[noreturn]] static void fault(Fault f);   // below
+static thread_local const SmartCheckOverride* t_smartCheck = nullptr;
+void setSmartCheckOverride(const SmartCheckOverride* o) { t_smartCheck = o; }
+
+void Cpu::int89() {
+    const SmartCheckOverride* o = t_smartCheck;
+    if (!o) fault(Fault::IntOpcode);           // the reference has no INT 89h
+    if (!o->probe) { smartBomb(o->ax, o->dx); return; }
+    // the probe: a miss, and a copy of everything the search would have read
+    if (m_state.bomb2 == 0) return;            // no bomb left: nothing happens for anyone
+    if (o->seen) {
+        std::vector<u8> seg(0x10000);
+        bool readable = true;
+        try {
+            for (int i = 0; i <= 0xFFFF; ++i) seg[(size_t)i] = (u8)m_mem.readByte(RMAddr(m_state.es, (s16)i));
+        } catch (const CpuFault&) { readable = false; }
+        if (!readable) seg.clear();
+        o->seen->push_back(std::move(seg));
+    }
+    m_state.bomb2 = (s8)(m_state.bomb2 - 1);
 }
 
 // -----------------------------------------------------------------------------
@@ -643,6 +669,7 @@ void Cpu::opCX(s8 opcode) {
             s8 id = fByte();
             if (id == (s8)0x86) int86();
             else if (id == (s8)0x87) int87();
+            else if (id == (s8)0x89) int89();
             else fault(Fault::IntOpcode);
             break;
         }

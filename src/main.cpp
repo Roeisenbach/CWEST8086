@@ -1,4 +1,4 @@
-// =============================================================================
+﻿// =============================================================================
 //  CORE WARS 8086 - debugger / IDE shell  (Dear ImGui + GLFW + OpenGL3)
 //
 //  Layout
@@ -37,7 +37,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <iphlpapi.h>   // types only -- GetAdaptersAddresses is loaded at run time (gui_net.inl)
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
 #include <windows.h>
@@ -47,6 +46,10 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <unordered_map>
+#include <random>
+#include <set>
+#include <array>
 #include <memory>
 #include <thread>
 #include <array>
@@ -54,6 +57,8 @@
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <exception>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -74,6 +79,30 @@ static inline ImU32 HexU(unsigned rgb, float a = 1.0f)
 
 // The palette is live: the theme picker writes straight into it, so every
 // Col::* read below picks the new colours up on the next frame.
+// Test builds only: per-section times (frame parts, workspace opening),
+// written to perf.txt beside the exe every three seconds (average and worst).
+#ifdef CWEST_TEST_HOOKS
+struct PerfAcc { double sum = 0, max = 0; int n = 0; };
+static std::map<std::string, PerfAcc> g_Perf;
+struct PerfScope
+{
+    const char* name; double t0;
+    explicit PerfScope(const char* n) : name(n), t0(glfwGetTime()) {}
+    ~PerfScope() { const double d = (glfwGetTime() - t0) * 1000.0; PerfAcc& a = g_Perf[name]; a.sum += d; a.n++; if (d > a.max) a.max = d; }
+};
+#define PERF_CAT2(a, b) a##b
+#define PERF_CAT(a, b) PERF_CAT2(a, b)
+#define PERF(name) PerfScope PERF_CAT(perfScope_, __LINE__)(name)
+static void PerfAdd(const char* name, double t0)
+{
+    const double d = (glfwGetTime() - t0) * 1000.0;
+    PerfAcc& a = g_Perf[name]; a.sum += d; a.n++; if (d > a.max) a.max = d;
+}
+#else
+#define PERF(name) do {} while (0)
+static void PerfAdd(const char*, double) {}
+#endif
+
 namespace Col {
     inline unsigned Bg0     = 0x0B0D12;   // app background, tab bar, strips
     inline unsigned Bg1     = 0x12151C;   // panels
@@ -231,16 +260,22 @@ static const int kSlotCount = 2;
 
 struct Survivor
 {
-    std::string name;      // display name (file name)
-    std::string path;      // on-disk path, empty for scratch buffers
+    std::string name;      // the file stem, e.g. "Phoenix1"
+    // Both forms live in the workspace: the source the editor edits, and the
+    // machine code that fights. Either file may not exist yet.
+    std::string asmPath;   // <workspace>\assembly\<folder>\<name>.asm
+    std::string binPath;   // <workspace>\survivors\<folder>\<name>
+    unsigned long long asmTime = 0, binTime = 0;   // last-write times as last read or written here
     std::string code;      // assembly source (editor buffer)
     std::vector<unsigned char> bin;   // assembled machine code; non-empty => runnable
     std::vector<cw::AsmLine> asmLines;   // source line -> byte range
     std::vector<cw::AsmDiag> asmDiags;
+    std::vector<cw::AsmSymbol> asmEqus;  // numeric EQUs and what they came to
     cw::Listing  listing;                // as first generated, for the warn flags
+    std::vector<int> smartSites;         // where its source says int 0x89 (offset of the CD)
     bool        asmOk = true;
     bool        present = false;
-    bool        enabled = true;
+    bool        enabled = true;          // "active": fights in Debug and Competition
     bool        dirty   = false;
     bool        runnable() const { return present && enabled && !bin.empty(); }
 };
@@ -249,14 +284,14 @@ struct Player
 {
     std::string name;
     Survivor    slots[kSlotCount];
-    bool        enabled = true;
+    bool        enabled = true;          // "active": the group fights in Debug and Competition
     unsigned    tint = Col::Accent;
     // With twoTone off, survivor 2 is a lightened tint; with it on, tint2 is
     // its own colour and the two survivors read as separate warriors.
     unsigned    tint2 = Col::Accent;
     bool        twoTone = false;
-    // The folder this group is filed under in the groups bar; empty for none.
-    // On disk it is a subfolder of survivors/ and assembly/ with the same name.
+    // The folder this group is filed under, as a path ("Bots/Old"); empty for
+    // the top. On disk it is the same directory under survivors\ and assembly\.
     std::string folder;
 
     int LoadedCount() const { int n = 0; for (int i = 0; i < kSlotCount; i++) if (slots[i].present) n++; return n; }
@@ -275,12 +310,12 @@ struct Zombie
     bool runnable() const { return sv.runnable(); }
 };
 
-// A folder of groups in the groups bar. It owns nothing: a group belongs to the
-// folder whose name it carries, so the list here is only the order they are
-// shown in and whether each is folded shut.
+// A folder of groups in the groups bar -- a directory in the workspace, nested
+// as deep as you like. It owns nothing: a group belongs to the folder whose path
+// it carries, so the list here is only which folders exist and which are shut.
 struct GroupFolder
 {
-    std::string name;
+    std::string path;               // "Bots" or "Bots/Old"
     bool        collapsed = false;
 };
 
@@ -291,7 +326,7 @@ struct Ref
     int slot   = -2;
     bool Valid() const
     {
-        if (player == -2) return slot >= 0;             // kZombiePlayer
+        if (player == -2 || player == -3) return slot >= 0;   // kZombiePlayer, kFolderPlayer
         return player >= 0 && slot >= -1 && slot < kSlotCount;
     }
 };
@@ -303,6 +338,10 @@ static inline bool operator!=(const Ref& a, const Ref& b) { return !(a == b); }
 // == the index into AppState::zombies.
 static const int kZombiePlayer = -2;
 static inline bool IsZombieRef(const Ref& r) { return r.player == kZombiePlayer && r.slot >= 0; }
+// Folder rows can be selected too: player == kFolderPlayer, slot == the index
+// into AppState::folders.
+static const int kFolderPlayer = -3;
+static inline bool IsFolderRef(const Ref& r) { return r.player == kFolderPlayer && r.slot >= 0; }
 
 struct AppState
 {
@@ -351,6 +390,9 @@ struct AppState
     bool                inspectorLeft = false;    // which side of the arena it takes
     float               inspectorWidth = 500.0f;
     bool                groupsCollapsed = false;  // names hidden, just the survivor strip
+    // Panels and floating windows can be dragged out of the main window onto
+    // the desktop, each in a window of its own (Dear ImGui's multi-viewports).
+    bool                popOutWindows = false;
     // The arena's colours are the theme's (Col::ArenaCore / Col::ArenaGrid).
     float               arenaGridWidth = 1.0f;    // 0 = no lines, 1 = the usual hairline
     bool                advanceSeed = false;      // bump the seed on every recompute
@@ -361,7 +403,12 @@ struct AppState
     int                 compGames   = 200;    // 0 = limitless
     int                 compThreads = 0;      // 0 = every core
     int                 compByGroup = 1;      // rank groups, or their survivors
-    int                 compBackend = 0;      // 0 CPU, 1 GPU, 2 both lanes, 3 Java
+    int                 compBackend = 0;      // 0 C++, 2 Busy (C++ + GPU), 3 Java (1, GPU alone, is gone)
+    // "Busy (C++)" -- the C++ engine and the graphics card flat out together.
+    // Off by default; Options turns it on, with a warning about the heat.
+    bool                compAllowBusy = false;
+    // The seed-search tool on the Competition toolbar.
+    bool                compSeekTool = false;
     std::string         compGpuNote;          // why the GPU or Java lane is not running
     // Groups drawn into each battle. A war holds twenty warriors, so a field
     // bigger than about nine groups cannot all fight at once; four is what the
@@ -371,13 +418,23 @@ struct AppState
     // The seed the tournament's first war is fought from; war k uses this + k.
     // Empty means the Debug panel's seed, which is what it always used to be.
     char                compSeedText[64] = "";
-    // How the tournament is shared out: 0 this machine, 1 shard files carried
-    // between machines, 2 host a run other machines join, 3 join one.
+    // How the tournament is shared out: 0 this machine, 2 host a run other
+    // machines join, 3 join one. (1 was shard files carried between machines,
+    // since removed; a saved 1 is read as 0.)
     int                 compMode    = 0;
     int                 compNetPort = 8086;
-    char                compNetHost[128] = "127.0.0.1";
+    char                compNetHost[128] = "";     // the host's https://....trycloudflare.com (or host:port here)
     char                compNetName[64]  = "";     // filled from the computer name
-    int                 compShards  = 4;           // shard files an export writes
+    // Who may join a hosted tournament: 0 anyone, 1 with the password (and then
+    // every message is sealed with it), 2 whoever the host accepts. A joiner
+    // types the same password to get into a protected host.
+    int                 compNetProtect = 0;
+    char                compNetPassword[64] = "";
+    // Export: 0 .asm source, 1 binaries; survivors in subfolders like their
+    // folders here, or side by side; the folder last exported to.
+    int                 exportFormat = 0;
+    bool                exportKeepFolders = false;
+    char                exportDir[260] = "";
     // The bar graph: columns rising from the floor instead of bars from the
     // left, and squeezed to fit the panel (3 px a bar at most) with the stats
     // on hover, the way the timeline lanes work.
@@ -386,6 +443,24 @@ struct AppState
     // Name and score written on each bar -- along it when the bars lie down,
     // turned on their side when they stand up as columns.
     bool                compBarLabels = true;
+    // A drop shadow under the names written on the bars, so they read on
+    // bright and dark bars alike.
+    bool                compBarShadow = true;
+    // What a run against folders shows for each folder: 0 the picked groups'
+    // share of its points, 1 that share against an even split (100% = average,
+    // share x the number of groups), 2 their place on its board.
+    int                 compFieldShow = 0;
+    // The group palette: five colours that groups made here take in turn
+    // (groupPalNext). Groups read in from disk get a colour from their name
+    // instead (DefaultGroupTint).
+    unsigned            groupPal0 = 0xFF3B3B, groupPal1 = 0x2EDB4B, groupPal2 = 0x3D6BFF,
+                        groupPal3 = 0xFFD83A, groupPal4 = 0xD54BFF;
+    int                 groupPalNext = 0;
+    // The tournament seed as a field on the Competition toolbar (only when the
+    // panel has the room for it; Options always has it).
+    bool                compSeedInBar = true;
+    // Edits are written to disk shortly after the typing stops.
+    bool                autoSave = true;
 
     // The edit tool: staged changes and whether a re-record is owed.
     bool                editMode = false;
@@ -398,9 +473,10 @@ struct AppState
     // --- options -----------------------------------------------------------
     bool                showOptions = false;
     int                 themeIndex  = 0;
-    // folder flow
+    // The open workspace (empty: none). Reopened on the next start.
     std::string         lastFolder;
-    int                 folderSortMode = 0;      // 0 ask, 1 always sort, 2 never
+    std::vector<std::string> recentWorkspaces;   // most recent first
+    int                 folderSortMode = 0;      // 0 ask, 1 always sort
     bool                folderAssemble = true;   // assembly/*.asm  -> survivors/
     bool                folderDisassemble = true;// survivors/*     -> assembly/
     // breakpoints
@@ -429,33 +505,61 @@ struct AppState
     char                fontMonoFile[160] = "";    // code, hex, inspector, timeline
 };
 static AppState g_App;
+static std::string g_StartWorkspace;     // the workspace open when the app last closed
 
-// Defined in gui_options.inl, but reached from the menus and the toolbar.
-static void OpenWorkspaceFolder();
-static void LoadWorkspaceFolder(const std::string& root);
-static void ImportLooseFiles();
+// Defined further down (gui_workspace.inl, gui_options.inl, gui_compete.inl),
+// but reached from the menus and the toolbar.
 static void DrawZombieSection();
 static void ZombieChip(int zi, float size);
-static bool SaveBinarySurvivor(Survivor& sv);
+static bool WriteSurvivorFiles(Survivor& sv);
+static void NoteEdit();
+static void FocusArenaOnIp(int wi = -1);
 static void DrawOptionsWindow();
-static bool DirExists(const std::string& p);
-static std::vector<std::string> ListDirFiles(const std::string& dir);
-static std::string CleanFolderName(const std::string& raw);
-static bool LooksLikeSurvivorFolder(const std::string& dir);
-static void RunFolderOp();
+static void RunWsOps();
+static void CompetitionStartFolders(const std::vector<int>& groups, const std::vector<std::string>& folders);
 
-// Folder changes asked for from inside the groups list -- a menu item, a drop --
-// are carried out after the frame's panels are drawn, so the list is never
+// A row of the groups bar by what it is rather than where it is, so it can be
+// found again after the lists change. kind: 0 group (slot -1) or one of its
+// survivors, 1 zombie (by file stem), 2 folder.
+struct RefKey { int kind = -1; std::string folder, name; int slot = -1; };
+
+// Changes asked for from inside the groups list -- a menu item, a drop, a key
+// -- are carried out after the frame's panels are drawn, so the list is never
 // rearranged while it is being walked.
-struct FolderOp
+struct WsOp
 {
-    enum Kind { None, Move, Rename, Ungroup, Close, New };
-    Kind             kind = None;
-    std::vector<int> players;     // Move: the groups to file
-    int              folder = -1; // Rename / Ungroup / Close: which folder
-    std::string      name;        // Move: destination ("" = out of every folder); Rename / New: the name
+    enum Kind { None, OpenWorkspace, PickWorkspace, CloseWorkspace, MoveGroups, MoveFolder, Rename,
+                NewFolder, NewGroup, NewZombie, Ungroup, Delete, Undo, Import, Paste, RunFolders, SortLoose };
+    Kind                     kind = None;
+    std::vector<RefKey>      items;     // what it acts on
+    std::vector<std::string> paths;     // Import: files from outside; RunFolders: the folders
+    std::string              folder;    // destination, or the folder acted on
+    std::string              name;      // a new name; MoveFolder: the folder that moves
+    bool                     zombies = false;   // Import / Paste into the zombie list
 };
-static FolderOp g_FolderOp;
+static std::vector<WsOp> g_WsOps;
+static void QueueWsOp(const WsOp& op) { g_WsOps.push_back(op); }
+static void QueueWsOp(WsOp::Kind k, const std::string& folder = std::string())
+{
+    WsOp op; op.kind = k; op.folder = folder; g_WsOps.push_back(op);
+}
+
+// The row whose name is being typed into (F2, or a new folder / group).
+struct InlineRename
+{
+    bool   active = false;
+    bool   focus = false;      // give the field the keyboard on its first frame
+    RefKey key;
+    char   buf[96] = "";
+};
+static InlineRename g_Rename;
+
+// The groups bar had the last click, so the list keys (Ctrl+A, F2, Delete,
+// Ctrl+Z, Ctrl+C) act on it.
+static bool g_GroupsFocus = false;
+
+// The warrior whose IP the arena keeps centred on (Follow IP), or -1.
+static int  g_FollowIp = -1;
 
 // Set by the timeline when its lanes need more height than the default
 // strip gives them; read here on the next frame. 0 means the default.
@@ -464,6 +568,16 @@ static float g_TimelineWantH = 0.0f;
 static float       g_Scale = 1.0f;   // DPI / UI scale
 static HWND        g_Hwnd = nullptr;
 static GLFWwindow* g_Window = nullptr;
+
+// Frame driving. A frame is normally run from main()'s loop; while Windows
+// holds its modal resize / move loop, the window procedure runs it instead.
+static void AppFrame();
+static void KeepFloatingWindowsClickable();
+static bool g_AppReady    = false;   // ImGui and the app are up; frames may run
+static bool g_InFrame     = false;   // guards against a frame inside a frame
+static bool g_InSizeMove  = false;   // between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE
+static bool g_LayoutBuilt = false;
+static const UINT_PTR kSizeMoveTimer = 0xC0DE;
 
 // -----------------------------------------------------------------------------
 // Native title bar plumbing
@@ -569,6 +683,34 @@ static LRESULT CALLBACK CustomWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
     case WM_ERASEBKGND:
         return 1; // the whole client area is repainted by OpenGL every frame
+
+    // Dragging an edge (or the title strip) puts Windows into a modal loop of
+    // its own: the main loop's glfwPollEvents does not return until the mouse
+    // is let go, so nothing was drawn and the old frame was stretched. Draw
+    // from here instead -- on every size change, and on a timer so a held
+    // drag (or a running war) keeps moving.
+    case WM_ENTERSIZEMOVE:
+        g_InSizeMove = true;
+        SetTimer(hwnd, kSizeMoveTimer, USER_TIMER_MINIMUM, NULL);
+        break;
+    case WM_EXITSIZEMOVE:
+        g_InSizeMove = false;
+        KillTimer(hwnd, kSizeMoveTimer);
+        break;
+    case WM_TIMER:
+        if (wParam == kSizeMoveTimer)
+        {
+            if (g_InSizeMove && g_AppReady) AppFrame();
+            return 0;
+        }
+        break;
+    case WM_SIZE:
+    {
+        // GLFW learns the new size first, then the frame is drawn at it
+        const LRESULT r = CallWindowProc(g_PrevWndProc, hwnd, msg, wParam, lParam);
+        if (g_InSizeMove && g_AppReady && wParam != SIZE_MINIMIZED) AppFrame();
+        return r;
+    }
     }
 
     return CallWindowProc(g_PrevWndProc, hwnd, msg, wParam, lParam);
@@ -768,37 +910,191 @@ static bool OwnerEnabledOf(const Ref& r)
 // -----------------------------------------------------------------------------
 // Folders of groups
 // -----------------------------------------------------------------------------
-static int FolderIndex(const std::string& name)
+// Folder paths use '/' ("Bots/Old"); the empty path is the top.
+static std::string FolderLeaf(const std::string& p)
 {
-    if (name.empty()) return -1;
-    const std::string key = ToLower(name);
-    for (int i = 0; i < (int)g_App.folders.size(); i++)
-        if (ToLower(g_App.folders[i].name) == key) return i;
-    return -1;
+    const size_t s = p.find_last_of('/');
+    return s == std::string::npos ? p : p.substr(s + 1);
+}
+static std::string FolderParent(const std::string& p)
+{
+    const size_t s = p.find_last_of('/');
+    return s == std::string::npos ? std::string() : p.substr(0, s);
+}
+static std::string FolderJoin(const std::string& parent, const std::string& leaf)
+{
+    return parent.empty() ? leaf : parent + "/" + leaf;
+}
+// p is root itself or somewhere inside it (everything is inside the top).
+static bool FolderUnder(const std::string& p, const std::string& root)
+{
+    if (root.empty()) return true;
+    const std::string a = ToLower(p), b = ToLower(root);
+    return a == b || (a.size() > b.size() && a.compare(0, b.size(), b) == 0 && a[b.size()] == '/');
+}
+static int FolderDepth(const std::string& p)
+{
+    if (p.empty()) return 0;
+    return 1 + (int)std::count(p.begin(), p.end(), '/');
 }
 
-static int EnsureFolder(const std::string& name)
+// -----------------------------------------------------------------------------
+// The folder tree, indexed. Every question below used to walk every group (or
+// every folder) and lower-case each name on the way -- once per row drawn, so a
+// workspace of a thousand groups cost tens of milliseconds a frame. The answers
+// are now worked out in one pass and kept until the groups or folders change:
+// a new frame, a different count, or a MarkFoldersChanged() from code that
+// renames or moves something.
+// -----------------------------------------------------------------------------
+static int g_FrameNo = 0;            // AppFrame counts; the index never outlives a frame
+// Bumped by whatever adds, removes, renames or moves a folder / a group.
+static unsigned g_FolderGen = 1, g_PlayerGen = 1;
+struct FolderIndexCache
 {
-    int i = FolderIndex(name);
+    unsigned folderGen = 0, playerGen = 0;
+    int    frame = -1;
+    size_t nPlayers = 0, nFolders = 0;
+    std::unordered_map<std::string, int>              index;     // lower path -> folder
+    std::unordered_map<std::string, std::vector<int>> children;  // lower parent -> folders, by leaf
+    std::unordered_map<std::string, std::vector<int>> inFolder;  // lower path ("" = loose) -> groups, load order
+    std::unordered_map<std::string, std::vector<int>> byName;    // the same, by name
+    std::unordered_map<std::string, std::vector<int>> under;     // lower path -> groups in it and below
+};
+static FolderIndexCache g_FolderIdx;
+
+// a folder change can move groups too (their folder paths go with it)
+static void MarkFoldersChanged() { g_FolderGen++; g_PlayerGen++; }
+static void MarkPlayersChanged() { g_PlayerGen++; }
+
+// Just path -> folder, which does not care about groups: loading a thousand
+// groups adds a folder now and then but a group every time.
+struct FolderPathCache
+{
+    unsigned gen = 0;
+    int frame = -1;
+    size_t n = 0;
+    std::unordered_map<std::string, int> index;
+};
+static FolderPathCache g_FolderPaths;
+
+static const std::unordered_map<std::string, int>& FolderPathIndex()
+{
+    FolderPathCache& c = g_FolderPaths;
+    if (c.gen == g_FolderGen && c.frame == g_FrameNo && c.n == g_App.folders.size()) return c.index;
+    c.index.clear();
+    for (int i = 0; i < (int)g_App.folders.size(); i++) c.index.emplace(ToLower(g_App.folders[(size_t)i].path), i);
+    c.gen = g_FolderGen;
+    c.frame = g_FrameNo;
+    c.n = g_App.folders.size();
+    return c.index;
+}
+
+static const FolderIndexCache& FolderIdx()
+{
+    FolderIndexCache& c = g_FolderIdx;
+    if (c.folderGen == g_FolderGen && c.playerGen == g_PlayerGen && c.frame == g_FrameNo &&
+        c.nPlayers == g_App.players.size() && c.nFolders == g_App.folders.size())
+        return c;
+    c.index.clear(); c.children.clear(); c.inFolder.clear(); c.byName.clear(); c.under.clear();
+    const int nf = (int)g_App.folders.size(), np = (int)g_App.players.size();
+    std::vector<std::string> lowPath((size_t)nf), lowLeaf((size_t)nf);
+    for (int i = 0; i < nf; i++)
+    {
+        lowPath[(size_t)i] = ToLower(g_App.folders[(size_t)i].path);
+        lowLeaf[(size_t)i] = ToLower(FolderLeaf(g_App.folders[(size_t)i].path));
+        c.index.emplace(lowPath[(size_t)i], i);      // the first of a duplicate wins, as the scan did
+    }
+    for (int i = 0; i < nf; i++)
+        c.children[ToLower(FolderParent(g_App.folders[(size_t)i].path))].push_back(i);
+    for (auto& kv : c.children)
+        std::stable_sort(kv.second.begin(), kv.second.end(), [&](int a, int b) { return lowLeaf[(size_t)a] < lowLeaf[(size_t)b]; });
+    std::vector<std::string> lowName((size_t)np);
+    for (int p = 0; p < np; p++)
+    {
+        const Player& pl = g_App.players[(size_t)p];
+        lowName[(size_t)p] = ToLower(pl.name);
+        std::string f = ToLower(pl.folder);
+        const bool known = !f.empty() && c.index.count(f);
+        // its own folder's list even when that folder is not (or no longer)
+        // one of ours, as the old scan answered; loose when it is not
+        if (!f.empty()) c.inFolder[f].push_back(p);
+        if (!known) { c.inFolder[std::string()].push_back(p); continue; }
+        for (std::string up = f; !up.empty(); up = FolderParent(up)) c.under[up].push_back(p);
+    }
+    for (auto& kv : c.inFolder)
+    {
+        std::vector<int> v = kv.second;
+        std::stable_sort(v.begin(), v.end(), [&](int a, int b) { return lowName[(size_t)a] < lowName[(size_t)b]; });
+        c.byName[kv.first] = std::move(v);
+    }
+    c.folderGen = g_FolderGen;
+    c.playerGen = g_PlayerGen;
+    c.frame = g_FrameNo;
+    c.nPlayers = g_App.players.size();
+    c.nFolders = g_App.folders.size();
+    return c;
+}
+
+static std::vector<int> FolderIdxGet(const std::unordered_map<std::string, std::vector<int>>& m, const std::string& key)
+{
+    auto it = m.find(key);
+    return it == m.end() ? std::vector<int>() : it->second;
+}
+
+static int FolderIndex(const std::string& path)
+{
+    if (path.empty()) return -1;
+    const std::unordered_map<std::string, int>& idx = FolderPathIndex();
+    auto it = idx.find(ToLower(path));
+    return it == idx.end() ? -1 : it->second;
+}
+
+static void SortFolders()
+{
+    std::stable_sort(g_App.folders.begin(), g_App.folders.end(), [](const GroupFolder& a, const GroupFolder& b) {
+        return ToLower(a.path) < ToLower(b.path);
+    });
+    MarkFoldersChanged();
+}
+
+// The folder, and every folder it is inside.
+static int EnsureFolder(const std::string& path)
+{
+    if (path.empty()) return -1;
+    int i = FolderIndex(path);
     if (i >= 0) return i;
+    if (!FolderParent(path).empty()) EnsureFolder(FolderParent(path));
     GroupFolder f;
-    f.name = name;
+    f.path = path;
     g_App.folders.push_back(f);
+    MarkFoldersChanged();
     return (int)g_App.folders.size() - 1;
 }
 
-// The groups filed under one folder, in the order they were loaded. An empty
-// name asks for the loose ones -- including any whose folder has since gone.
+// The groups filed directly in one folder, in load order. An empty path asks
+// for the loose ones -- including any whose folder has since gone.
 static std::vector<int> PlayersInFolder(const std::string& folder)
 {
-    std::vector<int> out;
-    const std::string key = ToLower(folder);
-    for (int p = 0; p < (int)g_App.players.size(); p++)
-    {
-        const std::string& f = g_App.players[p].folder;
-        if (key.empty() ? (f.empty() || FolderIndex(f) < 0) : (ToLower(f) == key)) out.push_back(p);
-    }
-    return out;
+    return FolderIdxGet(FolderIdx().inFolder, ToLower(folder));
+}
+
+// The same, in the order the groups bar shows them: by name.
+static std::vector<int> GroupsIn(const std::string& folder)
+{
+    return FolderIdxGet(FolderIdx().byName, ToLower(folder));
+}
+
+// Every group in a folder and in the folders inside it.
+static std::vector<int> GroupsUnder(const std::string& folder)
+{
+    if (folder.empty()) return std::vector<int>();
+    return FolderIdxGet(FolderIdx().under, ToLower(folder));
+}
+
+// The folders directly inside one, by name.
+static std::vector<int> FolderChildren(const std::string& parent)
+{
+    return FolderIdxGet(FolderIdx().children, ToLower(parent));
 }
 
 // What a menu item or a drag on one group row acts on: every selected group
@@ -818,12 +1114,28 @@ static std::vector<int> GroupsForAction(int pi)
     return sel;
 }
 
+static RefKey GroupKey(int p)
+{
+    RefKey k;
+    if (p < 0 || p >= (int)g_App.players.size()) return k;
+    k.kind = 0; k.folder = g_App.players[p].folder; k.name = g_App.players[p].name; k.slot = -1;
+    return k;
+}
+static RefKey FolderKey(int fi)
+{
+    RefKey k;
+    if (fi < 0 || fi >= (int)g_App.folders.size()) return k;
+    k.kind = 2; k.folder = g_App.folders[fi].path;
+    return k;
+}
+
 static void QueueFolderMove(const std::vector<int>& players, const std::string& folder)
 {
-    g_FolderOp = FolderOp();
-    g_FolderOp.kind = FolderOp::Move;
-    g_FolderOp.players = players;
-    g_FolderOp.name = folder;
+    WsOp op;
+    op.kind = WsOp::MoveGroups;
+    for (int p : players) op.items.push_back(GroupKey(p));
+    op.folder = folder;
+    QueueWsOp(op);
 }
 
 #include "gui/gui_editor.inl"   // listing / re-assembly / assembled preview
@@ -837,17 +1149,64 @@ static std::string EditorText()
     return t;
 }
 
+// What the editor handed back the moment the open survivor was loaded into it.
+// The editor normalises a few things on the way in (a missing final newline,
+// stray whitespace at the end), so a file that was only opened can read back
+// a byte or two different from disk; that is not an edit, and must not light
+// the unsaved dot.
+static std::string g_OpenBaseline;
+
+// Autosave: anything that edits a survivor's text calls NoteEdit(); once the
+// edits have stopped for a moment, whatever is unsaved is written out. One
+// save per pause, so source that does not assemble yet is not rewritten every
+// frame while it waits.
+static double g_AutoSaveAt = -1.0;
+static void NoteEdit() { g_AutoSaveAt = ImGui::GetTime() + 1.0; }
+
+// The open survivor's code as it was when the editor was handed it. If the
+// code changes underneath the editor (the folder loader swapping a binary's
+// disassembly for the real source, say) while the editor still shows the old
+// text untouched, the editor is the stale one -- flushing it back would write
+// the disassembly over the source, and autosave would put that on disk.
+static std::string g_OpenModelCode;
+
+// Puts the open survivor's current code into the editor, if `s` is that one.
+static void RefreshEditorIfOpen(const Survivor* s)
+{
+    if (!s || SurvivorAt(g_App.open) != s) return;
+    g_App.editor.SetText(s->code);
+    g_OpenBaseline = EditorText();
+    g_OpenModelCode = s->code;
+}
+
 static void FlushEditorToModel()
 {
     Survivor* s = SurvivorAt(g_App.open);
     if (!s || !s->present) return;
     const std::string text = EditorText();
-    if (text != s->code)
+    if (text == s->code) return;
+
+    if (text == g_OpenBaseline)
     {
+        // nothing has been typed since the editor was loaded
+        if (s->code != g_OpenModelCode)
+        {
+            // ...but the code moved on without it: the code wins
+            RefreshEditorIfOpen(s);
+            return;
+        }
+        // only the editor's normalisation differs -- not an edit
         s->code = text;
-        s->dirty = true;
-        ReassembleSurvivor(*s);           // gutter + diagnostics follow the text
+        g_OpenModelCode = text;
+        ReassembleSurvivor(*s);
+        return;
     }
+    s->code = text;
+    s->dirty = true;
+    NoteEdit();
+    g_OpenBaseline = text;
+    g_OpenModelCode = text;
+    ReassembleSurvivor(*s);               // gutter + diagnostics follow the text
 }
 
 static void OpenInEditor(const Ref& r)
@@ -882,7 +1241,12 @@ static void OpenInEditor(const Ref& r)
     g_App.open = target;
     g_App.editor.SetReadOnly(false);
     g_App.editor.SetText(s->code);
+    g_OpenBaseline = EditorText();
+    g_OpenModelCode = s->code;
     PushEditorMarkers(*s);
+    // A new file starts with nothing selected (the old selection used to
+    // carry over -- and Ctrl+V over it deleted lines the new file lacks).
+    g_App.editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
     g_App.editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
     g_App.status = "Opened " + OwnerNameOf(target) + " / " + s->name;
 }
@@ -891,41 +1255,52 @@ static void SaveSurvivor(const Ref& r)
 {
     if (r == g_App.open) FlushEditorToModel();
     Survivor* s = SurvivorAt(r);
-    if (!s || !s->present || s->path.empty()) return;
-    // A survivor loaded from a binary has no source file yet -- writing the
-    // editor text straight over the machine code would destroy it, so that case
-    // goes through the folder-aware saver instead.
-    if (SaveBinarySurvivor(*s)) return;
-    if (WriteTextFile(s->path, s->code))
-    {
-        s->dirty = false;
-        g_App.status = "Saved " + s->name;
-    }
-    else
-    {
-        g_App.status = "FAILED to save " + s->name;
-    }
+    if (!s || !s->present) return;
+    if (!WriteSurvivorFiles(*s))                g_App.status = "FAILED to save " + s->name;
+    else if (s->dirty)                          g_App.status = "Saved " + s->name + "'s source; its machine code "
+                                                               "is kept as it was until the source assembles";
+    else                                        g_App.status = "Saved " + s->name;
 }
 
-static void SaveAll()
+// Writes every survivor with unsaved changes; returns how many went to disk.
+static int SaveDirty()
 {
     FlushEditorToModel();
     int n = 0;
-    // One writer for both kinds of row, so a binary-backed survivor never has
-    // its machine code overwritten with editor text.
     auto saveOne = [&n](Survivor& sv) {
-        if (!sv.present || !sv.dirty || sv.path.empty()) return;
-        if (SaveBinarySurvivor(sv)) { if (!sv.dirty) n++; return; }
-        if (WriteTextFile(sv.path, sv.code)) { sv.dirty = false; n++; }
+        if (!sv.present || !sv.dirty) return;
+        if (WriteSurvivorFiles(sv)) n++;
     };
     for (int p = 0; p < (int)g_App.players.size(); p++)
         for (int s = 0; s < kSlotCount; s++)
             saveOne(g_App.players[p].slots[s]);
     for (Zombie& z : g_App.zombies)
         saveOne(z.sv);
+    return n;
+}
+
+static void SaveAll()
+{
+    const int n = SaveDirty();
     char buf[64];
     snprintf(buf, sizeof(buf), "Saved %d file(s)", n);
     g_App.status = buf;
+}
+
+static void AutoSaveTick()
+{
+    if (!g_App.autoSave || g_AutoSaveAt < 0.0 || ImGui::GetTime() < g_AutoSaveAt) return;
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;   // not in the middle of a drag
+    g_AutoSaveAt = -1.0;
+    const std::string before = g_App.status;
+    const int n = SaveDirty();
+    if (n > 0)
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Autosaved %d file(s)", n);
+        g_App.status = buf;
+    }
+    else if (n == 0) g_App.status = before;
 }
 
 // -----------------------------------------------------------------------------
@@ -933,21 +1308,27 @@ static void SaveAll()
 // -----------------------------------------------------------------------------
 static std::vector<Ref> FlatRows()
 {
-    // In the order the groups bar draws them -- folders first, then the loose
-    // groups -- and without anything folded away, so a shift-range selects
-    // exactly the rows between the two clicks and nothing out of sight.
-    std::vector<Ref> rows;
-    auto add = [&rows](int p) {
-        Ref r; r.player = p; r.slot = -1; rows.push_back(r);
-        for (int s = 0; s < kSlotCount; s++)
+    // In the order the groups bar draws them -- in each folder its folders
+    // first, then its groups -- and without anything folded away, so a
+    // shift-range selects exactly the rows between the two clicks and nothing
+    // out of sight.
+    struct Walk {
+        static void in(const std::string& parent, std::vector<Ref>& rows)
         {
-            Ref q; q.player = p; q.slot = s; rows.push_back(q);
+            for (int fi : FolderChildren(parent))
+            {
+                Ref r; r.player = kFolderPlayer; r.slot = fi; rows.push_back(r);
+                if (!g_App.folders[fi].collapsed) in(g_App.folders[fi].path, rows);
+            }
+            for (int p : GroupsIn(parent))
+            {
+                Ref r; r.player = p; r.slot = -1; rows.push_back(r);
+                for (int s = 0; s < kSlotCount; s++) { Ref q; q.player = p; q.slot = s; rows.push_back(q); }
+            }
         }
     };
-    for (const GroupFolder& f : g_App.folders)
-        if (!f.collapsed)
-            for (int p : PlayersInFolder(f.name)) add(p);
-    for (int p : PlayersInFolder(std::string())) add(p);
+    std::vector<Ref> rows;
+    Walk::in(std::string(), rows);
     return rows;
 }
 
@@ -1005,6 +1386,13 @@ static bool RefEnabled(const Ref& r)
 {
     if (IsZombieRef(r))
         return (r.slot < (int)g_App.zombies.size()) && g_App.zombies[r.slot].sv.enabled;
+    if (IsFolderRef(r))
+    {
+        // a folder counts as active while any group in it is
+        if (r.slot >= (int)g_App.folders.size()) return false;
+        for (int p : GroupsUnder(g_App.folders[r.slot].path)) if (g_App.players[p].enabled) return true;
+        return false;
+    }
     if (r.player < 0 || r.player >= (int)g_App.players.size()) return false;
     const Player& p = g_App.players[r.player];
     if (r.slot == -1) return p.enabled;
@@ -1016,6 +1404,16 @@ static void SetRefEnabled(const Ref& r, bool on)
     if (IsZombieRef(r))
     {
         if (r.slot < (int)g_App.zombies.size()) g_App.zombies[r.slot].sv.enabled = on;
+        return;
+    }
+    if (IsFolderRef(r))
+    {
+        if (r.slot >= (int)g_App.folders.size()) return;
+        for (int gp : GroupsUnder(g_App.folders[r.slot].path))
+        {
+            Ref g; g.player = gp; g.slot = -1;
+            SetRefEnabled(g, on);
+        }
         return;
     }
     if (r.player < 0 || r.player >= (int)g_App.players.size()) return;
@@ -1050,71 +1448,66 @@ static void SetRefEnabled(const Ref& r, bool on)
 static void ToggleRefEnabled(const Ref& r)
 {
     SetRefEnabled(r, !RefEnabled(r));
-    const char* state = RefEnabled(r) ? " enabled" : " disabled";
+    const char* state = RefEnabled(r) ? " is active" : " is out (not active)";
     if (IsZombieRef(r))
     {
         g_App.status = g_App.zombies[r.slot].name + state;
         return;
     }
+    if (IsFolderRef(r))
+    {
+        g_App.status = FolderLeaf(g_App.folders[r.slot].path) + (RefEnabled(r) ? ": every group active"
+                                                                              : ": every group out");
+        return;
+    }
     if (r.player < 0 || r.player >= (int)g_App.players.size()) return;
     const Player& p = g_App.players[r.player];
     g_App.status = (r.slot == -1) ? (p.name + state)
-                                  : (p.name + " / " + p.slots[r.slot].name + state);
+                                  : (p.slots[r.slot].name + state);
 }
 
-// Ctrl+Q: disable everything selected. If it is all disabled already, re-enable.
-// Delete on the groups selection: a survivor row empties its slot, a group row
-// closes the whole group, a zombie row is removed outright.
-static void DeleteSelection()
+// Ctrl+Q: makes everything selected active -- or, when all of it already is,
+// takes it all out.
+static void SetSelectionActive(bool on)
 {
-    if (g_App.selection.empty()) { g_App.status = "Nothing selected"; return; }
-
-    // Work back to front so erasing does not shift the refs still to come.
-    std::vector<Ref> sel = g_App.selection;
-    std::sort(sel.begin(), sel.end(), [](const Ref& a, const Ref& b) {
-        if (a.player != b.player) return a.player > b.player;
-        return a.slot > b.slot;
-    });
-
-    int n = 0;
-    for (const Ref& r : sel)
-    {
-        if (IsZombieRef(r))
-        {
-            if (r.slot < (int)g_App.zombies.size())
-            { g_App.zombies.erase(g_App.zombies.begin() + r.slot); n++; }
-        }
-        else if (r.player >= 0 && r.player < (int)g_App.players.size())
-        {
-            if (r.slot == -1) { g_App.players.erase(g_App.players.begin() + r.player); n++; }
-            else if (r.slot >= 0 && r.slot < kSlotCount && g_App.players[r.player].slots[r.slot].present)
-            { g_App.players[r.player].slots[r.slot] = Survivor(); n++; }
-        }
-    }
-
-    g_App.selection.clear();
-    g_App.anchor = Ref();
-    g_App.open = Ref();
-    g_App.editor.SetText("");
-    g_App.editor.SetReadOnly(true);
-    char buf[64];
-    snprintf(buf, sizeof(buf), "Closed %d item(s)", n);
+    for (size_t i = 0; i < g_App.selection.size(); i++)
+        SetRefEnabled(g_App.selection[i], on);
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%d item(s) %s", (int)g_App.selection.size(), on ? "active" : "taken out");
     g_App.status = buf;
 }
 
 static void ToggleSelectionEnabled()
 {
     if (g_App.selection.empty()) { g_App.status = "Nothing selected"; return; }
-    bool allDisabled = true;
+    bool allActive = true;
     for (size_t i = 0; i < g_App.selection.size(); i++)
-        if (RefEnabled(g_App.selection[i])) { allDisabled = false; break; }
+        if (!RefEnabled(g_App.selection[i])) { allActive = false; break; }
+    SetSelectionActive(!allActive);
+}
 
-    for (size_t i = 0; i < g_App.selection.size(); i++)
-        SetRefEnabled(g_App.selection[i], allDisabled);
+// Only the selection fights: everything else is taken out.
+static void ActivateOnlySelection()
+{
+    for (Player& pl : g_App.players)
+    {
+        pl.enabled = false;
+        for (Survivor& sv : pl.slots) if (sv.present) sv.enabled = false;
+    }
+    for (Zombie& z : g_App.zombies) z.sv.enabled = false;
+    for (const Ref& r : g_App.selection) SetRefEnabled(r, true);
+    g_App.status = "Only the selection is active now";
+}
 
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%s %d item(s)", allDisabled ? "Enabled" : "Disabled", (int)g_App.selection.size());
-    g_App.status = buf;
+// Ctrl+A in the groups bar: every folder, group and zombie.
+static void SelectAllRows()
+{
+    g_App.selection.clear();
+    for (int fi = 0; fi < (int)g_App.folders.size(); fi++) { Ref r; r.player = kFolderPlayer; r.slot = fi; g_App.selection.push_back(r); }
+    for (int p = 0; p < (int)g_App.players.size(); p++)  { Ref r; r.player = p; r.slot = -1; g_App.selection.push_back(r); }
+    for (int z = 0; z < (int)g_App.zombies.size(); z++)  { Ref r; r.player = kZombiePlayer; r.slot = z; g_App.selection.push_back(r); }
+    if (!g_App.selection.empty()) g_App.anchor = g_App.selection.front();
+    g_App.status = "Selected " + std::to_string((int)g_App.selection.size()) + " row(s)";
 }
 
 // -----------------------------------------------------------------------------
@@ -1133,89 +1526,91 @@ static const char* kTemplate =
     "    JNZ LOOP_BODY\n"
     "    JMP START\n";
 
+// ---- the group palette --------------------------------------------------------
+static unsigned GroupPalette(int i)
+{
+    const unsigned* p[5] = { &g_App.groupPal0, &g_App.groupPal1, &g_App.groupPal2, &g_App.groupPal3, &g_App.groupPal4 };
+    return *p[((i % 5) + 5) % 5];
+}
+
+static unsigned NameHash(const std::string& s)
+{
+    // FNV-1a, case and all: SilenTerror and SilentError are two survivors
+    unsigned h = 2166136261u;
+    for (unsigned char c : s) { h ^= (unsigned)c; h *= 16777619u; }
+    h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;   // spread the bits
+    return h;
+}
+
+// A group's colour the first time it is read in from disk, from its name: the
+// first three characters pick one of the group tints (kPlayerTints), and the
+// rest of the name shades it -- the same step on all three channels, so it is
+// only ever lighter or darker, never another hue. The same name always gets
+// the same colour.
+static const int kShadeMax = 12;                      // RGB steps, either way
+
+static unsigned ShadeRgb(const int c[3], int d)
+{
+    // all channels by the same amount, held back so none of them clips
+    const int lo = ImMin(c[0], ImMin(c[1], c[2])), hi = ImMax(c[0], ImMax(c[1], c[2]));
+    d = ImClamp(d, -lo, 255 - hi);
+    return ((unsigned)(c[0] + d) << 16) | ((unsigned)(c[1] + d) << 8) | (unsigned)(c[2] + d);
+}
+
+static unsigned DefaultGroupTint(const std::string& name)
+{
+    const size_t n = sizeof(kPlayerTints) / sizeof(kPlayerTints[0]);
+    const unsigned base = kPlayerTints[NameHash(name.substr(0, 3)) % (unsigned)n];
+    const int c[3] = { (int)((base >> 16) & 0xFF), (int)((base >> 8) & 0xFF), (int)(base & 0xFF) };
+    const unsigned r = NameHash(name.size() > 3 ? name.substr(3) : std::string());
+    return ShadeRgb(c, (int)(r % (unsigned)(2 * kShadeMax + 1)) - kShadeMax);
+}
+
+// A group made here: the palette's colours in turn.
+static unsigned NextPaletteTint()
+{
+    const unsigned t = GroupPalette(g_App.groupPalNext);
+    g_App.groupPalNext = (g_App.groupPalNext + 1) % 5;
+    return t;
+}
+
 // A group is the same group only inside the same folder: two folders can each
 // hold a "Phoenix" without the second pair landing in the first one's slots.
 static int FindOrCreatePlayer(const std::string& name, const std::string& folder = std::string())
 {
-    const std::string key = ToLower(name), fkey = ToLower(folder);
-    for (int i = 0; i < (int)g_App.players.size(); i++)
-        if (ToLower(g_App.players[i].name) == key && ToLower(g_App.players[i].folder) == fkey) return i;
+    // folder|name -> group, kept across calls: reading a workspace asks once
+    // per file, and a scan per ask was quadratic
+    static std::unordered_map<std::string, int> keys;
+    static unsigned keysGen = 0;
+    static int keysFrame = -1;
+    static size_t keysN = (size_t)-1;
+    if (keysGen != g_PlayerGen || keysFrame != g_FrameNo || keysN != g_App.players.size())
+    {
+        keys.clear();
+        for (int i = 0; i < (int)g_App.players.size(); i++)
+            keys.emplace(ToLower(g_App.players[(size_t)i].folder) + "|" + ToLower(g_App.players[(size_t)i].name), i);
+    }
+    const std::string key = ToLower(folder) + "|" + ToLower(name);
+    auto it = keys.find(key);
+    if (it != keys.end() && it->second < (int)g_App.players.size()) return it->second;
 
     Player p;
     p.name = name;
     p.folder = folder;
     if (!folder.empty()) EnsureFolder(folder);
-    p.tint = kPlayerTints[g_App.players.size() % (sizeof(kPlayerTints) / sizeof(kPlayerTints[0]))];
+    p.tint  = DefaultGroupTint(name);           // read in from disk; NewGroupIn overrides
+    p.tint2 = SlotTint(p.tint, 1);
     g_App.players.push_back(p);
+    MarkPlayersChanged();
+    keys[key] = (int)g_App.players.size() - 1;
+    keysGen = g_PlayerGen;
+    keysFrame = g_FrameNo;
+    keysN = g_App.players.size();
     return (int)g_App.players.size() - 1;
 }
 
-static void LoadSurvivorFiles(const std::vector<std::string>& paths,
-                              const std::string& folder = std::string())
-{
-    int loaded = 0;
-    Ref lastLoaded;
-
-    for (size_t i = 0; i < paths.size(); i++)
-    {
-        std::string text;
-        if (!ReadTextFile(paths[i], text))
-        {
-            g_App.status = "Could not read " + FileNameOf(paths[i]);
-            continue;
-        }
-
-        const std::string fileName = FileNameOf(paths[i]);
-        std::string base; int index = 0;
-        SplitIndexedStem(StemOf(fileName), base, index);
-
-        int pi = FindOrCreatePlayer(base, folder);
-
-        // survivor1.asm -> slot 0, survivor2.asm -> slot 1, anything else -> first free
-        int slot = (index >= 1 && index <= kSlotCount) ? index - 1 : -1;
-        if (slot < 0 || g_App.players[pi].slots[slot].present)
-        {
-            slot = -1;
-            for (int s = 0; s < kSlotCount; s++)
-                if (!g_App.players[pi].slots[s].present) { slot = s; break; }
-        }
-        if (slot < 0)
-        {
-            // both slots taken: start an overflow player so nothing is silently dropped
-            pi = FindOrCreatePlayer(base + " (2)", folder);
-            slot = 0;
-            for (int s = 0; s < kSlotCount; s++)
-                if (!g_App.players[pi].slots[s].present) { slot = s; break; }
-        }
-
-        Survivor& sv = g_App.players[pi].slots[slot];
-        sv.name    = fileName;
-        sv.path    = paths[i];
-        sv.code    = text;
-        sv.present = true;
-        sv.enabled = true;
-        sv.dirty   = false;
-
-        lastLoaded.player = pi;
-        lastLoaded.slot   = slot;
-        loaded++;
-    }
-
-    if (loaded > 0)
-    {
-        char buf[96];
-        snprintf(buf, sizeof(buf), "Loaded %d survivor file(s)", loaded);
-        g_App.status = buf;
-        g_App.selection.assign(1, lastLoaded);
-        g_App.anchor = lastLoaded;
-        OpenInEditor(lastLoaded);
-    }
-}
-
 // -----------------------------------------------------------------------------
-// Binary (machine-code) survivors  --  these are what the engine actually runs.
-// Same trailing-number pairing as the text loader; the assembly buffer is left
-// as a hex dump until the real disassembler lands (Phase 5).
+// Machine code from disk
 // -----------------------------------------------------------------------------
 static bool ReadBinaryFile(const std::string& path, std::vector<unsigned char>& out)
 {
@@ -1225,91 +1620,8 @@ static bool ReadBinaryFile(const std::string& path, std::vector<unsigned char>& 
     return true;
 }
 
-static void LoadBinarySurvivorFiles(const std::vector<std::string>& paths,
-                                    const std::string& folder = std::string())
-{
-    int loaded = 0;
-    Ref last;
-    for (const std::string& path : paths)
-    {
-        std::vector<unsigned char> bytes;
-        if (!ReadBinaryFile(path, bytes)) { g_App.status = "Could not read " + FileNameOf(path); continue; }
-        if (bytes.size() > 512) bytes.resize(512);   // WarriorRepository.MAX_WARRIOR_SIZE
-
-        const std::string fileName = FileNameOf(path);
-        std::string base; int index = 0;
-        SplitIndexedStem(StemOf(fileName), base, index);
-
-        int pi = FindOrCreatePlayer(base, folder);
-        int slot = (index >= 1 && index <= kSlotCount) ? index - 1 : -1;
-        if (slot < 0 || g_App.players[pi].slots[slot].present)
-        {
-            slot = -1;
-            for (int s = 0; s < kSlotCount; s++)
-                if (!g_App.players[pi].slots[s].present) { slot = s; break; }
-        }
-        if (slot < 0)
-        {
-            pi = FindOrCreatePlayer(base + " (2)", folder);
-            slot = 0;
-        }
-
-        Survivor& sv = g_App.players[pi].slots[slot];
-        sv.name    = fileName;
-        sv.path    = path;
-        ListSurvivor(sv, bytes);          // real disassembly, labels and all
-        sv.present = true;
-        sv.enabled = true;
-        sv.dirty   = false;
-        last.player = pi; last.slot = slot;
-        loaded++;
-    }
-    if (loaded > 0)
-    {
-        g_App.status = "Loaded " + std::to_string(loaded) + " binary survivor(s)";
-        g_App.selection.assign(1, last);
-        g_App.anchor = last;
-        OpenInEditor(last);
-    }
-}
-
-// Importing individual files -- what dropping them on the window does, and what
-// "Open as-is" does with every file in a folder: source files (.asm/.s/.txt)
-// become editable survivors, anything else is taken as assembled machine code.
-// Reads only; nothing is moved, assembled to disk or written.
-//
-// A directory among them is a folder of survivors: its files are imported the
-// same way and filed under a folder of that name in the groups bar. Only one
-// level -- a folder inside that folder is not opened.
-static void ImportFiles(const std::vector<std::string>& paths, const std::string& folder = std::string())
-{
-    std::vector<std::string> src, bin;
-    for (const std::string& p : paths)
-    {
-        if (DirExists(p))
-        {
-            if (!folder.empty()) continue;
-            std::string dir = p;
-            while (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) dir.pop_back();
-            const std::string name = CleanFolderName(FileNameOf(dir));
-            if (name.empty() || !LooksLikeSurvivorFolder(dir)) continue;
-            EnsureFolder(name);
-            ImportFiles(ListDirFiles(dir), name);
-            continue;
-        }
-        const std::string name = FileNameOf(p);
-        const size_t dot = name.find_last_of('.');
-        const std::string ext = ToLower(dot == std::string::npos ? std::string() : name.substr(dot));
-        if (ext == ".asm" || ext == ".s" || ext == ".txt") src.push_back(p);
-        else                                               bin.push_back(p);
-    }
-    if (!src.empty()) LoadSurvivorFiles(src, folder);
-    if (!bin.empty()) LoadBinarySurvivorFiles(bin, folder);
-    // a source file has no machine code until it is assembled, and cannot fight
-    for (Player& pl : g_App.players)
-        for (Survivor& sv : pl.slots)
-            if (sv.present && sv.bin.empty() && !sv.code.empty()) ReassembleSurvivor(sv);
-}
+#include "gui/gui_workspace.inl"   // the workspace folder: reading, writing, watching, undoable delete
+#include "gui/gui_export.inl"      // copies of survivors as .asm or binaries, with the warnings
 
 // -----------------------------------------------------------------------------
 // Simulation control  --  bridges the workspace model to cw::GuiSession
@@ -1348,14 +1660,73 @@ static long long SeedFromText(const char* t)
     return strtoll(t, NULL, 10);
 }
 
+// A group's identity: its folder and its name. Two folders can each hold a
+// "Phoenix", so the name alone is not enough -- colours and the inspector find
+// a war's groups by this, never by the name.
+static std::string PlayerKey(const Player& pl) { return ToLower(pl.folder) + "|" + ToLower(pl.name); }
+
+static int PlayerOfKey(const std::string& key)
+{
+    if (key.empty()) return -1;
+    static std::unordered_map<std::string, int> index;
+    static unsigned gen = 0;
+    static int frame = -1;
+    static size_t n = (size_t)-1;
+    if (gen != g_PlayerGen || frame != g_FrameNo || n != g_App.players.size())
+    {
+        index.clear();
+        for (int i = 0; i < (int)g_App.players.size(); i++) index.emplace(PlayerKey(g_App.players[(size_t)i]), i);
+        gen = g_PlayerGen; frame = g_FrameNo; n = g_App.players.size();
+    }
+    auto it = index.find(key);
+    return it == index.end() ? -1 : it->second;
+}
+
+// The workspace group a group of the recorded war was built from, or -1.
+static int WarGroupPlayer(int gi)
+{
+    if (gi < 0 || gi >= g_App.game.groupCount()) return -1;
+    return PlayerOfKey(g_App.game.groupKey(gi));
+}
+
+// The warrior of the recorded war that is survivor `slot` of group `p`, or -1.
+static int WarriorOfPlayer(int p, int slot)
+{
+    for (int w = 0; w < g_App.game.numWarriors(); w++)
+        if (g_App.game.warriorSlot(w) == slot && !g_App.game.warriorZombie(w) &&
+            WarGroupPlayer(g_App.game.warriorGroup(w)) == p)
+            return w;
+    return -1;
+}
+
+// The engine knows a group by its name -- two of the same name would be one
+// team -- so where active groups share a name, each fights under its name with
+// its folder added ("Phoenix [Old/2015]"), and its survivors with it.
+static void SeparateSameNames(std::vector<cw::WarriorGroup>& groups, const std::vector<const Player*>& from)
+{
+    std::unordered_map<std::string, int> count;
+    for (const cw::WarriorGroup& g : groups) count[g.name]++;
+    for (size_t i = 0; i < groups.size() && i < from.size(); i++)
+    {
+        cw::WarriorGroup& g = groups[i];
+        if (!from[i] || count[g.name] < 2) continue;
+        const std::string old = g.name;
+        g.name = old + " [" + (from[i]->folder.empty() ? std::string("top") : from[i]->folder) + "]";
+        for (cw::WarriorData& wd : g.warriors)
+            if (wd.name.compare(0, old.size(), old) == 0) wd.name = g.name + wd.name.substr(old.size());
+    }
+}
+
 static std::vector<cw::WarriorGroup> BuildGroups()
 {
     std::vector<cw::WarriorGroup> groups;
+    std::vector<const Player*> from;
     for (const Player& pl : g_App.players)
     {
         if (!pl.enabled) continue;
         cw::WarriorGroup g;
         g.name = pl.name;
+        g.key  = PlayerKey(pl);
         for (int s = 0; s < kSlotCount; s++)
         {
             const Survivor& sv = pl.slots[s];
@@ -1368,8 +1739,9 @@ static std::vector<cw::WarriorGroup> BuildGroups()
             wd.type = (s == 0) ? cw::WarriorType::SURVIVOR_1 : cw::WarriorType::SURVIVOR_2;
             g.warriors.push_back(std::move(wd));
         }
-        if (!g.warriors.empty()) groups.push_back(std::move(g));
+        if (!g.warriors.empty()) { groups.push_back(std::move(g)); from.push_back(&pl); }
     }
+    SeparateSameNames(groups, from);
 
     // All zombies share one group so they never count as separate players.
     cw::WarriorGroup z;
@@ -1394,10 +1766,13 @@ static void GameArm(bool keepSeed = false)
     std::vector<cw::WarriorGroup> groups = BuildGroups();
     if (groups.empty())
     {
-        g_App.status = "Need at least one group with an assembled survivor";
+        g_App.status = !HasWorkspace() ? "Open a workspace first (Ctrl+O)"
+                                       : "Make at least one group with an assembled survivor active";
         return;
     }
     g_App.tlLo = 0.0; g_App.tlHi = 0.0;      // timeline re-fits once the replay lands
+    // warrior numbers belong to one war; in the next one they are other warriors
+    if (g_FollowIp >= 0 && !keepSeed) g_FollowIp = -1;
     g_App.gameSeed = SeedFromText(g_App.seedText);
     // A recompute made for an edit has to be the same war, or the edit means
     // nothing, so the seed only advances for a deliberate new war.
@@ -1452,111 +1827,6 @@ static void GameReset()
 {
     if (g_App.game.ready()) g_App.game.rewind();
     else                    g_App.game.clear();
-}
-
-static void NewPlayer()
-{
-    char name[64];
-    snprintf(name, sizeof(name), "Player %d", (int)g_App.players.size() + 1);
-    int pi = FindOrCreatePlayer(name);
-    for (int s = 0; s < kSlotCount; s++)
-    {
-        Survivor& sv = g_App.players[pi].slots[s];
-        char fn[64];
-        snprintf(fn, sizeof(fn), "survivor%d.asm", s + 1);
-        sv.name    = fn;
-        sv.path    = "";
-        sv.code    = kTemplate;
-        sv.present = true;
-        sv.enabled = true;
-        sv.dirty   = true;
-    }
-    Ref r; r.player = pi; r.slot = 0;
-    g_App.selection.assign(1, r);
-    g_App.anchor = r;
-    OpenInEditor(r);
-    g_App.status = std::string("Created ") + name;
-}
-
-static void ClosePlayer(int pi)
-{
-    if (pi < 0 || pi >= (int)g_App.players.size()) return;
-    g_App.status = "Closed " + g_App.players[pi].name;
-    g_App.players.erase(g_App.players.begin() + pi);
-    g_App.selection.clear();
-    g_App.anchor = Ref();
-    g_App.open = Ref();
-    g_App.editor.SetText("");
-    g_App.editor.SetReadOnly(true);
-}
-
-static void SeedDemoWorkspace()
-{
-    int a = FindOrCreatePlayer("Phoenix");
-    g_App.players[a].slots[0].name = "survivor1.asm";
-    g_App.players[a].slots[0].code =
-        "; --- PHOENIX / survivor 1 ------------------------\n"
-        "; classic scanner, bombs whatever it finds\n"
-        "START:\n"
-        "    MOV AX, BX\n"
-        "    MOV CX, 10\n"
-        "    ADD AX, CX\n"
-        "    CMP AX, 100\n"
-        "    JE  END_LOOP\n"
-        "    JMP START\n"
-        "END_LOOP:\n"
-        "    NOP\n";
-    g_App.players[a].slots[0].present = true;
-    g_App.players[a].slots[1].name = "survivor2.asm";
-    g_App.players[a].slots[1].code =
-        "; --- PHOENIX / survivor 2 ------------------------\n"
-        "; replicator, keeps the core busy\n"
-        "COPY:\n"
-        "    MOV SI, [BX]\n"
-        "    ADD SI, 2\n"
-        "    MOV [BX], SI\n"
-        "    DEC CX\n"
-        "    JNZ COPY\n"
-        "    INT 0x20\n";
-    g_App.players[a].slots[1].present = true;
-
-    int b = FindOrCreatePlayer("Red Comet");
-    g_App.players[b].slots[0].name = "survivor1.asm";
-    g_App.players[b].slots[0].code =
-        "; --- RED COMET / survivor 1 ----------------------\n"
-        "IMP:\n"
-        "    MOV AX, 0100h\n"
-        "    XOR DX, DX\n"
-        "SPIN:\n"
-        "    INC DX\n"
-        "    CMP DX, AX\n"
-        "    JB  SPIN\n"
-        "    JMP IMP\n";
-    g_App.players[b].slots[0].present = true;
-    g_App.players[b].slots[1].name = "survivor2.asm";
-    g_App.players[b].slots[1].code =
-        "; --- RED COMET / survivor 2 ----------------------\n"
-        "BOMB:\n"
-        "    MOV DI, 2000h\n"
-        "    MOV CX, 0FFh\n"
-        "DROP:\n"
-        "    MOV [DI], 0CCh\n"
-        "    ADD DI, 4\n"
-        "    LOOP DROP\n"
-        "    HLT\n";
-    g_App.players[b].slots[1].present = true;
-
-    // assembled up front, like a folder's sources are on load -- otherwise
-    // they have no machine code until someone edits them, and cannot fight
-    for (int p : { a, b })
-        for (Survivor& sv : g_App.players[p].slots)
-            if (sv.present) ReassembleSurvivor(sv);
-
-    Ref r; r.player = a; r.slot = 0;
-    g_App.selection.assign(1, r);
-    g_App.anchor = r;
-    OpenInEditor(r);
-    g_App.status = "Ready - demo workspace loaded";
 }
 
 // -----------------------------------------------------------------------------
@@ -1929,8 +2199,6 @@ static const float kLongPressTime  = 0.62f;
 static bool    g_LongPressFired = false;   // the current click was already consumed
 static ImGuiID g_LongPressId = 0;
 static float   g_LongPressProgress = 0.0f;
-static int     g_PendingClosePlayer = -1;
-static char    g_RenameBuf[64] = "";
 static int     g_OptionsTab = 0;
 static bool    g_ResetLayout = false;
 // Set by the font pickers; the swap happens between frames, never inside one.
@@ -2013,6 +2281,17 @@ static void DrawTitleBar()
     dl->AddText(ImVec2(x, barMin.y + (g_TitleBarHeight - ssz.y) * 0.5f), HexU(Col::TextDim), sub);
     x += ssz.x + 16 * g_Scale;
 
+    // the open workspace, the way an editor names its folder
+    if (HasWorkspace())
+    {
+        const std::string ws = FileNameOf(WsRoot());
+        dl->AddLine(ImVec2(x - 8 * g_Scale, barMin.y + g_TitleBarHeight * 0.3f),
+                    ImVec2(x - 8 * g_Scale, barMin.y + g_TitleBarHeight * 0.7f), HexU(Col::Line));
+        const ImVec2 wsz = ImGui::CalcTextSize(ws.c_str());
+        dl->AddText(ImVec2(x, barMin.y + (g_TitleBarHeight - wsz.y) * 0.5f), HexU(Col::TextDim), ws.c_str());
+        x += wsz.x;
+    }
+
     // The menu bar is gone -- everything it held is a shortcut, a control on the
     // panel it belongs to, or a row in the options window -- so the middle of
     // the strip is left as drag surface.
@@ -2071,16 +2350,143 @@ static void DrawTitleBar()
 // -----------------------------------------------------------------------------
 // Toolbar
 // -----------------------------------------------------------------------------
-static bool ToolButton(const char* id, int glyph, const char* tip, bool accent = false, bool enabled = true)
+// Two arrows chasing round a circle: "play it all again".
+static void DrawGlyphRecompute(ImDrawList* dl, const ImVec2& c, float s, ImU32 col)
+{
+    const float r = s * 0.85f, th = 1.6f * g_Scale;
+    dl->PathArcTo(c, r, -2.6f, 0.35f, 14);
+    dl->PathStroke(col, 0, th);
+    dl->PathArcTo(c, r, 0.55f, 3.5f, 14);
+    dl->PathStroke(col, 0, th);
+    // arrow heads at the end of each arc, pointing along it
+    auto head = [&](float a) {
+        const ImVec2 p(c.x + cosf(a) * r, c.y + sinf(a) * r);
+        const ImVec2 t(-sinf(a), cosf(a));            // tangent, direction of travel
+        const ImVec2 n(cosf(a), sinf(a));
+        const float k = s * 0.45f;
+        dl->AddTriangleFilled(ImVec2(p.x + t.x * k, p.y + t.y * k),
+                              ImVec2(p.x - n.x * k * 0.8f, p.y - n.y * k * 0.8f),
+                              ImVec2(p.x + n.x * k * 0.8f, p.y + n.y * k * 0.8f), col);
+    };
+    head(0.35f);
+    head(3.5f);
+}
+
+// A crosshair: "find it on the arena".
+static void DrawGlyphTarget(ImDrawList* dl, const ImVec2& c, float s, ImU32 col)
+{
+    const float th = 1.4f * g_Scale;
+    dl->AddCircle(c, s * 0.62f, col, 16, th);
+    dl->AddCircleFilled(c, s * 0.18f, col, 8);
+    dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x - s * 0.42f, c.y), col, th);
+    dl->AddLine(ImVec2(c.x + s * 0.42f, c.y), ImVec2(c.x + s, c.y), col, th);
+    dl->AddLine(ImVec2(c.x, c.y - s), ImVec2(c.x, c.y - s * 0.42f), col, th);
+    dl->AddLine(ImVec2(c.x, c.y + s * 0.42f), ImVec2(c.x, c.y + s), col, th);
+}
+
+// A dot held in four corner brackets: "locked on -- keep following it".
+static void DrawGlyphFollow(ImDrawList* dl, const ImVec2& c, float s, ImU32 col)
+{
+    const float th = 1.4f * g_Scale;
+    dl->AddCircleFilled(c, s * 0.26f, col, 10);
+    const float a = s * 0.9f, k = s * 0.42f;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+        {
+            const ImVec2 corner(c.x + sx * a, c.y + sy * a);
+            dl->AddLine(corner, ImVec2(corner.x - sx * k, corner.y), col, th);
+            dl->AddLine(corner, ImVec2(corner.x, corner.y - sy * k), col, th);
+        }
+}
+
+// A box with an arrow leaving its corner: "open in its own window".
+static void DrawGlyphPopOut(ImDrawList* dl, const ImVec2& c, float s, ImU32 col)
+{
+    const float th = 1.4f * g_Scale;
+    const ImVec2 mn(c.x - s * 0.85f, c.y - s * 0.55f), mx(c.x + s * 0.55f, c.y + s * 0.85f);
+    dl->PathLineTo(ImVec2(mn.x + s * 0.55f, mn.y));
+    dl->PathLineTo(mn);
+    dl->PathLineTo(ImVec2(mn.x, mx.y));
+    dl->PathLineTo(mx);
+    dl->PathLineTo(ImVec2(mx.x, mx.y - s * 0.55f));
+    dl->PathStroke(col, 0, th);
+    const ImVec2 tip(c.x + s, c.y - s);
+    dl->AddLine(ImVec2(c.x - s * 0.15f, c.y + s * 0.15f), tip, col, th);
+    dl->AddLine(tip, ImVec2(tip.x - s * 0.6f, tip.y), col, th);
+    dl->AddLine(tip, ImVec2(tip.x, tip.y + s * 0.6f), col, th);
+}
+
+// Buttons that run edge to edge -- a "train" -- round only their outer corners:
+// the first its left pair, the last its right pair, the middle ones none.
+static ImDrawFlags TrainCorners(int i, int n)
+{
+    if (n <= 1)     return ImDrawFlags_RoundCornersAll;
+    if (i == 0)     return ImDrawFlags_RoundCornersLeft;
+    if (i == n - 1) return ImDrawFlags_RoundCornersRight;
+    return ImDrawFlags_RoundCornersNone;
+}
+
+// The hairline between two carriages of a train, drawn on the left edge of
+// every carriage but the first.
+static void TrainJoint(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, int i)
+{
+    if (i <= 0) return;
+    const float inset = (mx.y - mn.y) * 0.22f;
+    dl->AddLine(ImVec2(mn.x, mn.y + inset), ImVec2(mn.x, mx.y - inset), HexU(Col::Line), 1.0f);
+}
+
+static const float kBarH = 28.0f;   // height of every control on a panel's toolbar
+
+// An ordinary ImGui field (drag, input, combo) as one carriage of a train:
+// the carriage is drawn here with the corners its place calls for, and the
+// widget's own frame is switched off so it sits inside it. Pair every Begin
+// with an End right after the widget.
+struct TrainField { ImVec2 mn, mx; ImDrawFlags corners; };
+static TrainField TrainFieldBegin(float w, int i, int n)
+{
+    TrainField t;
+    t.mn = ImGui::GetCursorScreenPos();
+    t.mx = ImVec2(t.mn.x + w, t.mn.y + kBarH * g_Scale);
+    t.corners = TrainCorners(i, n);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const bool hot = ImGui::IsMouseHoveringRect(t.mn, t.mx) && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    dl->AddRectFilled(t.mn, t.mx, HexU(hot ? Col::Bg3 : Col::Bg2, ImGui::GetStyle().Alpha), 7.0f * g_Scale, t.corners);
+    TrainJoint(dl, t.mn, t.mx, i);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(10 * g_Scale, (kBarH * g_Scale - ImGui::GetFontSize()) * 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    const ImVec4 clear(0, 0, 0, 0);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, clear);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, clear);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, clear);
+    ImGui::PushStyleColor(ImGuiCol_Button, clear);           // a combo's arrow square
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, clear);
+    ImGui::SetNextItemWidth(w);
+    return t;
+}
+static void TrainFieldEnd(const TrainField& t)
+{
+    const bool active = ImGui::IsItemActive();
+    ImGui::PopStyleColor(5);
+    ImGui::PopStyleVar(3);
+    if (active)
+        ImGui::GetWindowDrawList()->AddRect(t.mn, t.mx, HexU(Col::Accent, 0.7f), 7.0f * g_Scale,
+                                            t.corners, 1.2f);
+}
+
+static bool ToolButton(const char* id, int glyph, const char* tip, bool accent = false, bool enabled = true,
+                       ImDrawFlags corners = ImDrawFlags_RoundCornersAll, int trainIndex = 0)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float h = 28.0f * g_Scale;
+    const float h = kBarH * g_Scale;
     BtnState b = BareButton(id, ImVec2(h, h));
 
     ImU32 bg = accent ? HexU(Col::Accent, b.held ? 1.0f : (b.hovered ? 0.95f : 0.85f))
                       : HexU(b.held ? Col::Bg4 : (b.hovered ? Col::Bg3 : Col::Bg2));
     if (!enabled) bg = HexU(Col::Bg2, 0.5f);
-    dl->AddRectFilled(b.mn, b.mx, bg, 7.0f * g_Scale);
+    dl->AddRectFilled(b.mn, b.mx, bg, 7.0f * g_Scale, corners);
+    if (!accent) TrainJoint(dl, b.mn, b.mx, trainIndex);
 
     const ImU32 fg = accent ? HexU(Col::Bg0) : HexU(enabled ? Col::Text : Col::TextDim);
     const ImVec2 c((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f);
@@ -2097,6 +2503,10 @@ static bool ToolButton(const char* id, int glyph, const char* tip, bool accent =
         case 7: DrawGlyphRewind(dl, c, s, fg);   break;
         case 8: DrawGlyphFastFwd(dl, c, s, fg);  break;
         case 9: DrawGlyphContinue(dl, c, s, fg); break;
+        case 10: DrawGlyphRecompute(dl, c, s, fg); break;
+        case 11: DrawGlyphTarget(dl, c, s, fg);  break;
+        case 12: DrawGlyphPopOut(dl, c, s * 0.9f, fg); break;
+        case 13: DrawGlyphFollow(dl, c, s, fg);  break;
         default: break;
     }
     if (b.hovered && tip) ImGui::SetTooltip("%s", tip);
@@ -2113,7 +2523,435 @@ static float CollapsedGroupsWidth()
     return kCollapsedChip * 2.0f * g_Scale + 4.0f * g_Scale + 22.0f * g_Scale;
 }
 
-static void SurvivorSlotButton(int pi, int si, float size)
+// Where files dropped on the window would land, by what is under the mouse:
+// rebuilt every frame as the rows are drawn, read by the drop callback.
+struct DropZone { ImVec2 mn, mx; std::string folder; bool zombies; };
+static std::vector<DropZone> g_DropZones, g_DropZonesBuild;
+static void AddDropZone(const ImVec2& mn, const ImVec2& mx, const std::string& folder, bool zombies)
+{
+    DropZone z; z.mn = mn; z.mx = mx; z.folder = folder; z.zombies = zombies;
+    g_DropZonesBuild.push_back(z);
+}
+
+// What a menu item or a drag on one row acts on: the whole selection when the
+// row is part of it, otherwise just the row.
+static std::vector<RefKey> ItemsForAction(const Ref& row)
+{
+    std::vector<RefKey> out;
+    if (IsSelected(row) && g_App.selection.size() > 1)
+        for (const Ref& r : g_App.selection)
+        {
+            RefKey k = KeyOfRef(r);
+            if (k.kind == 0 && k.slot >= 0) continue;          // survivors travel with their group
+            if (k.kind >= 0) out.push_back(k);
+        }
+    if (out.empty()) { RefKey k = KeyOfRef(row); if (k.kind == 0) k.slot = -1; out.push_back(k); }
+    return out;
+}
+
+static bool MultiSelected(const Ref& row)
+{
+    return IsSelected(row) && g_App.selection.size() > 1;
+}
+
+// The folders a drag or "Move to folder" may put these into.
+static bool CanMoveInto(const std::vector<RefKey>& items, const std::string& target)
+{
+    for (const RefKey& k : items)
+        if (k.kind == 2 && FolderUnder(target, k.folder)) return false;   // not into itself
+    return true;
+}
+
+static void QueueMove(const std::vector<RefKey>& items, const std::string& folder)
+{
+    if (!CanMoveInto(items, folder)) { g_App.status = "A folder can't go inside itself"; return; }
+    WsOp op;
+    op.kind = WsOp::MoveGroups;
+    op.items = items;
+    op.folder = folder;
+    QueueWsOp(op);
+}
+
+static void QueueDelete(const std::vector<RefKey>& items)
+{
+    WsOp op;
+    op.kind = WsOp::Delete;
+    op.items = items;
+    QueueWsOp(op);
+}
+
+// "Move to folder": every folder, as the tree, plus a new one.
+static void MoveToFolderMenu(const std::vector<RefKey>& items, const std::string& current)
+{
+    if (!ImGui::BeginMenu("Move to folder")) return;
+    if (items.size() > 1) ImGui::TextDisabled("%d items", (int)items.size());
+    const bool mixed = (current == "\x01");               // a selection from several places
+    const std::string here = mixed ? std::string() : current;
+    if (ImGui::MenuItem("(top)", NULL, !mixed && current.empty())) QueueMove(items, std::string());
+    std::vector<int> order;
+    for (int i = 0; i < (int)g_App.folders.size(); i++) order.push_back(i);   // already sorted by path
+    for (int fi : order)
+    {
+        const std::string& p = g_App.folders[fi].path;
+        const bool ok = CanMoveInto(items, p);
+        std::string label = std::string((size_t)(FolderDepth(p) - 1) * 3, ' ') + FolderLeaf(p);
+        if (ImGui::MenuItem((label + "##mv" + p).c_str(), NULL, ToLower(p) == ToLower(current), ok))
+            QueueMove(items, p);
+    }
+    ImGui::Separator();
+    static char newFolder[64] = "";
+    ImGui::SetNextItemWidth(170 * g_Scale);
+    if (ImGui::InputTextWithHint("##newfolder", "New folder, Enter...", newFolder, sizeof(newFolder),
+                                 ImGuiInputTextFlags_EnterReturnsTrue))
+    {
+        const std::string name = CleanFolderName(newFolder);
+        if (!name.empty()) QueueMove(items, FolderJoin(here, name));
+        else               g_App.status = "That can't be a folder name";
+        newFolder[0] = 0;
+        ImGui::CloseCurrentPopup();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Made inside the folder these are in now");
+    ImGui::EndMenu();
+}
+
+// "Run against folders": the groups each fight every picked folder's groups,
+// one folder at a time -- never two folders in the same battle -- and the
+// board keeps a page of scores per folder.
+//
+// The folders are picked in a window of their own (a menu of every folder grew
+// as wide as the longest path and as tall as the workspace): a tree that opens
+// only what you open, a filter box, and a size of its own you can drag.
+static std::set<std::string> g_RunPick;    // lower-case paths
+struct RunFolderPicker
+{
+    bool                open = false;
+    bool                appearing = false;
+    std::vector<RefKey> groups;               // who plays
+    char                filter[96] = "";
+    int                 openAll = 0;          // 1 expand every node next frame, -1 collapse
+};
+static RunFolderPicker g_RunPicker;
+
+static void RunAgainstFoldersMenu(const std::vector<RefKey>& items)
+{
+    std::vector<RefKey> groups;
+    for (const RefKey& k : items) if (k.kind == 0) groups.push_back(k);
+    if (groups.empty()) return;
+    const bool any = !g_App.folders.empty();
+    if (ImGui::MenuItem("Run against folders...", NULL, false, any))
+    {
+        g_RunPicker.open = true;
+        g_RunPicker.appearing = true;
+        g_RunPicker.groups = groups;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(any ? "Pick folders: each one is a tournament of its own for these groups"
+                              : "No folders yet");
+}
+
+// Picks (or drops) every folder nested inside `path` -- not `path` itself,
+// which would hold them all again.
+static void RunPickNested(const std::string& path)
+{
+    const std::string key = ToLower(path);
+    std::vector<std::string> nested;
+    for (const GroupFolder& g : g_App.folders)
+        if (ToLower(g.path) != key && FolderUnder(g.path, path)) nested.push_back(ToLower(g.path));
+    bool allOn = !nested.empty();
+    for (const std::string& n : nested) if (!g_RunPick.count(n)) allOn = false;
+    for (const std::string& n : nested) { if (allOn) g_RunPick.erase(n); else g_RunPick.insert(n); }
+    g_RunPick.erase(key);
+    if (nested.empty()) g_App.status = FolderLeaf(path) + " has no folders inside it";
+}
+
+struct RunPickCounts
+{
+    std::map<std::string, int> groups;     // lower path -> groups in it and below
+    std::map<std::string, int> picked;     // lower path -> picked folders strictly below
+    std::set<std::string>      shown;      // with a filter: folders that match, and their parents
+};
+
+// One level of the picker's tree.
+static void RunPickTree(const std::string& parent, const RunPickCounts& c, bool filtering)
+{
+    for (int fi : FolderChildren(parent))
+    {
+        if (fi >= (int)g_App.folders.size()) continue;
+        const std::string path = g_App.folders[fi].path;
+        const std::string key = ToLower(path);
+        if (filtering && !c.shown.count(key)) continue;
+        auto gi = c.groups.find(key);
+        auto pi = c.picked.find(key);
+        const int nGroups = gi == c.groups.end() ? 0 : gi->second;
+        const int nPicked = pi == c.picked.end() ? 0 : pi->second;
+        const bool leaf = FolderChildren(path).empty();
+
+        ImGui::PushID(path.c_str());
+        bool on = g_RunPick.count(key) > 0;
+        if (ImGui::Checkbox("##pick", &on)) { if (on) g_RunPick.insert(key); else g_RunPick.erase(key); }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n%d group%s, the folders inside it included", path.c_str(), nGroups, nGroups == 1 ? "" : "s");
+        ImGui::SameLine(0, 4 * g_Scale);
+        if (g_RunPicker.openAll != 0 && !leaf) ImGui::SetNextItemOpen(g_RunPicker.openAll > 0);
+        else if (filtering && !leaf) ImGui::SetNextItemOpen(true);
+        char label[200];
+        if (nPicked > 0)
+            snprintf(label, sizeof(label), "%s  (%d)   %d inside picked", FolderLeaf(path).c_str(), nGroups, nPicked);
+        else
+            snprintf(label, sizeof(label), "%s  (%d)", FolderLeaf(path).c_str(), nGroups);
+        const bool open = ImGui::TreeNodeEx("##node", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_OpenOnArrow |
+                                                      ImGuiTreeNodeFlags_OpenOnDoubleClick |
+                                                      (leaf ? ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen : 0),
+                                            "%s", label);
+        // a click on the name picks it too; the arrow only folds
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
+        {
+            const float arrowEnd = ImGui::GetItemRectMin().x + ImGui::GetTreeNodeToLabelSpacing();
+            if (leaf || ImGui::GetIO().MousePos.x > arrowEnd)
+            {
+                if (on) g_RunPick.erase(key); else g_RunPick.insert(key);
+            }
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) RunPickNested(path);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Click: %s this folder\nRight-click: %s",
+                              on ? "unpick" : "pick", leaf ? "(nothing inside it)" : "pick every folder inside it instead");
+        if (open && !leaf)
+        {
+            RunPickTree(path, c, filtering);
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+}
+
+static void DrawRunFoldersWindow()
+{
+    RunFolderPicker& P = g_RunPicker;
+    if (!P.open) return;
+    if (!HasWorkspace() || g_App.folders.empty()) { P.open = false; return; }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    if (P.appearing)
+    {
+        ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowFocus();
+        P.appearing = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(440 * g_Scale, 520 * g_Scale), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(320 * g_Scale, 280 * g_Scale),
+                                        ImVec2(ImMax(340 * g_Scale, vp->Size.x * 0.6f), vp->Size.y * 0.95f));
+    if (!ImGui::Begin("Run against folders###runfolders", &P.open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking))
+    {
+        ImGui::End();
+        return;
+    }
+
+    // who plays, in one line
+    {
+        std::string who;
+        const int shown = ImMin(3, (int)P.groups.size());
+        for (int i = 0; i < shown; i++) { if (i) who += ", "; who += P.groups[(size_t)i].name; }
+        if ((int)P.groups.size() > shown) who += " and " + std::to_string((int)P.groups.size() - shown) + " more";
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(Hex(Col::TextDim), "%s play%s each picked folder as a tournament of its own.",
+                           who.c_str(), P.groups.size() == 1 ? "s" : "");
+        ImGui::PopTextWrapPos();
+    }
+
+    // the filter, and a few ways to pick many at once
+    ImGui::SetNextItemWidth(ImMax(120 * g_Scale, ImGui::GetContentRegionAvail().x));
+    ImGui::InputTextWithHint("##filter", "Filter folders...", P.filter, sizeof(P.filter));
+    if (ImGui::SmallButton("Top folders"))
+        for (int fi : FolderChildren(std::string())) g_RunPick.insert(ToLower(g_App.folders[fi].path));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pick every folder at the top of the workspace");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear")) g_RunPick.clear();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Expand all")) P.openAll = 1;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Collapse all")) P.openAll = -1;
+
+    // counts for the labels, worked out once a frame rather than once a row
+    RunPickCounts c;
+    const std::string filter = ToLower(P.filter);
+    {
+        std::set<std::string> known;
+        for (const GroupFolder& f : g_App.folders)
+        {
+            const std::string k = ToLower(f.path);
+            known.insert(k);
+            if (!filter.empty() && k.find(filter) != std::string::npos)
+                for (std::string up = k; !up.empty(); up = FolderParent(up)) c.shown.insert(up);
+        }
+        for (const Player& pl : g_App.players)
+        {
+            const std::string f = ToLower(pl.folder);
+            if (f.empty() || !known.count(f)) continue;
+            for (std::string up = f; !up.empty(); up = FolderParent(up)) c.groups[up]++;
+        }
+        for (const std::string& k : g_RunPick)
+            for (std::string up = FolderParent(k); !up.empty(); up = FolderParent(up)) c.picked[up]++;
+    }
+
+    const float footH = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 4 * g_Scale;
+    ImGui::BeginChild("##runtree", ImVec2(0, ImMax(80.0f * g_Scale, ImGui::GetContentRegionAvail().y - footH)),
+                      ImGuiChildFlags_Borders);
+    if (!filter.empty() && c.shown.empty()) ImGui::TextDisabled("No folder matches \"%s\"", P.filter);
+    RunPickTree(std::string(), c, !filter.empty());
+    ImGui::EndChild();
+    P.openAll = 0;
+
+    // picks of folders that have gone since are left out
+    std::vector<std::string> picked;
+    for (const GroupFolder& f : g_App.folders) if (g_RunPick.count(ToLower(f.path))) picked.push_back(f.path);
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(Hex(Col::TextDim), "%d folder%s picked", (int)picked.size(), picked.size() == 1 ? "" : "s");
+    if (!picked.empty() && ImGui::IsItemHovered())
+    {
+        std::string all;
+        for (size_t i = 0; i < picked.size() && i < 40; i++) all += picked[i] + "\n";
+        if (picked.size() > 40) all += "...";
+        ImGui::SetTooltip("%s", all.c_str());
+    }
+    const float runW = ImGui::CalcTextSize("Run").x + 34 * g_Scale;
+    const float cancelW = ImGui::CalcTextSize("Cancel").x + 24 * g_Scale;
+    ImGui::SameLine(ImMax(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - runW - cancelW - 6 * g_Scale));
+    if (ImGui::Button("Cancel", ImVec2(cancelW, 0))) P.open = false;
+    ImGui::SameLine(0, 6 * g_Scale);
+    ImGui::BeginDisabled(picked.empty());
+    ImGui::PushStyleColor(ImGuiCol_Button, Hex(Col::Accent, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Hex(Col::Accent, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, Hex(Col::Accent, 0.75f));
+    ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::Bg0));
+    if (ImGui::Button("Run", ImVec2(runW, 0)))
+    {
+        WsOp op;
+        op.kind = WsOp::RunFolders;
+        op.items = P.groups;
+        op.paths = picked;
+        QueueWsOp(op);
+        P.open = false;
+    }
+    ImGui::PopStyleColor(4);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("A folder's groups include the folders inside it.\n"
+                          "Plays on the Competition panel's settings, with the C++ engine.");
+    ImGui::End();
+}
+
+// The menu for a few rows at once: only what makes sense for all of them.
+static void SharedContextMenu(const Ref& row)
+{
+    const std::vector<RefKey> items = ItemsForAction(row);
+    ImGui::TextDisabled("%d selected", (int)g_App.selection.size());
+    ImGui::Separator();
+    bool allActive = true;
+    for (const Ref& r : g_App.selection) if (!RefEnabled(r)) allActive = false;
+    if (ImGui::MenuItem("Active", "Ctrl+Q", allActive)) SetSelectionActive(!allActive);
+    if (ImGui::MenuItem("Only these active")) ActivateOnlySelection();
+    ImGui::Separator();
+    bool movable = false;
+    for (const RefKey& k : items) if (k.kind == 0 || k.kind == 2) movable = true;
+    if (movable)
+    {
+        std::vector<RefKey> mv;
+        for (const RefKey& k : items) if (k.kind == 0 || k.kind == 2) mv.push_back(k);
+        MoveToFolderMenu(mv, std::string("\x01"));
+        RunAgainstFoldersMenu(items);
+    }
+    ImGui::Separator();
+    if (ImGui::MenuItem("Export...")) ExportOpen(ExportKeysFor(row));
+    ImGui::Separator();
+    if (ImGui::MenuItem("Delete", "Del")) QueueDelete(items);
+}
+
+// The name of a row being renamed, as a text field over where the name sits.
+// Enter or clicking away keeps it, Esc throws it away.
+static void InlineRenameField(const ImVec2& mn, const ImVec2& mx)
+{
+    const float h = ImGui::GetFrameHeight();
+    ImGui::SetCursorScreenPos(ImVec2(mn.x, (mn.y + mx.y - h) * 0.5f));
+    ImGui::SetNextItemWidth(ImMax(40.0f * g_Scale, mx.x - mn.x));
+    if (g_Rename.focus) { ImGui::SetKeyboardFocusHere(); g_Rename.focus = false; }
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, Hex(Col::Bg0));
+    ImGui::PushStyleColor(ImGuiCol_Border, Hex(Col::Accent, 0.8f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    const bool enter = ImGui::InputText("##inlinerename", g_Rename.buf, sizeof(g_Rename.buf),
+                                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+    const bool escaped = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    if (enter || (ImGui::IsItemDeactivated() && !escaped))
+    {
+        WsOp op;
+        op.kind = WsOp::Rename;
+        op.items.push_back(g_Rename.key);
+        op.name = g_Rename.buf;
+        QueueWsOp(op);
+        g_Rename = InlineRename();
+    }
+    else if (escaped) g_Rename = InlineRename();
+}
+
+// A row that was just deleted, struck through and fading, with a way back.
+static void DrawGhostRow(const GhostRow& g, float alpha, bool newest, float rowH)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 o = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const ImVec2 mn = o, mx(o.x + w, o.y + rowH);
+    dl->AddRectFilled(mn, mx, HexU(Col::Danger, 0.07f * alpha), 7 * g_Scale);
+    const float av = 20.0f * g_Scale;
+    const ImVec2 amn(mn.x + 6 * g_Scale, mn.y + (rowH - av) * 0.5f), amx(amn.x + av, amn.y + av);
+    if (g.kind == 1) DrawGlyphFolder(dl, ImVec2(amn.x + av * 0.5f, amn.y + av * 0.5f), 5.0f * g_Scale, HexU(Col::TextDim, alpha * 0.7f));
+    else             dl->AddRect(amn, amx, HexU(g.tint, 0.5f * alpha), 5 * g_Scale, 0, 1.2f);
+    const ImVec2 ts = ImGui::CalcTextSize(g.label.c_str());
+    const float tx = amx.x + 9 * g_Scale, ty = mn.y + (rowH - ts.y) * 0.5f;
+    const float clipX = newest ? mx.x - ImGui::CalcTextSize("Undo").x - 24 * g_Scale : mx.x - 6 * g_Scale;
+    dl->PushClipRect(mn, ImVec2(clipX, mx.y), true);
+    dl->AddText(ImVec2(tx, ty), HexU(Col::TextDim, 0.8f * alpha), g.label.c_str());
+    dl->AddLine(ImVec2(tx, ty + ts.y * 0.55f), ImVec2(tx + ts.x, ty + ts.y * 0.55f), HexU(Col::Danger, 0.8f * alpha), 1.2f);
+    dl->PopClipRect();
+    if (newest)
+    {
+        const char* u = "Undo";
+        const ImVec2 us = ImGui::CalcTextSize(u);
+        ImGui::SetCursorScreenPos(ImVec2(mx.x - us.x - 16 * g_Scale, mn.y + (rowH - us.y - 4 * g_Scale) * 0.5f));
+        ImGui::PushID(g.label.c_str());
+        BtnState b = BareButton("##undo", ImVec2(us.x + 10 * g_Scale, us.y + 4 * g_Scale));
+        dl->AddRectFilled(b.mn, b.mx, HexU(b.hovered ? Col::Bg3 : Col::Bg2, alpha), 5 * g_Scale);
+        dl->AddText(ImVec2(b.mn.x + 5 * g_Scale, b.mn.y + 2 * g_Scale), HexU(Col::Accent, alpha), u);
+        if (b.hovered) ImGui::SetTooltip("Bring it back (Ctrl+Z)");
+        if (b.clicked) QueueWsOp(WsOp::Undo);
+        ImGui::PopID();
+    }
+    ImGui::SetCursorScreenPos(ImVec2(o.x, mx.y + 2 * g_Scale));
+    ImGui::Dummy(ImVec2(0, 0));
+    ImGui::SetCursorScreenPos(ImVec2(o.x, mx.y + 2 * g_Scale));
+}
+
+// The ghosts of one list (kind 0 groups / 1 folders of `folder`), by the
+// position they had.
+struct GhostRef { const GhostRow* row; float alpha; bool newest; };
+static std::vector<GhostRef> GhostsOf(int kind, const std::string& folder)
+{
+    std::vector<GhostRef> out;
+    for (size_t b = 0; b < g_Trash.size(); b++)
+    {
+        const float a = GhostAlpha(g_Trash[b]);
+        if (a <= 0.0f) continue;
+        for (const GhostRow& g : g_Trash[b].ghosts)
+            if (g.kind == kind && ToLower(g.folder) == ToLower(folder))
+                out.push_back(GhostRef{ &g, a, b + 1 == g_Trash.size() });
+    }
+    return out;
+}
+
+static void SurvivorSlotButton(int pi, int si, float size, ImDrawFlags corners = ImDrawFlags_RoundCornersAll)
 {
     AppState& S = g_App;
     Player& pl = S.players[pi];
@@ -2126,66 +2964,77 @@ static void SurvivorSlotButton(int pi, int si, float size)
     const unsigned slotTint = pl.twoTone ? (si == 1 ? pl.tint2 : pl.tint)
                                          : SlotTint(pl.tint, si);
 
-    const bool selected  = IsSelected(ref);
-    const bool isOpen    = (S.open == ref);
-    const bool effective = sv.present && sv.enabled && pl.enabled;
+    const bool selected = IsSelected(ref);
+    const bool isOpen   = (S.open == ref);
+    const bool active   = sv.present && sv.enabled && pl.enabled;
 
     bool clicked = b.clicked;
     if (sv.present && CheckLongPress(clicked))
         ToggleRefEnabled(ref);
 
+    // Active: the solid swatch. Not active: the same colour as an outline only,
+    // so what fights reads at a glance and nothing looks broken.
     ImU32 bg, fg, border = 0;
+    float borderW = 1.0f;
     if (!sv.present)
     {
-        // No survivor on disk for this slot: it simply shows up disabled and empty.
         bg = HexU(Col::Bg2, 0.35f);
         fg = HexU(Col::TextDim, 0.55f);
         border = HexU(Col::Line);
     }
-    else if (!effective)
+    else if (!active)
     {
-        bg = HexU(Col::Bg2, 0.55f);
+        bg = HexU(b.hovered ? Col::Bg3 : Col::Bg2, selected ? 1.0f : 0.7f);
         fg = HexU(Col::TextDim);
-        border = HexU(Col::Danger, 0.45f);
+        border = HexU(slotTint, selected ? 0.95f : 0.55f);
+        borderW = selected ? 1.5f : 1.0f;
     }
     else if (selected)
     {
-        // selected reads as the plain chip, unselected as the solid swatch
         bg = HexU(b.held ? Col::Bg4 : (b.hovered ? Col::Bg3 : Col::Bg2));
         fg = HexU(slotTint);
         border = HexU(slotTint, 0.95f);
     }
     else
     {
-        bg = HexU(slotTint, b.hovered ? 1.0f : 0.82f);
+        bg = HexU(slotTint, b.hovered ? 1.0f : 0.85f);
         fg = HexU(Col::Bg0);
     }
 
     const float r = 6.0f * g_Scale;
-    dl->AddRectFilled(b.mn, b.mx, bg, r);
-    if (border) dl->AddRect(b.mn, b.mx, border, r, 0, 1.0f);
-    if (isOpen && effective && !selected)
-        dl->AddRect(b.mn, b.mx, HexU(slotTint, 0.85f), r, 0, 1.5f);
+    dl->AddRectFilled(b.mn, b.mx, bg, r, corners);
+    if (border) dl->AddRect(b.mn, b.mx, border, r, corners, borderW);
+    if (isOpen && active && !selected)
+        dl->AddRect(b.mn, b.mx, HexU(slotTint, 0.85f), r, corners, 1.5f);
 
     const char label[2] = { (char)('1' + si), 0 };
     const ImVec2 tsz = ImGui::CalcTextSize(label);
     dl->AddText(ImVec2((b.mn.x + b.mx.x - tsz.x) * 0.5f, (b.mn.y + b.mx.y - tsz.y) * 0.5f), fg, label);
 
+    // unsaved changes: a dot in the corner, ringed so it reads on any tint
     if (sv.present && sv.dirty)
-        dl->AddCircleFilled(ImVec2(b.mx.x - 3.5f * g_Scale, b.mn.y + 3.5f * g_Scale), 2.2f * g_Scale, HexU(Col::Warn));
+    {
+        const ImVec2 dc(b.mx.x - 4.0f * g_Scale, b.mn.y + 4.0f * g_Scale);
+        dl->AddCircleFilled(dc, 3.2f * g_Scale, HexU(Col::Bg0));
+        dl->AddCircleFilled(dc, 2.2f * g_Scale, HexU(Col::Warn));
+    }
 
     DrawLongPressHint(b.mn, b.mx);
 
     if (b.hovered)
     {
         if (!sv.present)
-            ImGui::SetTooltip("%s %d - disabled\nThis group only loaded %d survivor%s",
+            ImGui::SetTooltip("%s %d - empty\nThis group has %d survivor%s",
                               pl.name.c_str(), si + 1, pl.LoadedCount(), pl.LoadedCount() == 1 ? "" : "s");
         else
-            ImGui::SetTooltip("%s\n%s\n\nClick: open + select\nCtrl / Shift + click: multi-select\nHold: %s",
-                              sv.name.c_str(),
-                              sv.path.empty() ? "(unsaved)" : sv.path.c_str(),
-                              sv.enabled ? "disable" : "enable");
+            ImGui::SetTooltip("%s  -  %s\n%s%s\n\nClick: open + select\nCtrl / Shift + click: multi-select\nHold: %s",
+                              sv.name.c_str(), active ? "active" : "not active",
+                              sv.asmPath.c_str(),
+                              sv.dirty ? (g_App.autoSave
+                                              ? "\nYellow dot: changes not on disk yet (autosave is on)"
+                                              : "\nYellow dot: unsaved changes - Ctrl+S saves")
+                                       : "",
+                              active ? "take it out" : "make it active");
     }
 
     if (clicked && sv.present)
@@ -2193,7 +3042,7 @@ static void SurvivorSlotButton(int pi, int si, float size)
         HandleRowClick(ref, true);
         if (S.game.ready())
         {
-            int w = S.game.findWarrior(pl.name, si);
+            int w = WarriorOfPlayer(pi, si);
             if (w < 0)
             {
                 // fall back to the warrior file name, in case the group was
@@ -2209,35 +3058,50 @@ static void SurvivorSlotButton(int pi, int si, float size)
 
     if (sv.present && ImGui::BeginPopupContextItem("##slotctx"))
     {
-        ImGui::TextDisabled("%s", sv.name.c_str());
-        ImGui::Separator();
-        if (ImGui::MenuItem(sv.enabled ? "Disable" : "Enable")) ToggleRefEnabled(ref);
-        if (ImGui::MenuItem("Save", NULL, false, !sv.path.empty())) SaveSurvivor(ref);
-        if (ImGui::MenuItem("Reload from disk", NULL, false, !sv.path.empty()))
+        if (MultiSelected(ref)) SharedContextMenu(ref);
+        else
         {
-            std::string text;
-            if (ReadTextFile(sv.path, text))
+            ImGui::TextDisabled("%s", sv.name.c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem("Active", "Ctrl+Q", active)) ToggleRefEnabled(ref);
+            if (ImGui::MenuItem("Save", "Ctrl+S")) SaveSurvivor(ref);
+            if (ImGui::MenuItem("Export...")) ExportOpen(ExportKeysFor(ref));
+            if (ImGui::MenuItem("Reveal in Explorer")) RevealInExplorer(PathExists(sv.asmPath) ? sv.asmPath : sv.binPath);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete this survivor", "Del"))
             {
-                sv.code  = text;
-                sv.dirty = false;
-                if (S.open == ref) { S.open = Ref(); OpenInEditor(ref); }
-                S.status = "Reloaded " + sv.name;
-            }
-        }
-        if (ImGui::MenuItem("Clear slot"))
-        {
-            const bool wasOpen = (S.open == ref);
-            sv = Survivor();
-            if (wasOpen)
-            {
-                S.open = Ref();
-                S.editor.SetText("");
-                S.editor.SetReadOnly(true);
+                RefKey k = KeyOfRef(ref);
+                QueueDelete(std::vector<RefKey>(1, k));
             }
         }
         ImGui::EndPopup();
     }
     ImGui::PopID();
+}
+
+// The drag payload of a row: which row was picked up.
+static void RowDragSource(const Ref& row, const char* label)
+{
+    if (!ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers)) return;
+    ImGui::SetDragDropPayload("CW_ROW", &row, sizeof(row));
+    const std::vector<RefKey> items = ItemsForAction(row);
+    if (items.size() == 1) ImGui::TextUnformatted(label);
+    else                   ImGui::Text("%d items", (int)items.size());
+    ImGui::EndDragDropSource();
+}
+
+// A row things can be dropped on: they go into `folder`.
+static bool RowDropTarget(const std::string& folder)
+{
+    bool hot = false;
+    if (ImGui::BeginDragDropTarget())
+    {
+        hot = true;
+        if (const ImGuiPayload* pay = ImGui::AcceptDragDropPayload("CW_ROW"))
+            QueueMove(ItemsForAction(*(const Ref*)pay->Data), folder);
+        ImGui::EndDragDropTarget();
+    }
+    return hot;
 }
 
 static void DrawPlayerRow(int pi, float rowH)
@@ -2249,138 +3113,173 @@ static void DrawPlayerRow(int pi, float rowH)
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 rowStart = ImGui::GetCursorScreenPos();
     const float  avail    = ImGui::GetContentRegionAvail().x;
-    const float  slotSize = 22.0f * g_Scale;
+    const float  slotSize = 21.0f * g_Scale;
+    const float  slotGap  = 2.0f * g_Scale;     // the two survivors are one train
     const float  gap      = 5.0f * g_Scale;
 
     ImGui::PushID(pi);
 
+    // The row draws its own states, so ImGui's selection fill is turned off.
     const bool selected = IsSelected(ref);
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
     bool clicked = ImGui::Selectable("##row", selected, ImGuiSelectableFlags_AllowOverlap, ImVec2(avail, rowH));
+    ImGui::PopStyleColor(3);
     const ImVec2 rowMin = ImGui::GetItemRectMin();
     const ImVec2 rowMax = ImGui::GetItemRectMax();
     const bool rowHovered = ImGui::IsItemHovered();
+    const bool rowHeld = ImGui::IsItemActive();
+    AddDropZone(rowMin, rowMax, pl.folder, false);
 
-    // A group row can be dragged onto a folder to file it there, or onto
-    // another group to join whatever that one is in (or out of).
-    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers))
-    {
-        ImGui::SetDragDropPayload("CW_GROUP", &pi, sizeof(pi));
-        const int n = (int)GroupsForAction(pi).size();
-        if (n == 1) ImGui::TextUnformatted(pl.name.c_str());
-        else        ImGui::Text("%d groups", n);
-        ImGui::EndDragDropSource();
-    }
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* pay = ImGui::AcceptDragDropPayload("CW_GROUP"))
-            QueueFolderMove(GroupsForAction(*(const int*)pay->Data), pl.folder);
-        ImGui::EndDragDropTarget();
-    }
+    // a group row can be dragged onto a folder, or onto another group to join
+    // whatever folder that one is in
+    RowDragSource(ref, pl.name.c_str());
+    const bool dropHot = RowDropTarget(pl.folder);
 
     if (CheckLongPress(clicked))
         ToggleRefEnabled(ref);
+
+    // row surface: nothing at rest, a soft fill on hover, the accent when picked
+    const float rr = 7.0f * g_Scale;
+    if (selected)
+    {
+        dl->AddRectFilled(rowMin, rowMax, HexU(Col::Accent, rowHovered ? 0.20f : 0.15f), rr);
+        dl->AddRect(rowMin, rowMax, HexU(Col::Accent, 0.35f), rr, 0, 1.0f);
+    }
+    else if (rowHovered || rowHeld)
+        dl->AddRectFilled(rowMin, rowMax, HexU(rowHeld ? Col::Bg3 : Col::Bg2), rr);
+    if (dropHot) dl->AddRect(rowMin, rowMax, HexU(Col::Accent, 0.6f), rr, 0, 1.2f);
     DrawLongPressHint(rowMin, rowMax);
 
-    // left tint bar
-    dl->AddRectFilled(ImVec2(rowMin.x, rowMin.y + 4 * g_Scale),
-                      ImVec2(rowMin.x + 3 * g_Scale, rowMax.y - 4 * g_Scale),
-                      HexU(pl.tint, pl.enabled ? 1.0f : 0.30f), 1.5f * g_Scale);
-
-    // name (clipped so it never runs under the slot buttons)
-    const float  textX    = rowMin.x + 12 * g_Scale;
-    const ImVec2 nsz      = ImGui::CalcTextSize(pl.name.c_str());
-    const float  textY    = rowMin.y + (rowH - nsz.y) * 0.5f;
-    const ImU32  nameCol  = pl.enabled ? HexU(Col::Text) : HexU(Col::TextDim);
-    const float  nameClip = rowMax.x - slotSize * 2 - gap * 3;
-    dl->PushClipRect(ImVec2(rowMin.x, rowMin.y), ImVec2(nameClip, rowMax.y), true);
-    dl->AddText(ImVec2(textX, textY), nameCol, pl.name.c_str());
-    dl->PopClipRect();
+    const bool renaming = RenamingRef(ref);
+    const float  textX    = rowMin.x + 6 * g_Scale + 20.0f * g_Scale + 9 * g_Scale;
+    const float  nameClip = rowMax.x - slotSize * 2 - slotGap - gap * 2;
+    if (!renaming)
+    {
+        const ImVec2 nsz   = ImGui::CalcTextSize(pl.name.c_str());
+        const float  textY = rowMin.y + (rowH - nsz.y) * 0.5f;
+        dl->PushClipRect(ImVec2(rowMin.x, rowMin.y), ImVec2(nameClip, rowMax.y), true);
+        dl->AddText(ImVec2(textX, textY), HexU(pl.enabled ? Col::Text : Col::TextDim), pl.name.c_str());
+        dl->PopClipRect();
+    }
 
     if (rowHovered && !ImGui::IsAnyItemActive())
-        ImGui::SetTooltip("%s - %d/%d survivors loaded\n\nClick: select   Ctrl / Shift + click: multi-select\nHold: %s the whole player",
-                          pl.name.c_str(), pl.LoadedCount(), kSlotCount, pl.enabled ? "disable" : "enable");
+        ImGui::SetTooltip("%s - %s, %d/%d survivors%s\n\nClick: select   Ctrl / Shift + click: multi-select\n"
+                          "Click the square or hold the row: %s\nF2: rename   Del: delete   drag: move to a folder",
+                          pl.name.c_str(), pl.enabled ? "active" : "not active", pl.LoadedCount(), kSlotCount,
+                          pl.folder.empty() ? "" : ("\nin " + pl.folder).c_str(),
+                          pl.enabled ? "take it out" : "make it active");
 
     if (ImGui::BeginPopupContextItem("##rowctx"))
     {
-        // Rename in place: the buffer is seeded the first frame the popup opens
-        // so typing is never fighting the model.
-        if (ImGui::IsWindowAppearing())
-            snprintf(g_RenameBuf, sizeof(g_RenameBuf), "%s", pl.name.c_str());
-        ImGui::SetNextItemWidth(180 * g_Scale);
-        if (ImGui::InputText("##rename", g_RenameBuf, sizeof(g_RenameBuf),
-                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
+        if (MultiSelected(ref)) SharedContextMenu(ref);
+        else
         {
-            if (g_RenameBuf[0]) { pl.name = g_RenameBuf; S.status = "Renamed to " + pl.name; }
-            ImGui::CloseCurrentPopup();
-        }
-        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(-1);
-
-        auto colourPick = [](const char* label, unsigned& v) {
-            float c[3] = { ((v >> 16) & 0xFF) / 255.0f,
-                           ((v >>  8) & 0xFF) / 255.0f,
-                           ( v        & 0xFF) / 255.0f };
-            if (ImGui::ColorEdit3(label, c,
-                                  ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel))
-                v = ((unsigned)(c[0] * 255.0f + 0.5f) << 16) |
-                    ((unsigned)(c[1] * 255.0f + 0.5f) <<  8) |
-                     (unsigned)(c[2] * 255.0f + 0.5f);
-        };
-
-        // One colour lightened for survivor 2, or two colours of your own.
-        if (ImGui::Checkbox("Two colours", &pl.twoTone) && pl.twoTone)
-            pl.tint2 = SlotTint(pl.tint, 1);
-        if (pl.twoTone)
-        {
-            colourPick("Survivor 1", pl.tint);
-            colourPick("Survivor 2", pl.tint2);
-        }
-        else colourPick("Colour", pl.tint);
-        ImGui::Separator();
-        if (ImGui::BeginMenu("Move to folder"))
-        {
-            // acts on the whole selection when this row is part of it
-            const std::vector<int> moving = GroupsForAction(pi);
-            if (moving.size() > 1) ImGui::TextDisabled("%d groups", (int)moving.size());
-            if (ImGui::MenuItem("(no folder)", NULL, FolderIndex(pl.folder) < 0))
-                QueueFolderMove(moving, std::string());
-            for (const GroupFolder& f : S.folders)
-                if (ImGui::MenuItem(f.name.c_str(), NULL, ToLower(f.name) == ToLower(pl.folder)))
-                    QueueFolderMove(moving, f.name);
+            ImGui::TextDisabled("%s", pl.name.c_str());
             ImGui::Separator();
-            static char newFolder[64] = "";
-            ImGui::SetNextItemWidth(160 * g_Scale);
-            if (ImGui::InputTextWithHint("##newfolder", "New folder...", newFolder, sizeof(newFolder),
-                                         ImGuiInputTextFlags_EnterReturnsTrue))
+            if (ImGui::MenuItem("Rename", "F2")) BeginInlineRename(ref);
+            auto colourPick = [](const char* label, unsigned& v) {
+                float c[3] = { ((v >> 16) & 0xFF) / 255.0f,
+                               ((v >>  8) & 0xFF) / 255.0f,
+                               ( v        & 0xFF) / 255.0f };
+                if (ImGui::ColorEdit3(label, c,
+                                      ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel))
+                    v = ((unsigned)(c[0] * 255.0f + 0.5f) << 16) |
+                        ((unsigned)(c[1] * 255.0f + 0.5f) <<  8) |
+                         (unsigned)(c[2] * 255.0f + 0.5f);
+            };
+            // One colour lightened for survivor 2, or two colours of your own.
+            if (ImGui::Checkbox("Two colours", &pl.twoTone) && pl.twoTone)
+                pl.tint2 = SlotTint(pl.tint, 1);
+            if (pl.twoTone)
             {
-                const std::string name = CleanFolderName(newFolder);
-                if (!name.empty()) QueueFolderMove(moving, name);
-                else               S.status = "That is not a usable folder name";
-                newFolder[0] = 0;
-                ImGui::CloseCurrentPopup();
+                colourPick("Survivor 1", pl.tint);
+                colourPick("Survivor 2", pl.tint2);
             }
-            ImGui::EndMenu();
+            else colourPick("Colour", pl.tint);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Active", "Ctrl+Q", pl.enabled)) ToggleRefEnabled(ref);
+            if (ImGui::MenuItem("Only this one active"))
+            {
+                S.selection.assign(1, ref);
+                ActivateOnlySelection();
+            }
+            const std::vector<RefKey> items = ItemsForAction(ref);
+            MoveToFolderMenu(items, pl.folder);
+            RunAgainstFoldersMenu(items);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Copy", "Ctrl+C")) { S.selection.assign(1, ref); CopySelectionToClipboard(); }
+            if (ImGui::MenuItem("Export...")) ExportOpen(ExportKeysFor(ref));
+            if (ImGui::MenuItem("Reveal in Explorer"))
+            {
+                const Survivor* first = pl.FirstLoaded() >= 0 ? &pl.slots[pl.FirstLoaded()] : NULL;
+                if (first) RevealInExplorer(PathExists(first->asmPath) ? first->asmPath : first->binPath);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete", "Del")) QueueDelete(items);
         }
-        if (ImGui::MenuItem(pl.enabled ? "Disable player" : "Enable player")) ToggleRefEnabled(ref);
-        if (ImGui::MenuItem("Close player")) g_PendingClosePlayer = pi;
         ImGui::EndPopup();
     }
 
-    // the two survivor buttons, submitted after the row so they win hover/click
-    float bx = rowMax.x - gap - slotSize * 2 - gap;
+    // the avatar: the group's colour (split when it has two) with its initial,
+    // solid when the group is active and an outline when it is not -- and a
+    // click on it is the switch
+    {
+        const float av = 20.0f * g_Scale;
+        const ImVec2 amn(rowMin.x + 6 * g_Scale, rowMin.y + (rowH - av) * 0.5f);
+        ImGui::SetCursorScreenPos(amn);
+        BtnState ab = BareButton("##avatar", ImVec2(av, av));
+        const ImVec2 amx = ab.mx;
+        const float ar = 5.0f * g_Scale;
+        if (pl.enabled)
+        {
+            const float lift = ab.hovered ? 1.0f : 0.92f;
+            if (pl.twoTone)
+            {
+                const float mid = ImFloor((amn.x + amx.x) * 0.5f);
+                dl->AddRectFilled(amn, ImVec2(mid, amx.y), HexU(pl.tint, lift), ar, ImDrawFlags_RoundCornersLeft);
+                dl->AddRectFilled(ImVec2(mid, amn.y), amx, HexU(pl.tint2, lift), ar, ImDrawFlags_RoundCornersRight);
+            }
+            else dl->AddRectFilled(amn, amx, HexU(pl.tint, lift), ar);
+        }
+        else
+        {
+            dl->AddRectFilled(amn, amx, HexU(ab.hovered ? Col::Bg3 : Col::Bg2), ar);
+            dl->AddRect(amn, amx, HexU(pl.tint, ab.hovered ? 0.9f : 0.6f), ar, 0, 1.5f);
+        }
+        char ini[2] = { pl.name.empty() ? '?' : (char)toupper((unsigned char)pl.name[0]), 0 };
+        const ImVec2 is = ImGui::CalcTextSize(ini);
+        dl->AddText(ImVec2((amn.x + amx.x - is.x) * 0.5f, (amn.y + amx.y - is.y) * 0.5f),
+                    pl.enabled ? HexU(Col::Bg0, 0.9f) : HexU(pl.tint, 0.85f), ini);
+        if (ab.hovered)
+            ImGui::SetTooltip(pl.enabled ? "Active - fights in Debug and Competition\nClick: take it out"
+                                         : "Not active - sits out\nClick: make it active");
+        if (ab.clicked) ToggleRefEnabled(ref);
+    }
+
+    if (renaming) InlineRenameField(ImVec2(textX - 4 * g_Scale, rowMin.y), ImVec2(nameClip, rowMax.y));
+
+    // the two survivor buttons, one train, submitted after the row so they win
+    // hover and click
+    float bx = rowMax.x - (rowH - slotSize) * 0.5f - slotSize * 2 - slotGap;
     const float by = rowMin.y + (rowH - slotSize) * 0.5f;
     for (int sl = 0; sl < kSlotCount; sl++)
     {
         ImGui::SetCursorScreenPos(ImVec2(bx, by));
-        SurvivorSlotButton(pi, sl, slotSize);
-        bx += slotSize + gap;
+        SurvivorSlotButton(pi, sl, slotSize, TrainCorners(sl, kSlotCount));
+        bx += slotSize + slotGap;
     }
 
     ImGui::PopID();
 
-    if (clicked)
+    if (clicked && !renaming)
+    {
         HandleRowClick(ref, true);
+        g_GroupsFocus = true;
+    }
 
-    ImGui::SetCursorScreenPos(ImVec2(rowStart.x, rowMax.y + 3 * g_Scale));
+    ImGui::SetCursorScreenPos(ImVec2(rowStart.x, rowMax.y + 2 * g_Scale));
 }
 
 // A folder with a small plus in its corner: "new folder".
@@ -2392,49 +3291,46 @@ static void DrawGlyphFolderPlus(ImDrawList* dl, const ImVec2& c, float s, ImU32 
     dl->AddLine(ImVec2(k.x, k.y - s * 0.45f), ImVec2(k.x, k.y + s * 0.45f), col, 1.4f);
 }
 
-// Turning a folder on or off turns every group in it: off when any of them is
-// still on, back on only when they are all off.
-static void ToggleFolderEnabled(int fi)
-{
-    if (fi < 0 || fi >= (int)g_App.folders.size()) return;
-    const std::vector<int> members = PlayersInFolder(g_App.folders[fi].name);
-    bool anyOn = false;
-    for (int p : members) if (g_App.players[p].enabled) anyOn = true;
-    for (int p : members) { Ref r; r.player = p; r.slot = -1; SetRefEnabled(r, !anyOn); }
-    g_App.status = g_App.folders[fi].name + (anyOn ? " disabled" : " enabled") + "  (" +
-                   std::to_string((int)members.size()) + " group(s))";
-}
-
-// The heading of a folder of groups: a caret, the name and how many it holds.
-// Clicking folds it; holding it, like any other row, turns its groups on or off.
+// The heading of a folder of groups: a caret, the name and how many of the
+// groups in it (folders inside included) are active. Clicking selects it and
+// folds it; holding it switches every group in it.
 static void DrawFolderRow(int fi, float rowH)
 {
     AppState& S = g_App;
     GroupFolder& f = S.folders[fi];
-    const std::vector<int> members = PlayersInFolder(f.name);
+    const std::string path = f.path;
+    const std::vector<int> members = GroupsUnder(path);
     int on = 0;
     for (int p : members) if (S.players[p].enabled) on++;
+    Ref ref; ref.player = kFolderPlayer; ref.slot = fi;
+    const bool selected = IsSelected(ref);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 rowStart = ImGui::GetCursorScreenPos();
     const float  avail    = ImGui::GetContentRegionAvail().x;
 
     ImGui::PushID("folder");
-    ImGui::PushID(fi);
-    bool clicked = ImGui::Selectable("##frow", false, 0, ImVec2(avail, rowH));
+    ImGui::PushID(path.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+    bool clicked = ImGui::Selectable("##frow", selected, ImGuiSelectableFlags_AllowOverlap, ImVec2(avail, rowH));
+    ImGui::PopStyleColor(3);
     const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
     const bool hovered = ImGui::IsItemHovered();
-
-    bool dropHot = false;
-    if (ImGui::BeginDragDropTarget())
+    AddDropZone(mn, mx, path, false);
+    if (selected)
     {
-        dropHot = true;
-        if (const ImGuiPayload* pay = ImGui::AcceptDragDropPayload("CW_GROUP"))
-            QueueFolderMove(GroupsForAction(*(const int*)pay->Data), f.name);
-        ImGui::EndDragDropTarget();
+        dl->AddRectFilled(mn, mx, HexU(Col::Accent, hovered ? 0.20f : 0.15f), 7.0f * g_Scale);
+        dl->AddRect(mn, mx, HexU(Col::Accent, 0.35f), 7.0f * g_Scale, 0, 1.0f);
     }
+    else if (hovered || ImGui::IsItemActive())
+        dl->AddRectFilled(mn, mx, HexU(ImGui::IsItemActive() ? Col::Bg3 : Col::Bg2), 7.0f * g_Scale);
 
-    if (CheckLongPress(clicked)) ToggleFolderEnabled(fi);
+    RowDragSource(ref, FolderLeaf(path).c_str());
+    const bool dropHot = RowDropTarget(path);
+
+    if (CheckLongPress(clicked)) ToggleRefEnabled(ref);
     DrawLongPressHint(mn, mx);
 
     const bool dim = !members.empty() && on == 0;
@@ -2455,64 +3351,228 @@ static void DrawFolderRow(int fi, float rowH)
     DrawGlyphFolder(dl, ImVec2(mn.x + 24 * g_Scale, (mn.y + mx.y) * 0.5f), 5.5f * g_Scale,
                     HexU(dim ? Col::TextDim : Col::Accent, dim ? 0.7f : 0.95f));
 
-    // how many it holds -- and how many of those are on, when not all are
+    // how many are active, out of how many
     char cnt[24];
-    if (on == (int)members.size()) snprintf(cnt, sizeof(cnt), "%d", (int)members.size());
-    else                           snprintf(cnt, sizeof(cnt), "%d / %d", on, (int)members.size());
+    if (members.empty())                   snprintf(cnt, sizeof(cnt), "0");
+    else if (on == (int)members.size())    snprintf(cnt, sizeof(cnt), "%d", (int)members.size());
+    else                                   snprintf(cnt, sizeof(cnt), "%d/%d", on, (int)members.size());
+    ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.86f);
     const ImVec2 cs = ImGui::CalcTextSize(cnt);
-    const float  pillW = cs.x + 12 * g_Scale, pillH = cs.y + 2 * g_Scale;
+    const float  pillW = cs.x + 12 * g_Scale, pillH = cs.y + 3 * g_Scale;
     const ImVec2 pmn(mx.x - pillW - 6 * g_Scale, (mn.y + mx.y - pillH) * 0.5f);
     dl->AddRectFilled(pmn, ImVec2(pmn.x + pillW, pmn.y + pillH), HexU(Col::Bg3, 0.8f), pillH * 0.5f);
-    dl->AddText(ImVec2(pmn.x + 6 * g_Scale, pmn.y + 1 * g_Scale), HexU(Col::TextDim), cnt);
+    dl->AddText(ImVec2(pmn.x + 6 * g_Scale, pmn.y + 1.5f * g_Scale), HexU(Col::TextDim), cnt);
+    ImGui::PopFont();
 
-    const ImVec2 ns = ImGui::CalcTextSize(f.name.c_str());
-    dl->PushClipRect(mn, ImVec2(pmn.x - 6 * g_Scale, mx.y), true);
-    dl->AddText(ImVec2(mn.x + 36 * g_Scale, mn.y + (rowH - ns.y) * 0.5f), ink, f.name.c_str());
-    dl->PopClipRect();
+    const bool renaming = RenamingRef(ref);
+    const std::string leaf = FolderLeaf(path);
+    if (!renaming)
+    {
+        const ImVec2 ns = ImGui::CalcTextSize(leaf.c_str());
+        dl->PushClipRect(mn, ImVec2(pmn.x - 6 * g_Scale, mx.y), true);
+        dl->AddText(ImVec2(mn.x + 36 * g_Scale, mn.y + (rowH - ns.y) * 0.5f), ink, leaf.c_str());
+        dl->PopClipRect();
+    }
 
-    if (hovered && !ImGui::IsAnyItemActive())
-        ImGui::SetTooltip("%s - %d group(s), %d enabled\n\nClick: %s\nHold: %s every group in it\n"
-                          "Drop a group here to file it\nRight-click: rename, ungroup",
-                          f.name.c_str(), (int)members.size(), on,
-                          f.collapsed ? "unfold" : "fold", on ? "disable" : "enable");
+    if (hovered && !ImGui::IsAnyItemActive() && !renaming)
+        ImGui::SetTooltip("%s - %d group(s), %d active\n\nClick: select and %s\nHold: %s every group in it\n"
+                          "Drop groups or folders here to move them in\nF2: rename   Del: delete",
+                          path.c_str(), (int)members.size(), on,
+                          f.collapsed ? "unfold" : "fold", on ? "take out" : "make active");
 
     if (ImGui::BeginPopupContextItem("##fctx"))
     {
-        if (ImGui::IsWindowAppearing())
-            snprintf(g_RenameBuf, sizeof(g_RenameBuf), "%s", f.name.c_str());
-        ImGui::SetNextItemWidth(180 * g_Scale);
-        if (ImGui::InputText("##frename", g_RenameBuf, sizeof(g_RenameBuf),
-                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
+        if (MultiSelected(ref)) SharedContextMenu(ref);
+        else
         {
-            g_FolderOp = FolderOp();
-            g_FolderOp.kind = FolderOp::Rename;
-            g_FolderOp.folder = fi;
-            g_FolderOp.name = g_RenameBuf;
-            ImGui::CloseCurrentPopup();
+            ImGui::TextDisabled("%s", path.c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem("Rename", "F2")) BeginInlineRename(ref);
+            if (ImGui::MenuItem("New folder inside")) QueueWsOp(WsOp::NewFolder, path);
+            if (ImGui::MenuItem("New group inside"))  QueueWsOp(WsOp::NewGroup, path);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Every group active", NULL, !members.empty() && on == (int)members.size(),
+                                !members.empty()))
+                ToggleRefEnabled(ref);
+            if (ImGui::MenuItem("Only this folder active", NULL, false, !members.empty()))
+            {
+                S.selection.assign(1, ref);
+                ActivateOnlySelection();
+            }
+            if (ImGui::MenuItem("Select every group", NULL, false, !members.empty()))
+            {
+                S.selection.clear();
+                for (int p : members) { Ref r; r.player = p; r.slot = -1; S.selection.push_back(r); }
+                S.anchor = S.selection.back();
+            }
+            const std::vector<RefKey> items = ItemsForAction(ref);
+            MoveToFolderMenu(items, FolderParent(path));
+            ImGui::Separator();
+            if (ImGui::MenuItem("Paste here", "Ctrl+V")) QueueWsOp(WsOp::Paste, path);
+            if (ImGui::MenuItem("Export...")) ExportOpen(ExportKeysFor(ref));
+            if (ImGui::MenuItem("Reveal in Explorer")) RevealInExplorer(TreeDir(kSurvDir, path));
+            if (ImGui::MenuItem("Ungroup  (keep what is inside)")) QueueWsOp(WsOp::Ungroup, path);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete folder", "Del")) QueueDelete(items);
         }
-        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(-1);
-        ImGui::Separator();
-        if (ImGui::MenuItem(on ? "Disable every group" : "Enable every group", NULL, false, !members.empty()))
-            ToggleFolderEnabled(fi);
-        if (ImGui::MenuItem("Select every group", NULL, false, !members.empty()))
-        {
-            S.selection.clear();
-            for (int p : members) { Ref r; r.player = p; r.slot = -1; S.selection.push_back(r); }
-            S.anchor = S.selection.back();
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Ungroup  (keep the groups)"))
-        { g_FolderOp = FolderOp(); g_FolderOp.kind = FolderOp::Ungroup; g_FolderOp.folder = fi; }
-        if (ImGui::MenuItem("Close folder and its groups"))
-        { g_FolderOp = FolderOp(); g_FolderOp.kind = FolderOp::Close; g_FolderOp.folder = fi; }
         ImGui::EndPopup();
     }
 
+    if (renaming) InlineRenameField(ImVec2(mn.x + 32 * g_Scale, mn.y), ImVec2(pmn.x - 6 * g_Scale, mx.y));
+
     ImGui::PopID();
     ImGui::PopID();
 
-    if (clicked) f.collapsed = !f.collapsed;
-    ImGui::SetCursorScreenPos(ImVec2(rowStart.x, mx.y + 3 * g_Scale));
+    if (clicked && !renaming)
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        HandleRowClick(ref, false);
+        if (!io.KeyCtrl && !io.KeyShift && fi < (int)S.folders.size()) S.folders[fi].collapsed = !S.folders[fi].collapsed;
+        g_GroupsFocus = true;
+    }
+    ImGui::SetCursorScreenPos(ImVec2(rowStart.x, mx.y + 2 * g_Scale));
+}
+
+// A row scrolled out of sight only takes its room. Drawing every one of a
+// thousand groups -- buttons, menus, tooltips -- was most of a frame. Rows still
+// draw in full while they are being renamed or while anything is dragged.
+static bool RowOutOfSight(const Ref& ref, float rowH)
+{
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    if (ImGui::IsRectVisible(at, ImVec2(at.x + 4.0f, at.y + rowH))) return false;
+    if (RenamingRef(ref) || ImGui::GetDragDropPayload() != NULL) return false;
+    ImGui::Dummy(ImVec2(0.0f, rowH));
+    ImGui::SetCursorScreenPos(ImVec2(at.x, at.y + rowH + 2 * g_Scale));   // a drawn row's pitch
+    return true;
+}
+
+// One level of the tree: its folders (each followed by what is inside it,
+// hanging off a guide line), then its groups -- with the rows deleted a moment
+// ago still showing where they were.
+static void DrawFolderTree(const std::string& parent, float rowH)
+{
+    AppState& S = g_App;
+    const std::vector<GhostRef> folderGhosts = GhostsOf(1, parent);
+    const std::vector<int> kids = FolderChildren(parent);
+    auto ghostsAt = [&](const std::vector<GhostRef>& gs, int pos) {
+        for (const GhostRef& g : gs) if (g.row->pos == pos) DrawGhostRow(*g.row, g.alpha, g.newest, rowH);
+    };
+    for (int i = 0; i < (int)kids.size(); i++)
+    {
+        ghostsAt(folderGhosts, i);
+        const int fi = kids[i];
+        if (fi >= (int)S.folders.size()) break;
+        const std::string path = S.folders[fi].path;
+        {
+            Ref fref; fref.player = kFolderPlayer; fref.slot = fi;
+            if (!RowOutOfSight(fref, rowH)) DrawFolderRow(fi, rowH);
+        }
+        const int now = FolderIndex(path);          // a click may have folded it
+        if (now < 0 || S.folders[now].collapsed) continue;
+        const float guideX = ImGui::GetCursorScreenPos().x + 8 * g_Scale;
+        const float top = ImGui::GetCursorScreenPos().y;
+        ImGui::Indent(14 * g_Scale);
+        DrawFolderTree(path, rowH);
+        ImGui::Unindent(14 * g_Scale);
+        const float bottom = ImGui::GetCursorScreenPos().y - 4 * g_Scale;
+        if (bottom > top)
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(guideX, top), ImVec2(guideX, bottom), HexU(Col::Line), 1.0f);
+    }
+    for (const GhostRef& g : folderGhosts) if (g.row->pos >= (int)kids.size()) DrawGhostRow(*g.row, g.alpha, g.newest, rowH);
+
+    const std::vector<GhostRef> groupGhosts = GhostsOf(0, parent);
+    const std::vector<int> groups = GroupsIn(parent);
+    if (!kids.empty() && !groups.empty() && parent.empty())
+        ImGui::Dummy(ImVec2(0, 3 * g_Scale));     // a breath between the folders and the loose groups
+    for (int i = 0; i < (int)groups.size(); i++)
+    {
+        ghostsAt(groupGhosts, i);
+        if (groups[i] >= (int)S.players.size()) continue;
+        Ref gref; gref.player = groups[i]; gref.slot = -1;
+        if (!RowOutOfSight(gref, rowH)) DrawPlayerRow(groups[i], rowH);
+    }
+    for (const GhostRef& g : groupGhosts) if (g.row->pos >= (int)groups.size()) DrawGhostRow(*g.row, g.alpha, g.newest, rowH);
+}
+
+// The workspace switcher under the header's folder button.
+static void WorkspaceMenu()
+{
+    AppState& S = g_App;
+    if (HasWorkspace())
+    {
+        ImGui::TextDisabled("%s", WsRoot().c_str());
+        ImGui::Separator();
+    }
+    if (ImGui::MenuItem("Open workspace...", "Ctrl+O")) QueueWsOp(WsOp::PickWorkspace);
+    std::vector<std::string> recent;
+    for (const std::string& r : S.recentWorkspaces)
+        if (ToLower(r) != ToLower(WsRoot()) && DirExists(r)) recent.push_back(r);
+    if (ImGui::BeginMenu("Open recent", !recent.empty()))
+    {
+        for (const std::string& r : recent)
+        {
+            if (ImGui::MenuItem((FileNameOf(r) + "##" + r).c_str()))
+                QueueWsOp(WsOp::OpenWorkspace, r);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", r.c_str());
+        }
+        ImGui::EndMenu();
+    }
+    if (!HasWorkspace()) return;
+    ImGui::Separator();
+    if (ImGui::MenuItem("Paste files", "Ctrl+V")) QueueWsOp(WsOp::Paste, TargetFolder());
+    if (ImGui::MenuItem("Reveal in Explorer")) RevealInExplorer(WsRoot());
+    if (ImGui::MenuItem("Read the folder again")) ReconcileWorkspace();
+    ImGui::Separator();
+    if (ImGui::MenuItem("Close workspace")) QueueWsOp(WsOp::CloseWorkspace);
+}
+
+// No workspace yet: the only thing to do is pick one.
+static void DrawWelcome()
+{
+    AppState& S = g_App;
+    ImGui::Dummy(ImVec2(0, 10 * g_Scale));
+    ImGui::TextUnformatted("No workspace open");
+    ImGui::Dummy(ImVec2(0, 4 * g_Scale));
+    ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::TextDim));
+    ImGui::TextWrapped("A workspace is a folder: every group, zombie and folder you make lives in it "
+                       "and is saved there as you go. Pick an empty folder to start a new one, or a "
+                       "folder that already has survivors (and zombies) in it.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 10 * g_Scale));
+    ImGui::PushStyleColor(ImGuiCol_Button, Hex(Col::Accent, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Hex(Col::Accent));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, Hex(Col::Accent, 0.75f));
+    ImGui::PushStyleColor(ImGuiCol_Text, Hex(0xFFFFFF));
+    if (ImGui::Button("Open workspace...", ImVec2(-FLT_MIN, 30 * g_Scale))) QueueWsOp(WsOp::PickWorkspace);
+    ImGui::PopStyleColor(4);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ctrl+O. Dropping a folder on the window opens it too.");
+
+    std::vector<std::string> recent;
+    for (const std::string& r : S.recentWorkspaces) if (DirExists(r)) recent.push_back(r);
+    if (recent.empty()) return;
+    ImGui::Dummy(ImVec2(0, 14 * g_Scale));
+    ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+    ImGui::TextColored(Hex(Col::TextDim), "RECENT");
+    ImGui::PopFont();
+    for (const std::string& r : recent)
+    {
+        ImGui::PushID(r.c_str());
+        const ImVec2 o = ImGui::GetCursorScreenPos();
+        const float w = ImGui::GetContentRegionAvail().x, h = 40 * g_Scale;
+        BtnState b = BareButton("##recent", ImVec2(w, h));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(b.held ? Col::Bg3 : Col::Bg2), 7 * g_Scale);
+        DrawGlyphFolder(dl, ImVec2(o.x + 14 * g_Scale, o.y + h * 0.5f), 5.5f * g_Scale, HexU(Col::Accent));
+        dl->PushClipRect(b.mn, b.mx, true);
+        dl->AddText(ImVec2(o.x + 30 * g_Scale, o.y + 4 * g_Scale), HexU(Col::Text), FileNameOf(r).c_str());
+        ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+        dl->AddText(ImVec2(o.x + 30 * g_Scale, o.y + h * 0.52f), HexU(Col::TextDim), ParentDir(r).c_str());
+        ImGui::PopFont();
+        dl->PopClipRect();
+        if (b.hovered) ImGui::SetTooltip("%s", r.c_str());
+        if (b.clicked) QueueWsOp(WsOp::OpenWorkspace, r);
+        ImGui::PopID();
+    }
 }
 
 static void DrawWorkspacePanel(float width, float height)
@@ -2520,63 +3580,104 @@ static void DrawWorkspacePanel(float width, float height)
     AppState& S = g_App;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 origin = ImGui::GetCursorScreenPos();
+    g_DropZones.swap(g_DropZonesBuild);
+    g_DropZonesBuild.clear();
 
     dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), HexU(Col::Bg1));
 
-    // --- header ------------------------------------------------------------
-    const float headerH = 34.0f * g_Scale;
-    {
-        const char* title = "GROUPS";
-        // the caret takes the left edge, so the label starts after it
-        const float caretW = 22.0f * g_Scale;
-        const ImVec2 tsz = ImGui::CalcTextSize(title);
-        if (!S.groupsCollapsed)
-            dl->AddText(ImVec2(origin.x + caretW + 10 * g_Scale, origin.y + (headerH - tsz.y) * 0.5f),
-                        HexU(Col::TextDim), title);
+    // The list keys follow the last click: in here, or anywhere else (a click
+    // in one of the panel's own menus counts as in here).
+    // (a floating window lying over the panel is not the panel)
+    if ((ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right)) &&
+        !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        g_GroupsFocus = ImGui::IsMouseHoveringRect(origin, ImVec2(origin.x + width, origin.y + height), false) &&
+                        ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
 
-        const float bs = 22.0f * g_Scale;
+    // --- header ------------------------------------------------------------
+    const float headerH = 44.0f * g_Scale;
+    {
+        // the caret takes the left edge, so the title starts after it
+        const float caretW = 24.0f * g_Scale;
+        const float bs = 24.0f * g_Scale;
         BtnState b;
         // Collapsed there is only room for the caret, so nothing else is drawn:
         // the actions would sit on top of it.
         if (!S.groupsCollapsed)
         {
-            float bx = origin.x + width - bs - 10 * g_Scale;
-            ImGui::SetCursorScreenPos(ImVec2(bx, origin.y + (headerH - bs) * 0.5f));
-            b = BareButton("##wsload", ImVec2(bs, bs));
-            if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 5 * g_Scale);
-            DrawGlyphFolder(dl, ImVec2((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f), 5 * g_Scale, HexU(Col::TextDim));
-            if (b.hovered) ImGui::SetTooltip("Open folder (Ctrl+O)");
-            if (b.clicked) OpenWorkspaceFolder();
+            // title, and how many groups are active out of how many
+            const char* title = "Groups";
+            const ImVec2 tsz = ImGui::CalcTextSize(title);
+            const float tx = origin.x + caretW + 10 * g_Scale;
+            const float ty = origin.y + (headerH - tsz.y) * 0.5f;
+            dl->AddText(ImVec2(tx, ty), HexU(Col::Text), title);
+            if (HasWorkspace())
+            {
+                int active = 0;
+                for (const Player& pl : S.players) if (pl.enabled) active++;
+                char n[24];
+                if (active == (int)S.players.size()) snprintf(n, sizeof(n), "%d", (int)S.players.size());
+                else                                  snprintf(n, sizeof(n), "%d/%d", active, (int)S.players.size());
+                ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+                const ImVec2 ns = ImGui::CalcTextSize(n);
+                const float ph = ns.y + 4 * g_Scale, pw = ImMax(ph, ns.x + 10 * g_Scale);
+                const ImVec2 pmn(tx + tsz.x + 7 * g_Scale, origin.y + (headerH - ph) * 0.5f);
+                dl->AddRectFilled(pmn, ImVec2(pmn.x + pw, pmn.y + ph),
+                                  HexU(active == (int)S.players.size() ? Col::Bg3 : Col::Accent,
+                                       active == (int)S.players.size() ? 1.0f : 0.30f), ph * 0.5f);
+                dl->AddText(ImVec2(pmn.x + (pw - ns.x) * 0.5f, pmn.y + 2 * g_Scale), HexU(Col::TextDim), n);
+                ImGui::PopFont();
+                if (ImGui::IsMouseHoveringRect(pmn, ImVec2(pmn.x + pw, pmn.y + ph)))
+                    ImGui::SetTooltip("%d of %d groups active", active, (int)S.players.size());
+            }
 
-            bx -= bs + 4 * g_Scale;
-            ImGui::SetCursorScreenPos(ImVec2(bx, origin.y + (headerH - bs) * 0.5f));
-            b = BareButton("##wsopensv", ImVec2(bs, bs));
-            if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 5 * g_Scale);
-            DrawGlyphSurvivor(dl, ImVec2((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f), 5 * g_Scale, HexU(Col::TextDim));
-            if (b.hovered) ImGui::SetTooltip("Open survivor (Ctrl+B)\nOne or more files, straight into the workspace");
-            if (b.clicked) ImportLooseFiles();
-
-            bx -= bs + 4 * g_Scale;
-            ImGui::SetCursorScreenPos(ImVec2(bx, origin.y + (headerH - bs) * 0.5f));
-            b = BareButton("##wsnew", ImVec2(bs, bs));
-            if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 5 * g_Scale);
-            DrawGlyphPlus(dl, ImVec2((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f), 5 * g_Scale, HexU(Col::TextDim));
-            if (b.hovered) ImGui::SetTooltip("New player (Ctrl+N)");
-            if (b.clicked) NewPlayer();
-
-            bx -= bs + 4 * g_Scale;
-            ImGui::SetCursorScreenPos(ImVec2(bx, origin.y + (headerH - bs) * 0.5f));
-            b = BareButton("##wsnewfolder", ImVec2(bs, bs));
-            if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 5 * g_Scale);
-            DrawGlyphFolderPlus(dl, ImVec2((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f), 5 * g_Scale, HexU(Col::TextDim));
-            if (b.hovered) ImGui::SetTooltip("New folder\nDrag groups onto it, or right-click a group > Move to folder");
-            if (b.clicked) { g_FolderOp = FolderOp(); g_FolderOp.kind = FolderOp::New; }
+            // the actions, as one train on the right
+            struct Act { const char* id; int glyph; const char* tip; };
+            static const Act acts[3] = {
+                { "##wsnewfolder", 0, "New folder\nInside the selected folder. Drag groups onto it to file them." },
+                { "##wsnew",       1, "New group (Ctrl+N)\nTwo survivors from the template, in the selected folder" },
+                { "##wsload",      2, "Workspace\nOpen another (Ctrl+O), recent ones, reveal, close" },
+            };
+            const int nActs = HasWorkspace() ? 3 : 1;
+            float bx = origin.x + width - bs * nActs - 10 * g_Scale;
+            const float by = origin.y + (headerH - bs) * 0.5f;
+            for (int i = 3 - nActs; i < 3; i++)
+            {
+                ImGui::SetCursorScreenPos(ImVec2(bx, by));
+                b = BareButton(acts[i].id, ImVec2(bs, bs));
+                dl->AddRectFilled(b.mn, b.mx, HexU(b.held ? Col::Bg4 : b.hovered ? Col::Bg3 : Col::Bg2),
+                                  6 * g_Scale, TrainCorners(i - (3 - nActs), nActs));
+                TrainJoint(dl, b.mn, b.mx, i - (3 - nActs));
+                const ImVec2 c((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f);
+                const ImU32 ink = HexU(b.hovered ? Col::Text : Col::TextDim);
+                switch (acts[i].glyph)
+                {
+                    case 0: DrawGlyphFolderPlus(dl, c, 5 * g_Scale, ink); break;
+                    case 1: DrawGlyphPlus(dl, c, 5 * g_Scale, ink);       break;
+                    default: DrawGlyphFolder(dl, c, 5 * g_Scale, ink);    break;
+                }
+                if (b.hovered) ImGui::SetTooltip("%s", acts[i].tip);
+                if (b.clicked)
+                {
+                    switch (i)
+                    {
+                        case 0: QueueWsOp(WsOp::NewFolder, TargetFolder()); break;
+                        case 1: QueueWsOp(WsOp::NewGroup, TargetFolder()); break;
+                        default: ImGui::OpenPopup("##wsmenu"); break;
+                    }
+                }
+                bx += bs;
+            }
+            if (ImGui::BeginPopup("##wsmenu"))
+            {
+                WorkspaceMenu();
+                ImGui::EndPopup();
+            }
         }
 
         // collapse: names go, leaving one line of survivor chips per group
-        ImGui::SetCursorScreenPos(ImVec2(origin.x + 6 * g_Scale, origin.y + (headerH - bs) * 0.5f));
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + 8 * g_Scale, origin.y + (headerH - bs) * 0.5f));
         b = BareButton("##wscollapse", ImVec2(bs, bs));
-        if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 5 * g_Scale);
+        if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 6 * g_Scale);
         {
             const ImVec2 c((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f);
             const float a = 4 * g_Scale;
@@ -2603,99 +3704,138 @@ static void DrawWorkspacePanel(float width, float height)
     ImGui::BeginChild("##wslist", ImVec2(width, height - headerH),
                       ImGuiChildFlags_AlwaysUseWindowPadding);
 
-    if (S.players.empty() && S.folders.empty())
+    if (!HasWorkspace())
     {
-        ImGui::Dummy(ImVec2(0, 10 * g_Scale));
-        ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::TextDim));
-        ImGui::TextWrapped("No groups loaded.");
-        ImGui::Dummy(ImVec2(0, 4 * g_Scale));
-        ImGui::TextWrapped("Open a folder holding assembly / survivors / zombies. Files whose names "
-                           "differ only by a trailing number pair into one group "
-                           "(survivor1 + survivor2).");
+        if (!S.groupsCollapsed) DrawWelcome();
+        ImGui::EndChild();
         ImGui::PopStyleColor();
-        ImGui::Dummy(ImVec2(0, 12 * g_Scale));
-        if (ImGui::Button("Open folder...", ImVec2(-FLT_MIN, 0)))
-            OpenWorkspaceFolder();
-        if (ImGui::Button("New player", ImVec2(-FLT_MIN, 0)))
-            NewPlayer();
+        ImGui::PopStyleVar();
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + width, origin.y));
+        return;
     }
-    else
+
+    // warriors dropped at the top of the workspace, outside its layout
+    if (g_WsLooseFiles > 0 && !S.groupsCollapsed)
     {
-        const float rowH = 28.0f * g_Scale;
-        if (S.groupsCollapsed)
+        ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::Warn));
+        ImGui::TextWrapped("%d warrior file(s) lie loose at the top of the workspace.", g_WsLooseFiles);
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("Sort them in")) QueueWsOp(WsOp::SortLoose);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(".asm into assembly, machine code into survivors (zom* into zombies)");
+        ImGui::Dummy(ImVec2(0, 4 * g_Scale));
+    }
+
+    const float rowH = 30.0f * g_Scale;
+    if (S.groupsCollapsed)
+    {
+        // one line per group, its two survivors side by side; the zombies
+        // follow under a rule of their own
+        const float sz = kCollapsedChip * g_Scale, gap = 4.0f * g_Scale;
+        const ImVec2 base = ImGui::GetCursorScreenPos();
+        float y = 0.0f;
+        for (const Ref& r : FlatRows())
         {
-            // one line per group, its two survivors side by side; the zombies
-            // follow under a rule of their own
-            const float sz = kCollapsedChip * g_Scale, gap = 4.0f * g_Scale;
-            const ImVec2 base = ImGui::GetCursorScreenPos();
-            float y = 0.0f;
-            auto chipRow = [&](int p) {
-                ImGui::PushID(p);
-                for (int sl = 0; sl < kSlotCount; sl++)
-                {
-                    ImGui::SetCursorScreenPos(ImVec2(base.x + sl * (sz + gap), base.y + y));
-                    SurvivorSlotButton(p, sl, sz);
-                }
-                ImGui::PopID();
-                y += sz + gap;
-            };
-            // a folder is one chip two survivors wide; clicking it folds its rows
-            for (int fi = 0; fi < (int)S.folders.size(); fi++)
+            if (IsFolderRef(r))
             {
-                GroupFolder& f = S.folders[fi];
-                const std::vector<int> members = PlayersInFolder(f.name);
+                // a folder is one chip two survivors wide; clicking it folds its rows
+                GroupFolder& f = S.folders[r.slot];
+                const float ind = (float)(FolderDepth(f.path) - 1) * 2.0f * g_Scale;
                 ImGui::PushID("folderchip");
-                ImGui::PushID(fi);
-                ImGui::SetCursorScreenPos(ImVec2(base.x, base.y + y));
-                BtnState fb = BareButton("##fchip", ImVec2(sz * 2 + gap, sz * 0.8f));
+                ImGui::PushID(f.path.c_str());
+                ImGui::SetCursorScreenPos(ImVec2(base.x + ind, base.y + y));
+                BtnState fb = BareButton("##fchip", ImVec2(sz * 2 + gap - ind, sz * 0.8f));
                 dl->AddRectFilled(fb.mn, fb.mx, HexU(fb.hovered ? Col::Bg3 : Col::Bg2), 5 * g_Scale);
-                DrawGlyphFolder(dl, ImVec2((fb.mn.x + fb.mx.x) * 0.5f, (fb.mn.y + fb.mx.y) * 0.5f),
+                DrawGlyphFolder(ImGui::GetWindowDrawList(), ImVec2((fb.mn.x + fb.mx.x) * 0.5f, (fb.mn.y + fb.mx.y) * 0.5f),
                                 4.5f * g_Scale, HexU(f.collapsed ? Col::TextDim : Col::Accent));
-                if (fb.hovered) ImGui::SetTooltip("%s - %d group(s)\nClick: %s", f.name.c_str(),
-                                                  (int)members.size(), f.collapsed ? "unfold" : "fold");
+                if (fb.hovered) ImGui::SetTooltip("%s - %d group(s)\nClick: %s", f.path.c_str(),
+                                                  (int)GroupsUnder(f.path).size(), f.collapsed ? "unfold" : "fold");
                 if (fb.clicked) f.collapsed = !f.collapsed;
                 ImGui::PopID();
                 ImGui::PopID();
                 y += sz * 0.8f + gap;
-                if (!f.collapsed) for (int p : members) chipRow(p);
+                continue;
             }
-            for (int p : PlayersInFolder(std::string())) chipRow(p);
-            if (!S.zombies.empty())
+            if (r.slot != -1) continue;
+            // chips out of sight are only counted, not drawn
+            if (ImGui::IsRectVisible(ImVec2(base.x, base.y + y), ImVec2(base.x + sz * 2 + gap, base.y + y + sz)) ||
+                ImGui::GetDragDropPayload() != NULL)
             {
-                const float lineY = base.y + y + gap;
-                dl->AddLine(ImVec2(base.x, lineY), ImVec2(base.x + sz * 2 + gap, lineY),
-                            HexU(Col::Line));
-                y += gap * 3;
-                for (int zi = 0; zi < (int)S.zombies.size(); zi++)
+                ImGui::PushID(r.player);
+                for (int sl = 0; sl < kSlotCount; sl++)
                 {
-                    ImGui::SetCursorScreenPos(ImVec2(base.x, base.y + y));
-                    ZombieChip(zi, sz);
-                    y += sz + gap;
+                    ImGui::SetCursorScreenPos(ImVec2(base.x + sl * (sz + gap), base.y + y));
+                    SurvivorSlotButton(r.player, sl, sz, TrainCorners(sl, kSlotCount));
                 }
+                ImGui::PopID();
             }
-            ImGui::SetCursorScreenPos(ImVec2(base.x, base.y + y));
-            ImGui::Dummy(ImVec2(0.0f, 0.0f));
+            y += sz + gap;
         }
-        else
+        if (!S.zombies.empty())
         {
-            // folders first, each with its groups indented under it, then the
-            // groups that are in no folder
-            for (int fi = 0; fi < (int)S.folders.size(); fi++)
+            const float lineY = base.y + y + gap;
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(base.x, lineY), ImVec2(base.x + sz * 2 + gap, lineY), HexU(Col::Line));
+            y += gap * 3;
+            for (int zi = 0; zi < (int)S.zombies.size(); zi++)
             {
-                DrawFolderRow(fi, rowH);
-                if (S.folders[fi].collapsed) continue;
-                ImGui::Indent(12 * g_Scale);
-                for (int p : PlayersInFolder(S.folders[fi].name))
-                    DrawPlayerRow(p, rowH);
-                ImGui::Unindent(12 * g_Scale);
+                ImGui::SetCursorScreenPos(ImVec2(base.x, base.y + y));
+                ZombieChip(zi, sz);
+                y += sz + gap;
             }
-            for (int p : PlayersInFolder(std::string()))
-                DrawPlayerRow(p, rowH);
-            ImGui::Dummy(ImVec2(0.0f, 0.0f));   // close the manual cursor placement
         }
+        ImGui::SetCursorScreenPos(ImVec2(base.x, base.y + y));
+        ImGui::Dummy(ImVec2(0.0f, 0.0f));
+    }
+    else
+    {
+        if (S.players.empty() && S.folders.empty() && GhostsOf(0, std::string()).empty() &&
+            GhostsOf(1, std::string()).empty())
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::TextDim));
+            ImGui::TextWrapped("No groups yet. Make one with the + above (Ctrl+N), paste warrior files "
+                               "here (Ctrl+V), drop them on the window, or put them in the workspace's "
+                               "survivors or assembly folder -- they show up on their own.");
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(0, 6 * g_Scale));
+        }
+        DrawFolderTree(std::string(), rowH);
+        ImGui::Dummy(ImVec2(0.0f, 0.0f));   // close the manual cursor placement
+        DrawZombieSection();
     }
 
-    if (!S.groupsCollapsed) DrawZombieSection();
+    // Anywhere else in the list is the top level: dropped there, groups and
+    // folders come out of their folders. (The smallest target under the mouse
+    // wins, so the rows keep theirs.)
+    {
+        ImGuiWindow* w = ImGui::GetCurrentWindow();
+        const ImRect all = w->InnerRect;
+        if (ImGui::BeginDragDropTargetCustom(all, ImGui::GetID("##rootdrop")))
+        {
+            if (const ImGuiPayload* pay = ImGui::AcceptDragDropPayload("CW_ROW"))
+                QueueMove(ItemsForAction(*(const Ref*)pay->Data), std::string());
+            ImGui::EndDragDropTarget();
+        }
+        // and files dropped there land at the top (the rows and the zombie
+        // section added their own zones first; the first match wins)
+        AddDropZone(all.Min, all.Max, std::string(), false);
+        // a right-click on empty space: what can be made here
+        const bool emptyHere = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(all.Min, all.Max) &&
+                               !ImGui::IsAnyItemHovered();
+        if (emptyHere && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+            ImGui::OpenPopup("##wsempty");
+        if (emptyHere && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift)
+            S.selection.clear();
+        if (ImGui::BeginPopup("##wsempty"))
+        {
+            if (ImGui::MenuItem("New group", "Ctrl+N")) QueueWsOp(WsOp::NewGroup);
+            if (ImGui::MenuItem("New folder")) QueueWsOp(WsOp::NewFolder);
+            if (ImGui::MenuItem("New zombie")) QueueWsOp(WsOp::NewZombie);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Paste files", "Ctrl+V")) QueueWsOp(WsOp::Paste);
+            if (ImGui::MenuItem("Select all", "Ctrl+A")) SelectAllRows();
+            ImGui::EndPopup();
+        }
+    }
 
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -2703,7 +3843,6 @@ static void DrawWorkspacePanel(float width, float height)
 
     ImGui::SetCursorScreenPos(ImVec2(origin.x + width, origin.y));
 }
-
 // -----------------------------------------------------------------------------
 // Docked panels
 // -----------------------------------------------------------------------------
@@ -2763,13 +3902,13 @@ static void DrawEditorPanel()
                 const ImVec2 isz = ImGui::CalcTextSize(info);
                 const float ix = o.x + w - isz.x - (OwnerEnabledOf(S.open) && sv->enabled
                                                     ? 12 * g_Scale
-                                                    : 96 * g_Scale);
+                                                    : ImGui::CalcTextSize("NOT ACTIVE").x + 36 * g_Scale);
                 if (ix > x) dl->AddText(ImVec2(ix, ty), HexU(nerr ? Col::Danger : Col::TextDim), info);
             }
 
             if (!OwnerEnabledOf(S.open) || !sv->enabled)
             {
-                const char* tag = "DISABLED";
+                const char* tag = "NOT ACTIVE";
                 const ImVec2 tsz = ImGui::CalcTextSize(tag);
                 dl->AddRectFilled(ImVec2(o.x + w - tsz.x - 24 * g_Scale, o.y + (crumbH - tsz.y) * 0.5f - 3 * g_Scale),
                                   ImVec2(o.x + w - 12 * g_Scale, o.y + (crumbH + tsz.y) * 0.5f + 3 * g_Scale),
@@ -2858,6 +3997,7 @@ static void DrawEditorPanel()
                 g_ReframeRedo.clear();
                 ListSurvivor(*open, bytes, at);
                 open->dirty = true;
+                NoteEdit();
                 S.editor.SetText(open->code);
                 PushEditorMarkers(*open);
                 char m[80];
@@ -2870,8 +4010,13 @@ static void DrawEditorPanel()
         if (open && open->present && S.editor.IsTextChanged())
         {
             FlushEditorToModel();
-            PushEditorMarkers(*open);
+            // a ";$" line's db follows its instruction text as it is typed
+            if (SyncAltLinesLive(*open, S.editor)) FlushEditorToModel();
         }
+        // The markers follow the survivor's diagnostics every frame: they were
+        // only pushed on a keystroke, so a file that was just opened (or
+        // re-assembled from elsewhere) showed none of its errors.
+        if (open && open->present) PushEditorMarkers(*open);
     }
     ImGui::End();
 }
@@ -2881,9 +4026,8 @@ static void DrawEditorPanel()
 static unsigned GroupColor(int gi)
 {
     if (gi < 0 || gi >= g_App.game.groupCount()) return 0x8A9BA8;
-    const std::string& gn = g_App.game.groupName(gi);
-    for (const Player& pl : g_App.players)
-        if (pl.name == gn) return pl.tint;
+    const int p = WarGroupPlayer(gi);
+    if (p >= 0) return g_App.players[(size_t)p].tint;
     return kPlayerTints[(size_t)gi % (sizeof(kPlayerTints) / sizeof(kPlayerTints[0]))];
 }
 
@@ -2959,7 +4103,7 @@ static bool CycleIsBreak(const cw::Replay& R, cw::u64 c)
     return false;
 }
 
-static ImU32 WarriorColor(int wi, float alpha)
+static ImU32 WarriorColorSlow(int wi)
 {
     // Zombies belong to no scored group, so they carry no group colour -- their
     // shade comes from the row that owns them in the groups bar.
@@ -2967,20 +4111,44 @@ static ImU32 WarriorColor(int wi, float alpha)
     {
         const std::string& nm = g_App.game.replay().warriorName[(size_t)wi];
         for (const Zombie& z : g_App.zombies)
-            if (z.name == nm) return ImGui::ColorConvertFloat4ToU32(Hex(z.tint, alpha));
-        return ImGui::ColorConvertFloat4ToU32(Hex(Col::Warn, alpha));
+            if (z.name == nm) return ImGui::ColorConvertFloat4ToU32(Hex(z.tint, 1.0f));
+        return ImGui::ColorConvertFloat4ToU32(Hex(Col::Warn, 1.0f));
     }
 
     const int gi = g_App.game.warriorGroup(wi);
     const int sl = g_App.game.warriorSlot(wi);
     unsigned base = GroupColor(gi);
-    if (gi >= 0)
+    const int p = WarGroupPlayer(gi);
+    if (p >= 0 && g_App.players[(size_t)p].twoTone)
     {
-        const std::string& gn = g_App.game.groupName(gi);
-        for (const Player& pl : g_App.players)
-            if (pl.name == gn && pl.twoTone) { base = (sl == 1) ? pl.tint2 : pl.tint; return ImGui::ColorConvertFloat4ToU32(Hex(base, alpha)); }
+        const Player& pl = g_App.players[(size_t)p];
+        return ImGui::ColorConvertFloat4ToU32(Hex((sl == 1) ? pl.tint2 : pl.tint, 1.0f));
     }
-    return ImGui::ColorConvertFloat4ToU32(Hex(SlotTint(base, sl), alpha));
+    return ImGui::ColorConvertFloat4ToU32(Hex(SlotTint(base, sl), 1.0f));
+}
+
+// Finding a warrior's colour means matching its group by name against every
+// survivor in the workspace, and the arena asks once per owned byte -- with a
+// war that has written over the whole arena and a workspace of hundreds of
+// survivors, that was millions of string compares a frame. So each warrior's
+// colour is worked out once a frame and kept.
+static ImU32 WarriorColor(int wi, float alpha)
+{
+    static int cacheFrame = -1;
+    static cw::u64 cacheGen = ~0ull;
+    static std::vector<ImU32> cache;                    // 0 = not worked out yet
+    if (cacheFrame != g_FrameNo || cacheGen != g_App.game.generation())
+    {
+        cacheFrame = g_FrameNo;
+        cacheGen = g_App.game.generation();
+        cache.assign(cache.size(), 0u);
+    }
+    if (wi < 0) return ImGui::ColorConvertFloat4ToU32(Hex(Col::Warn, alpha));
+    if ((size_t)wi >= cache.size()) cache.resize((size_t)wi + 1, 0u);
+    ImU32& c = cache[(size_t)wi];
+    if (c == 0u) c = WarriorColorSlow(wi) | IM_COL32_A_MASK;
+    const int a = (int)(ImSaturate(alpha) * 255.0f + 0.5f);
+    return (c & ~IM_COL32_A_MASK) | ((ImU32)a << IM_COL32_A_SHIFT);
 }
 
 
@@ -2988,11 +4156,13 @@ static ImU32 WarriorColor(int wi, float alpha)
 // Edit tool
 //
 // With it on, double-clicking a byte in the arena, the stack or the shared page
-// -- or a register in the survivor panel -- asks for a new value. The change is
-// kept as a Poke against the cycle it was made at; the war is then played out
-// again from the seed with that poke applied, so everything after the edit
-// follows from it. The re-record is deferred until the next forward move, so a
-// run of edits costs one recomputation rather than one each.
+// -- or a register in the survivor panel -- turns that byte or register into a
+// text field where it stands. Enter or clicking away keeps what was typed, Esc
+// drops it. The change is kept as a Poke against the cycle it was made at; the
+// war is then played out again from the seed with that poke applied, so
+// everything after the edit follows from it. The re-record is deferred until
+// the next forward move, so a run of edits costs one recomputation rather than
+// one each.
 // -----------------------------------------------------------------------------
 struct EditTarget
 {
@@ -3003,31 +4173,69 @@ struct EditTarget
     unsigned cur = 0;
     char     what[72] = "";
     char     buf[16] = "";
+    ImGuiID  win = 0;              // the panel whose byte or register it is
+    bool     focus = false;        // the field takes the keyboard on its first frame
+    int      openedFrame = -1;
+    int      placedFrame = -1;     // the last frame the panel laid the target out
+    ImVec2   mn, mx;               // and where it put it
+    int      drawnFrame = -1;
 };
 static EditTarget g_Edit;
+
+static ImGuiID EditPanelId() { return ImGui::GetCurrentWindow()->ID; }
+
+static void EditBegin(const char* say)
+{
+    g_Edit.open = true;
+    g_Edit.win = EditPanelId();
+    g_Edit.focus = true;
+    g_Edit.openedFrame = g_FrameNo;
+    char m[128];
+    snprintf(m, sizeof(m), "%s: type the new value -- Enter or click away keeps it, Esc drops it", say);
+    g_App.status = m;
+}
 
 static void RequestByteEdit(cw::s32 linear, unsigned value, const char* where)
 {
     if (!g_App.editMode || !g_App.game.ready()) return;
     g_Edit = EditTarget();
-    g_Edit.open = true;
     g_Edit.linear = linear;
     g_Edit.cur = value & 0xFF;
     snprintf(g_Edit.what, sizeof(g_Edit.what), "%s byte %05X", where, (unsigned)linear);
     snprintf(g_Edit.buf, sizeof(g_Edit.buf), "%02X", value & 0xFF);
+    EditBegin(g_Edit.what);
 }
 
 static void RequestRegEdit(int warrior, int reg, const char* name, unsigned value)
 {
     if (!g_App.editMode || !g_App.game.ready()) return;
     g_Edit = EditTarget();
-    g_Edit.open = true;
     g_Edit.isReg = true;
     g_Edit.warrior = warrior;
     g_Edit.reg = reg;
     g_Edit.cur = value & 0xFFFF;
     snprintf(g_Edit.what, sizeof(g_Edit.what), "register %s", name);
     snprintf(g_Edit.buf, sizeof(g_Edit.buf), "%04X", value & 0xFFFF);
+    EditBegin(g_Edit.what);
+}
+
+// Whether the edit is about this byte or register, in the panel being drawn.
+static bool EditIsByte(cw::s32 linear)
+{
+    return g_Edit.open && !g_Edit.isReg && g_Edit.linear == linear && g_Edit.win == EditPanelId();
+}
+static bool EditIsReg(int warrior, int reg)
+{
+    return g_Edit.open && g_Edit.isReg && g_Edit.warrior == warrior && g_Edit.reg == reg &&
+           g_Edit.win == EditPanelId();
+}
+
+// Where the panel put the target this frame; the field goes over it.
+static void EditPlace(const ImVec2& mn, const ImVec2& mx)
+{
+    g_Edit.mn = mn;
+    g_Edit.mx = mx;
+    g_Edit.placedFrame = g_FrameNo;
 }
 
 // Put one edit on the list. A second edit of the same register at the same
@@ -3082,52 +4290,166 @@ static bool PendingRegValue(int warrior, int reg, unsigned& value)
     return false;
 }
 
-static void DrawEditPopup()
+// What was typed becomes a poke -- unless it is what was there already, which
+// would only cost a recomputation for nothing.
+static void EditCommit()
 {
-    if (g_Edit.open && !ImGui::IsPopupOpen("Edit value")) ImGui::OpenPopup("Edit value");
-    ImGui::SetNextWindowSize(ImVec2(300 * g_Scale, 0), ImGuiCond_Always);
-    if (!ImGui::BeginPopupModal("Edit value", NULL, ImGuiWindowFlags_NoResize)) return;
-
-    ImGui::TextColored(Hex(Col::TextDim), "%s", g_Edit.what);
-    ImGui::TextColored(Hex(Col::TextDim, 0.7f), "round %d", g_App.game.round());
-    ImGui::Spacing();
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-    const bool entered = ImGui::InputText("##val", g_Edit.buf, sizeof(g_Edit.buf),
-                                          ImGuiInputTextFlags_CharsHexadecimal |
-                                          ImGuiInputTextFlags_EnterReturnsTrue |
-                                          ImGuiInputTextFlags_AutoSelectAll);
-    ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::TextDim));
-    ImGui::TextWrapped("Hexadecimal. The war is played out again from the seed with this change "
-                       "applied, next time you move forward.");
-    ImGui::PopStyleColor();
-    ImGui::Separator();
-
-    const bool ok = entered || ImGui::Button("Apply", ImVec2(110 * g_Scale, 0));
-    ImGui::SameLine();
-    const bool cancel = ImGui::Button("Cancel", ImVec2(90 * g_Scale, 0));
-
-    if (ok)
+    g_Edit.open = false;
+    if (!g_Edit.buf[0] || !g_App.game.ready()) { g_App.status = "Edit dropped"; return; }
+    const unsigned v = (unsigned)strtoul(g_Edit.buf, NULL, 16) & (g_Edit.isReg ? 0xFFFFu : 0xFFu);
+    if (v == g_Edit.cur) { g_App.status = "Unchanged"; return; }
+    cw::Poke p;
+    p.cycle = g_App.game.cycle();
+    p.isReg = g_Edit.isReg;
+    if (g_Edit.isReg)
     {
-        cw::Poke p;
-        p.cycle = g_App.game.cycle();
-        p.isReg = g_Edit.isReg;
-        const unsigned v = (unsigned)strtoul(g_Edit.buf, NULL, 16);
-        if (g_Edit.isReg)
-        {
-            p.warrior = g_Edit.warrior;
-            p.reg = g_Edit.reg;
-            p.regValue = (cw::u16)v;
-        }
-        else
-        {
-            p.linear = g_Edit.linear;
-            p.value = (cw::u8)v;
-        }
-        StagePoke(p, g_Edit.what, g_Edit.buf);
+        p.warrior = g_Edit.warrior;
+        p.reg = g_Edit.reg;
+        p.regValue = (cw::u16)v;
     }
-    if (ok || cancel) { g_Edit.open = false; ImGui::CloseCurrentPopup(); }
-    ImGui::EndPopup();
+    else
+    {
+        p.linear = g_Edit.linear;
+        p.value = (cw::u8)v;
+    }
+    char val[8];
+    snprintf(val, sizeof(val), g_Edit.isReg ? "%04X" : "%02X", v);
+    StagePoke(p, g_Edit.what, val);
+}
+
+// The field, over the byte or register being edited. Each panel that can hold
+// one calls this once it has laid its cells out (EditPlace), still inside its
+// own window; `fontSize` 0 keeps the size it is drawing at.
+static void EditField(float fontSize = 0.0f)
+{
+    if (!g_Edit.open || g_Edit.win != EditPanelId() || g_Edit.placedFrame != g_FrameNo) return;
+    ImGui::PushFont(g_App.fontMono, fontSize > 0.0f ? fontSize : ImGui::GetFontSize());
+    const ImVec2 pad(3.0f * g_Scale, 1.0f * g_Scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, pad);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f * g_Scale);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, Hex(Col::Bg0));
+    ImGui::PushStyleColor(ImGuiCol_Border, Hex(Col::Accent2));
+    const ImVec2 mn = g_Edit.mn, mx = g_Edit.mx;
+    // as wide as the cell, and never too narrow for the digits and the caret
+    const float digits = ImGui::CalcTextSize(g_Edit.isReg ? "FFFF" : "FF").x;
+    const float w = ImMax(digits + pad.x * 2.0f + 3.0f * g_Scale, mx.x - mn.x);
+    const float h = ImGui::GetFrameHeight();
+    ImGui::SetCursorScreenPos(ImVec2(ImFloor((mn.x + mx.x - w) * 0.5f), ImFloor((mn.y + mx.y - h) * 0.5f)));
+    ImGui::SetNextItemWidth(w);
+    if (g_Edit.focus) { ImGui::SetKeyboardFocusHere(); g_Edit.focus = false; }
+    const bool enter = ImGui::InputText("##inplaceedit", g_Edit.buf, g_Edit.isReg ? 5 : 3,
+                                        ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsUppercase |
+                                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    const bool escaped = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    const bool leftIt = ImGui::IsItemDeactivated();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
+    ImGui::PopFont();
+    g_Edit.drawnFrame = g_FrameNo;
+    if (escaped) { g_Edit.open = false; g_App.status = "Edit dropped"; }
+    else if (enter || leftIt) EditCommit();
+}
+
+// An edit whose byte or register is no longer on screen -- scrolled away, its
+// panel closed, the edit tool switched off -- is dropped rather than left open
+// where nobody can see it. Called once a frame, after the panels.
+static void EditFieldSweep()
+{
+    if (!g_Edit.open) return;
+    if (!g_App.editMode || !g_App.game.ready()) { g_Edit.open = false; return; }
+    if (ImMax(g_Edit.drawnFrame, g_Edit.openedFrame) < g_FrameNo - 1) g_Edit.open = false;
+}
+
+// ---------------------------------------------------------------------------
+// Pointer rings -- shared by the arena, the stack, the shared page and the code
+//
+// The segment:register pairs that can be marked, in the order the options list
+// them. Bit i of AppState::hlMask turns pair i on, in every panel at once.
+// ---------------------------------------------------------------------------
+struct PointerPair { const char* name; int seg; int reg; };
+static const PointerPair kPointerPairs[] = {
+    { "CS:IP", cw::PR_CS, cw::PR_IP },
+    { "DS:AX", cw::PR_DS, cw::PR_AX }, { "DS:BX", cw::PR_DS, cw::PR_BX },
+    { "DS:CX", cw::PR_DS, cw::PR_CX }, { "DS:DX", cw::PR_DS, cw::PR_DX },
+    { "DS:SI", cw::PR_DS, cw::PR_SI }, { "DS:DI", cw::PR_DS, cw::PR_DI },
+    { "ES:SI", cw::PR_ES, cw::PR_SI }, { "ES:DI", cw::PR_ES, cw::PR_DI },
+    { "SS:BP", cw::PR_SS, cw::PR_BP }, { "SS:SP", cw::PR_SS, cw::PR_SP },
+};
+static const int kPointerPairCount = (int)(sizeof(kPointerPairs) / sizeof(kPointerPairs[0]));
+
+// One enabled pair of a warrior, as the linear address it points at. CS:IP is
+// left out where IP already has a marker of its own (the arena, the code).
+struct PtrHit { cw::s32 lin; const char* name; };
+static std::vector<PtrHit> PointerHits(const cw::CpuState& st, bool withIp)
+{
+    std::vector<PtrHit> out;
+    if (!g_App.hlMask) return out;
+    cw::CpuState s = st;
+    for (int i = 0; i < kPointerPairCount; i++)
+    {
+        if (!(g_App.hlMask & (1u << i))) continue;
+        if (i == 0 && !withIp) continue;
+        const PointerPair& pp = kPointerPairs[i];
+        out.push_back({ cw::RMAddr(*s.slot(pp.seg), *s.slot(pp.reg)).linear, pp.name });
+    }
+    return out;
+}
+
+// Where a linear address falls in a 64K window that starts at segment `seg`:
+// its offset there, or -1 when it is outside the window.
+static int OffsetInSegment(cw::s32 lin, cw::s16 seg)
+{
+    cw::s32 d = lin - cw::RMAddr(seg, 0).linear;
+    if (d < 0) d += 0x100000;            // 20-bit wrap
+    return (d >= 0 && d < 0x10000) ? (int)d : -1;
+}
+
+// Black or white, whichever stands out against `c`: the hairline that keeps a
+// coloured ring visible against the cell inside it. A dark ring gets white.
+static ImU32 HairlineFor(ImU32 c, float alpha = 0.9f)
+{
+    const ImVec4 v = ImGui::ColorConvertU32ToFloat4(c);
+    const float lum = 0.299f * v.x + 0.587f * v.y + 0.114f * v.z;
+    return lum < 0.5f ? IM_COL32(255, 255, 255, (int)(alpha * 255)) : IM_COL32(11, 14, 19, (int)(alpha * 255));
+}
+
+// The ring itself: the pointer colour, with a hairline of contrast inside it.
+static void PointerRing(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, float rounding, float thick)
+{
+    const ImU32 ring = HexU(g_App.hlColor);
+    dl->AddRect(mn, mx, ring, rounding, 0, thick);
+    const float in = thick * 0.5f + 0.5f;
+    dl->AddRect(ImVec2(mn.x + in, mn.y + in), ImVec2(mx.x - in, mx.y - in),
+                HairlineFor(ring, 0.6f), ImMax(0.0f, rounding - 1.0f), 0, 1.0f);
+}
+
+// A pointer's name in a list (stack, shared page, code): it sits over the
+// row's index, and a click moves it over the row's content instead -- one or
+// the other is always covered, so the click is how to read what is under it.
+// Several on one row line up side by side. Returns the tag's width.
+static std::map<std::string, bool> g_TagOnContent;
+static float PointerListTag(const char* panel, const char* name, const ImVec2& indexMn, float rowH,
+                            float contentX, int k)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const std::string key = std::string(panel) + "|" + name;
+    bool& onContent = g_TagOnContent[key];
+    ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.8f);
+    const ImVec2 ts = ImGui::CalcTextSize(name);
+    const float w = ts.x + 8 * g_Scale, h = ImMin(rowH - 1.0f, ts.y + 3 * g_Scale);
+    const float x = (onContent ? contentX : indexMn.x - 2 * g_Scale) + k * (w + 2 * g_Scale);
+    const ImVec2 mn(x, indexMn.y + (rowH - h) * 0.5f - 1.0f), mx(x + w, mn.y + h);
+    const ImU32 bg = HexU(g_App.hlColor);
+    dl->AddRectFilled(mn, mx, bg, h * 0.5f);
+    dl->AddText(ImVec2(mn.x + 4 * g_Scale, mn.y + (h - ts.y) * 0.5f), HairlineFor(bg, 1.0f), name);
+    ImGui::PopFont();
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(mn, mx))
+    {
+        ImGui::SetTooltip("%s\nClick: move it over the %s", name, onContent ? "index" : "content");
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) onContent = !onContent;
+    }
+    return w;
 }
 
 #include "gui/gui_inspector.inl"   // registers / flags / code / stack / shared panels
@@ -3137,7 +4459,7 @@ static void DrawEditPopup()
 // crowd each other.
 // The grid is inset by exactly these, so the rulers sit beside the arena rather
 // than on top of it and cell 0,0 can always be scrolled clear of them.
-static float ArenaRulerW() { return ImGui::CalcTextSize("0000").x + 8 * g_Scale; }
+static float ArenaRulerW() { return ImGui::CalcTextSize("00").x + 12 * g_Scale; }
 static float ArenaRulerH() { return ImGui::GetTextLineHeight() + 5 * g_Scale; }
 // Wide enough for a pointer tag such as "DS:BX" in the left strip.
 static float ArenaTagW()
@@ -3155,8 +4477,11 @@ static void ArenaRulers(const ImVec2& p0, float cell, int N, float lw, float lh)
     const ImVec2 wpos = ImGui::GetWindowPos();
     const ImVec2 wsz  = ImGui::GetWindowSize();
 
+    // A byte's offset is its row and its column: the row (the high byte) down
+    // the side, the column (the low byte) along the top -- "12" and "34" for
+    // 0x1234, each written the same way.
     int stride = 1;
-    while (stride < N && stride * cell < 46.0f * g_Scale) stride *= 2;
+    while (stride < N && stride * cell < 30.0f * g_Scale) stride *= 2;
 
     dl->PushClipRect(wpos, ImVec2(wpos.x + wsz.x, wpos.y + wsz.y), true);
     // opaque: once the arena is panned its cells run underneath these strips
@@ -3170,8 +4495,9 @@ static void ArenaRulers(const ImVec2& p0, float cell, int N, float lw, float lh)
     {
         const float sy = p0.y + y * cell + (cell - th) * 0.5f;
         if (sy + th < wpos.y + lh || sy > wpos.y + wsz.y) continue;
-        snprintf(t, sizeof(t), "%04X", (unsigned)(y * N));
-        dl->AddText(ImVec2(wpos.x + 4 * g_Scale, sy), HexU(Col::TextDim, 0.75f), t);
+        snprintf(t, sizeof(t), "%02X", (unsigned)y);
+        const float tw = ImGui::CalcTextSize(t).x;
+        dl->AddText(ImVec2(wpos.x + lw - tw - 6 * g_Scale, sy), HexU(Col::TextDim, 0.75f), t);
     }
     dl->PopClipRect();
 
@@ -3180,7 +4506,7 @@ static void ArenaRulers(const ImVec2& p0, float cell, int N, float lw, float lh)
     {
         const float sx = p0.x + x * cell;
         if (sx + cell + 24 * g_Scale < wpos.x + lw || sx > wpos.x + wsz.x) continue;
-        snprintf(t, sizeof(t), "+%02X", (unsigned)x);
+        snprintf(t, sizeof(t), "%02X", (unsigned)x);
         // over the middle of its column when the column is wide enough to hold
         // it, otherwise starting at the column's left line
         const float tw = ImGui::CalcTextSize(t).x;
@@ -3194,28 +4520,20 @@ static void ArenaRulers(const ImVec2& p0, float cell, int N, float lw, float lh)
     dl->PopClipRect();
 }
 
-// How much grid the arena has at this zoom: the thickness setting, eased in
-// from nothing between a cell of 7 px and one of 16 px, so zooming in grows the
-// lines and the rounded corners gradually instead of snapping them on.
-static float ArenaLineScale(float cell)
+// The grid at this zoom. Below kGridOn px a cell has no lines at all; from
+// there on the lines have their full width -- never thinner than a pixel, since
+// sub-pixel lines shimmer as the view moves -- and it is their opacity that
+// eases in, from transparent at kGridOn to solid at kGridFull.
+static const float kGridOn = 9.0f, kGridFull = 16.0f;
+static float ArenaLineScale(float cell)        // thickness setting, or 0 below the threshold
 {
-    float t = ImClamp((cell - 7.0f) / 9.0f, 0.0f, 1.0f);
-    t = t * t * (3.0f - 2.0f * t);                       // smoothstep
-    return ImClamp(g_App.arenaGridWidth, 0.0f, 3.0f) * t;
+    return (cell >= kGridOn) ? ImClamp(g_App.arenaGridWidth, 0.0f, 3.0f) : 0.0f;
 }
-
-// The segment:register pairs that can be ringed in the arena, in the order the
-// options list them. Bit i of AppState::hlMask turns pair i on.
-struct PointerPair { const char* name; int seg; int reg; };
-static const PointerPair kPointerPairs[] = {
-    { "CS:IP", cw::PR_CS, cw::PR_IP },
-    { "DS:AX", cw::PR_DS, cw::PR_AX }, { "DS:BX", cw::PR_DS, cw::PR_BX },
-    { "DS:CX", cw::PR_DS, cw::PR_CX }, { "DS:DX", cw::PR_DS, cw::PR_DX },
-    { "DS:SI", cw::PR_DS, cw::PR_SI }, { "DS:DI", cw::PR_DS, cw::PR_DI },
-    { "ES:SI", cw::PR_ES, cw::PR_SI }, { "ES:DI", cw::PR_ES, cw::PR_DI },
-    { "SS:BP", cw::PR_SS, cw::PR_BP }, { "SS:SP", cw::PR_SS, cw::PR_SP },
-};
-static const int kPointerPairCount = (int)(sizeof(kPointerPairs) / sizeof(kPointerPairs[0]));
+static float ArenaLineFade(float cell)         // 0 transparent .. 1 solid
+{
+    float t = ImClamp((cell - kGridOn) / (kGridFull - kGridOn), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);          // smoothstep
+}
 
 // Where the inspected warrior's chosen pointers land this frame: arena offset
 // and the pair's name. Filled by ArenaPointerRings, read by ArenaPointerTags.
@@ -3248,14 +4566,12 @@ static void ArenaPointerRings(cw::GuiSession& g, const ImVec2& p0, float cell, i
     const float rounding = cellRnd > 0.0f ? cellRnd + thick * 0.5f + 0.5f : 0.0f;
 
     std::vector<int> ringed;
-    for (int i = 0; i < kPointerPairCount; i++)
+    // CS:IP is left out here: IP already has its ring of its own
+    for (const PtrHit& h : PointerHits(st, false))
     {
-        if (!(S.hlMask & (1u << i))) continue;
-        const PointerPair& pp = kPointerPairs[i];
-        const cw::s16 seg = *st.slot(pp.seg), off = *st.slot(pp.reg);
-        const cw::s32 lin = cw::RMAddr(seg, off).linear - cw::SNAP_LO;
+        const cw::s32 lin = h.lin - cw::SNAP_LO;
         if (lin < 0 || lin >= N * N) continue;
-        g_PointerMarks.push_back({ (int)lin, pp.name });
+        g_PointerMarks.push_back({ (int)lin, h.name });
 
         // one ring per cell, however many pairs share it
         if (std::find(ringed.begin(), ringed.end(), (int)lin) != ringed.end()) continue;
@@ -3267,104 +4583,200 @@ static void ArenaPointerRings(cw::GuiSession& g, const ImVec2& p0, float cell, i
         // contrast inside it so it reads on any cell colour
         const ImVec2 a(p0.x + x * cell, p0.y + y * cell);
         const float  o = thick * 0.5f + 0.5f;
-        const ImVec2 mn(a.x - o, a.y - o), mx(a.x + cell + o, a.y + cell + o);
-        dl->AddRect(mn, mx, HexU(S.hlColor), rounding, 0, thick);
-        dl->AddRect(ImVec2(mn.x + thick * 0.5f + 0.5f, mn.y + thick * 0.5f + 0.5f),
-                    ImVec2(mx.x - thick * 0.5f - 0.5f, mx.y - thick * 0.5f - 0.5f),
-                    HexU(ContrastInk(), 0.55f), ImMax(0.0f, rounding - 1.0f), 0, 1.0f);
+        PointerRing(dl, ImVec2(a.x - o, a.y - o), ImVec2(a.x + cell + o, a.y + cell + o), rounding, thick);
     }
 }
 
 // The pairs' names, in the offset strips: in the top strip over the ringed
 // cell's column and in the left strip beside its row, so they never sit on top
-// of the arena itself. Pairs that share a column (or row) share one tag.
+// of the arena itself.
+//
+// Each pair has a label of its own. Where labels land on top of one another
+// (two pairs on one column, or neighbouring columns at a small zoom), clicking
+// the one in front slides it aside to the nearest free spot -- its pointer
+// stays on its column, a leader line runs to it -- which uncovers the next;
+// clicking that one moves it too, and so on. A moved label that would no longer
+// cover anything at home goes back by itself; clicking it sends it back early.
+struct TagSlide { float cur = 0.0f, target = 0.0f; };
+static std::map<std::string, TagSlide> g_TagSlides;
+
+struct StripTag {
+    std::string key;     // "T:DS:SI" / "L:DS:SI"
+    const char* name;
+    float anchor;        // the column's centre x (top) or the row's centre y (left)
+    ImVec2 homeMn, size;
+};
+
+// Lays out, animates, draws and handles clicks for one strip's labels.
+// `along` is 0 for the top strip (labels slide in x), 1 for the left (in y).
+static void DrawStripTags(std::vector<StripTag>& tags, int along, const ImVec2& clipMn, const ImVec2& clipMx,
+                          float edge)
+{
+    if (tags.empty()) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = HexU(g_App.hlColor), ink = HairlineFor(bg, 1.0f);
+    const float dt = ImGui::GetIO().DeltaTime;
+    const float lo = along == 0 ? clipMn.x : clipMn.y, hi = along == 0 ? clipMx.x : clipMx.y;
+
+    auto rectAt = [&](const StripTag& t, float off, ImVec2& mn, ImVec2& mx) {
+        mn = t.homeMn;
+        if (along == 0) mn.x += off; else mn.y += off;
+        mx = ImVec2(mn.x + t.size.x, mn.y + t.size.y);
+    };
+    auto overlaps = [](const ImVec2& a0, const ImVec2& a1, const ImVec2& b0, const ImVec2& b1) {
+        return a0.x < b1.x - 0.5f && b0.x < a1.x - 0.5f && a0.y < b1.y - 0.5f && b0.y < a1.y - 0.5f;
+    };
+
+    // where everything is this frame
+    std::vector<ImVec2> mn(tags.size()), mx(tags.size());
+    for (size_t i = 0; i < tags.size(); i++)
+    {
+        TagSlide& s = g_TagSlides[tags[i].key];
+        s.cur += (s.target - s.cur) * (1.0f - expf(-dt * 14.0f));
+        if (fabsf(s.target - s.cur) < 0.3f) s.cur = s.target;
+        rectAt(tags[i], s.cur, mn[i], mx[i]);
+    }
+    auto coversAny = [&](size_t i, const ImVec2& a0, const ImVec2& a1) {
+        for (size_t j = 0; j < tags.size(); j++)
+            if (j != i && overlaps(a0, a1, mn[j], mx[j])) return true;
+        return false;
+    };
+
+    // a moved label that would sit clear at home goes back
+    for (size_t i = 0; i < tags.size(); i++)
+    {
+        TagSlide& s = g_TagSlides[tags[i].key];
+        if (s.target == 0.0f) continue;
+        ImVec2 h0, h1; rectAt(tags[i], 0.0f, h0, h1);
+        if (!coversAny(i, h0, h1)) s.target = 0.0f;
+    }
+
+    // a click goes to the label drawn last under the mouse -- the one in front
+    int hot = -1;
+    if (ImGui::IsWindowHovered())
+        for (size_t i = tags.size(); i-- > 0; )
+            if (ImGui::IsMouseHoveringRect(mn[i], mx[i])) { hot = (int)i; break; }
+    if (hot >= 0)
+    {
+        TagSlide& s = g_TagSlides[tags[(size_t)hot].key];
+        std::string under;
+        for (size_t j = 0; j < tags.size(); j++)
+            if ((int)j != hot && overlaps(mn[(size_t)hot], mx[(size_t)hot], mn[j], mx[j]))
+                under += std::string(under.empty() ? "" : ", ") + tags[j].name;
+        if (!under.empty())
+            ImGui::SetTooltip("%s\ncovers %s - click to move it aside", tags[(size_t)hot].name, under.c_str());
+        else if (s.target != 0.0f)
+            ImGui::SetTooltip("%s\nclick to put it back", tags[(size_t)hot].name);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            if (!under.empty())
+            {
+                // the nearest offset, either way along the strip, where it covers
+                // nothing and stays inside the strip
+                const StripTag& t = tags[(size_t)hot];
+                const float len = along == 0 ? t.size.x : t.size.y;
+                const float home = along == 0 ? t.homeMn.x : t.homeMn.y;
+                const float step = 2.0f * g_Scale;
+                for (float d = step; d < (hi - lo) + len; d += step)
+                {
+                    bool done = false;
+                    for (int sgn = 1; sgn >= -1 && !done; sgn -= 2)
+                    {
+                        const float off = s.cur + sgn * d;
+                        if (home + off < lo || home + off + len > hi) continue;
+                        ImVec2 a0, a1; rectAt(t, off, a0, a1);
+                        if (!coversAny((size_t)hot, a0, a1)) { s.target = off; done = true; }
+                    }
+                    if (done) break;
+                }
+            }
+            else s.target = 0.0f;
+        }
+    }
+
+    dl->PushClipRect(clipMn, clipMx, true);
+    ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.8f);
+    for (size_t i = 0; i < tags.size(); i++)
+    {
+        const StripTag& t = tags[i];
+        const ImVec2 a = mn[i], b = mx[i];
+        const float r = along == 0 ? (b.y - a.y) * 0.5f : 3.0f * g_Scale;
+        // the pointer always stays on the cell's column (or row); a label that
+        // has been moved keeps a leader line back to it
+        if (along == 0)
+        {
+            const float cx = t.anchor;
+            const float lx = ImClamp(cx, a.x + r, b.x - r);
+            if (fabsf(lx - cx) > 1.0f)
+                dl->AddLine(ImVec2(lx, b.y), ImVec2(cx, edge - 3 * g_Scale), bg, 1.2f * g_Scale);
+            dl->AddTriangleFilled(ImVec2(cx - 3 * g_Scale, edge - 4 * g_Scale), ImVec2(cx + 3 * g_Scale, edge - 4 * g_Scale),
+                                  ImVec2(cx, edge), bg);
+        }
+        else
+        {
+            const float cy = t.anchor;
+            const float ly = ImClamp(cy, a.y + r, b.y - r);
+            if (fabsf(ly - cy) > 1.0f)
+                dl->AddLine(ImVec2(b.x, ly), ImVec2(edge - 3 * g_Scale, cy), bg, 1.2f * g_Scale);
+            dl->AddTriangleFilled(ImVec2(edge - 4 * g_Scale, cy - 3 * g_Scale), ImVec2(edge - 4 * g_Scale, cy + 3 * g_Scale),
+                                  ImVec2(edge, cy), bg);
+        }
+        // a thin outline in the strip's colour keeps stacked labels apart
+        dl->AddRectFilled(a, b, bg, r);
+        dl->AddRect(a, b, HexU(Col::Bg1, 0.9f), r, 0, 1.0f);
+        const ImVec2 ts = ImGui::CalcTextSize(t.name);
+        dl->AddText(ImVec2(a.x + ImMax(1.0f, (b.x - a.x - ts.x) * 0.5f), a.y + (b.y - a.y - ts.y) * 0.5f), ink, t.name);
+    }
+    ImGui::PopFont();
+    dl->PopClipRect();
+}
+
 static void ArenaPointerTags(const ImVec2& p0, float cell, int N, float lw, float lh)
 {
     if (g_PointerMarks.empty() || lw <= 0.0f || lh <= 0.0f) return;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wpos = ImGui::GetWindowPos();
     const ImVec2 wsz  = ImGui::GetWindowSize();
-    const ImU32  bg   = HexU(g_App.hlColor), ink = HexU(Col::Bg0);
 
     ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.8f);
     const float th = ImGui::GetTextLineHeight();
-
-    // gather "DS:SI ES:DI" per column and per row
-    std::map<int, std::string> cols, rows;
+    std::vector<StripTag> top, left;
     for (const PointerMark& m : g_PointerMarks)
     {
-        std::string& c = cols[m.off % N];
-        if (c.find(m.name) == std::string::npos) c += c.empty() ? m.name : std::string(" ") + m.name;
-        std::string& r = rows[m.off / N];
-        if (r.find(m.name) == std::string::npos) r += r.empty() ? m.name : std::string(" ") + m.name;
-    }
-
-    // top strip: centred over the column, kept inside the strip
-    dl->PushClipRect(ImVec2(wpos.x + lw, wpos.y), ImVec2(wpos.x + wsz.x, wpos.y + lh), true);
-    for (const auto& kv : cols)
-    {
-        const float cx = p0.x + (kv.first + 0.5f) * cell;
-        if (cx < wpos.x + lw || cx > wpos.x + wsz.x) continue;
-        // several pairs on one column: the first and a count, so the tag stays
-        // about one column wide instead of running over its neighbours
-        std::string text = kv.second;
-        const size_t sp = text.find(' ');
-        if (sp != std::string::npos)
+        const ImVec2 ts = ImGui::CalcTextSize(m.name);
+        // top strip: centred over the column, kept inside the strip
         {
-            int more = 0;
-            for (char ch : text) if (ch == ' ') more++;
-            text = text.substr(0, sp) + " +" + std::to_string(more);
+            const float cx = p0.x + (m.off % N + 0.5f) * cell;
+            if (cx >= wpos.x + lw && cx <= wpos.x + wsz.x)
+            {
+                StripTag t;
+                t.key = std::string("T:") + m.name;
+                t.name = m.name;
+                t.anchor = cx;
+                t.size = ImVec2(ts.x + 8 * g_Scale, th + 2);
+                t.homeMn = ImVec2(ImClamp(cx - t.size.x * 0.5f, wpos.x + lw + 1, wpos.x + wsz.x - t.size.x - 1),
+                                  wpos.y + (lh - th) * 0.5f - 3);
+                top.push_back(t);
+            }
         }
-        const std::string& label = text;
-        const ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-        const float  w  = ts.x + 8 * g_Scale;
-        const float  x  = ImClamp(cx - w * 0.5f, wpos.x + lw + 1, wpos.x + wsz.x - w - 1);
-        const float  y  = wpos.y + (lh - th) * 0.5f - 1;
-        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + th + 2), bg, (th + 2) * 0.5f);
-        dl->AddTriangleFilled(ImVec2(cx - 3 * g_Scale, y + th + 2), ImVec2(cx + 3 * g_Scale, y + th + 2),
-                              ImVec2(cx, wpos.y + lh), bg);
-        dl->AddText(ImVec2(x + 4 * g_Scale, y + 1), ink, label.c_str());
-        if (sp != std::string::npos && ImGui::IsMouseHoveringRect(ImVec2(x, y), ImVec2(x + w, y + th + 2)))
-            ImGui::SetTooltip("%s", kv.second.c_str());
-    }
-    dl->PopClipRect();
-
-    // left strip: beside the row; several names stack when the row is tall
-    // enough, otherwise the first one and a count
-    dl->PushClipRect(ImVec2(wpos.x, wpos.y + lh), ImVec2(wpos.x + lw, wpos.y + wsz.y), true);
-    for (const auto& kv : rows)
-    {
-        const float cy = p0.y + (kv.first + 0.5f) * cell;
-        if (cy < wpos.y + lh || cy > wpos.y + wsz.y) continue;
-        std::vector<std::string> names;
-        for (size_t s = 0, e; s < kv.second.size(); s = e + 1)
+        // left strip: beside the row
         {
-            e = kv.second.find(' ', s);
-            if (e == std::string::npos) e = kv.second.size();
-            names.push_back(kv.second.substr(s, e - s));
-        }
-        const int fit = ImMax(1, (int)(cell / (th + 2)));
-        std::vector<std::string> shown;
-        for (size_t i = 0; i < names.size(); i++)
-        {
-            if ((int)shown.size() == fit - 1 && names.size() > (size_t)fit)
-            { shown.push_back("+" + std::to_string((int)(names.size() - i))); break; }
-            shown.push_back(names[i]);
-        }
-        float y = cy - shown.size() * (th + 2) * 0.5f;
-        for (const std::string& n : shown)
-        {
-            const float x = wpos.x + 2 * g_Scale, w = lw - 6 * g_Scale;
-            dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + th + 1), bg, 3.0f * g_Scale);
-            dl->AddTriangleFilled(ImVec2(x + w, cy - 3 * g_Scale), ImVec2(x + w, cy + 3 * g_Scale),
-                                  ImVec2(wpos.x + lw, cy), bg);
-            const ImVec2 ts = ImGui::CalcTextSize(n.c_str());
-            dl->AddText(ImVec2(x + ImMax(1.0f, (w - ts.x) * 0.5f), y + 0.5f), ink, n.c_str());
-            y += th + 2;
+            const float cy = p0.y + (m.off / N + 0.5f) * cell;
+            if (cy >= wpos.y + lh && cy <= wpos.y + wsz.y)
+            {
+                StripTag t;
+                t.key = std::string("L:") + m.name;
+                t.name = m.name;
+                t.anchor = cy;
+                t.size = ImVec2(lw - 8 * g_Scale, th + 1);
+                t.homeMn = ImVec2(wpos.x + 2 * g_Scale, cy - t.size.y * 0.5f);
+                left.push_back(t);
+            }
         }
     }
-    dl->PopClipRect();
     ImGui::PopFont();
+
+    DrawStripTags(top, 0, ImVec2(wpos.x + lw, wpos.y), ImVec2(wpos.x + wsz.x, wpos.y + lh), wpos.y + lh);
+    DrawStripTags(left, 1, ImVec2(wpos.x, wpos.y + lh), ImVec2(wpos.x + lw, wpos.y + wsz.y), wpos.x + lw);
 }
 
 // An opaque mix of two colours. Arena cells are drawn solid -- a translucent
@@ -3469,6 +4881,82 @@ static void BandInstructions(cw::GuiSession& g, const cw::u8* bytes, int ip, int
     }
 }
 
+// The mouse during a wheel zoom. Where the view cannot hold still the byte the
+// zoom started on, the mouse moves with that byte -- and for as long as the
+// view glides, the mouse is clipped to that one pixel, so a hand on the mouse
+// cannot fight it. The lock goes when the glide ends, or from AppFrame when
+// the arena stops being drawn.
+static int g_MouseLockFrame = -1;
+
+static void ArenaMouseLock(ImVec2 p)
+{
+    // Once windows can be popped out, ImGui's coordinates are the desktop's
+    // already, and the arena may be in a window other than the main one.
+    // Otherwise they are the main window's, and its client area is on screen
+    // where GLFW says.
+    LONG x, y;
+    if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+    {
+        x = (LONG)lroundf(p.x);
+        y = (LONG)lroundf(p.y);
+    }
+    else
+    {
+        const ImVec2 vp = ImGui::GetMainViewport()->Pos;
+        int wx = 0, wy = 0;
+        glfwGetWindowPos(g_Window, &wx, &wy);
+        x = wx + (LONG)lroundf(p.x - vp.x);
+        y = wy + (LONG)lroundf(p.y - vp.y);
+    }
+    RECT r = { x, y, x + 1, y + 1 };
+    ClipCursor(&r);
+    SetCursorPos(x, y);
+    g_MouseLockFrame = g_FrameNo;
+}
+
+static void ArenaMouseUnlock()
+{
+    if (g_MouseLockFrame < 0) return;
+    ClipCursor(NULL);
+    g_MouseLockFrame = -1;
+}
+
+// Where the mouse belongs on one axis of a wheel zoom. `aScr` is where the
+// wheel turned and `aByte` the byte that was under it -- outside 0..n when it
+// was in the margin beside a smaller arena. `pan` and `cell` are the view now.
+// - Over the arena: on that byte, wherever the view has put it.
+// - In the margin: where it was, until the arena's near edge grows out to it,
+//   and from then on riding that edge.
+// The same numbers place it every frame, the last frame included, so it lands
+// exactly on the byte instead of chasing it.
+static float ArenaZoomMouseAxis(float aScr, float aByte, float pan, float cell, float n, float vmin, float vsz)
+{
+    float want;
+    if (aByte < 0.0f)   want = ImMin(aScr, vmin + (0.0f - pan) * cell);
+    else if (aByte > n) want = ImMax(aScr, vmin + (n - pan) * cell);
+    else                want = vmin + (aByte - pan) * cell;
+    return ImClamp(want, vmin, vmin + vsz - 1.0f);
+}
+
+// Centre the arena on an axis where the whole thing fits; otherwise keep the
+// view inside it, so there is never dead space to pan into.
+static void ArenaPlaceAxis(float& pan, float vis, float n)
+{
+    pan = (vis >= n) ? (n - vis) * 0.5f : ImClamp(pan, 0.0f, n - vis);
+}
+
+// Where the mouse will be when the zoom reaches `target`: the view it will
+// settle on (the byte held at the point, then placed), and the spot on it.
+// Worked out before the glide, so the mouse goes straight there -- chasing
+// the byte frame by frame would swing out and back where the edge clamps and
+// the centring take turns.
+static float ArenaZoomMouseFinal(float aScr, float aByte, float target, float n, float vmin, float vsz)
+{
+    float pan = aByte - (aScr - vmin) / target;
+    ArenaPlaceAxis(pan, vsz / target, n);
+    return ArenaZoomMouseAxis(aScr, aByte, pan, target, n, vmin, vsz);
+}
+
 static void DrawArenaGrid(cw::GuiSession& g)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -3498,27 +4986,36 @@ static void DrawArenaGrid(cw::GuiSession& g)
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle |
                            ImGuiButtonFlags_MouseButtonRight);
     const bool hovered = ImGui::IsItemHovered();
+    const bool panning = ImGui::IsItemActive() && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f);
 
     ImVec2& pan = g_App.arenaPan;                             // top-left byte on screen
 
     // The wheel sets a target zoom and the view glides to it over a few
-    // frames, holding still the byte that was under the cursor. Anything else
-    // that sets the zoom (Find IP, the settings) is taken as it stands.
+    // frames, holding still the byte that was under the mouse wherever it
+    // can. Where the arena's edge or its centring will not let it, the mouse
+    // goes with the byte instead (ArenaZoomMouseAxis), locked there for the
+    // glide. Anything else that sets the zoom (Find IP, the settings) is taken
+    // as it stands.
     static float  zoomTarget = -1.0f, zoomSeen = -1.0f;
-    static ImVec2 anchorScreen, anchorByte;
-    if (zoomTarget < 0.0f || g_App.arenaZoom != zoomSeen) zoomTarget = g_App.arenaZoom;
+    static ImVec2 anchorScreen, anchorByte, mouseAt;
+    static float  cellFrom = 1.0f;                  // the zoom when the notch came
+    static bool   gesture = false;                  // a wheel zoom is gliding and owns the mouse
+    if (zoomTarget < 0.0f || g_App.arenaZoom != zoomSeen) { zoomTarget = g_App.arenaZoom; gesture = false; }
     if (hovered && io.MouseWheel != 0.0f)
     {
+        // a notch mid-glide carries on from where the glide has put the mouse
+        const ImVec2 at = gesture ? mouseAt : io.MousePos;
         zoomTarget   = ImClamp(zoomTarget * powf(1.15f, io.MouseWheel), 1.0f, 512.0f);
-        anchorScreen = io.MousePos;
-        anchorByte   = ImVec2(pan.x + (io.MousePos.x - viewMin.x) / cell,
-                              pan.y + (io.MousePos.y - viewMin.y) / cell);
+        anchorScreen = at;
+        anchorByte   = ImVec2(pan.x + (at.x - viewMin.x) / cell, pan.y + (at.y - viewMin.y) / cell);
+        cellFrom     = cell;
+        gesture      = (g_FollowIp < 0);            // following, the IP holds the middle instead
     }
     if (ImGui::IsItemActive())
     {
         pan.x -= io.MouseDelta.x / cell;
         pan.y -= io.MouseDelta.y / cell;
-        anchorByte.x -= io.MouseDelta.x / cell;      // a drag mid-glide moves the anchor with it
+        anchorByte.x -= io.MouseDelta.x / cell;     // a drag mid-glide moves the anchor with it
         anchorByte.y -= io.MouseDelta.y / cell;
     }
     if (zoomTarget != cell)
@@ -3532,11 +5029,48 @@ static void DrawArenaGrid(cw::GuiSession& g)
     }
     zoomSeen = g_App.arenaZoom;
 
-    // Centre the arena on an axis where the whole thing fits; otherwise keep it
-    // against the edges so there is never dead space to pan into.
     const float visX = viewSz.x / cell, visY = viewSz.y / cell;
-    pan.x = (visX >= (float)N) ? ((float)N - visX) * 0.5f : ImClamp(pan.x, 0.0f, (float)N - visX);
-    pan.y = (visY >= (float)N) ? ((float)N - visY) * 0.5f : ImClamp(pan.y, 0.0f, (float)N - visY);
+
+    // Follow IP: the followed warrior's next instruction glides to the middle
+    // of the view as the war plays. Dragging the arena yourself lets go.
+    if (g_FollowIp >= 0)
+    {
+        if (panning) { g_FollowIp = -1; g_App.status = "Stopped following IP"; }
+        else if (g.ready() && g_FollowIp < g.numWarriors())
+        {
+            const int off = g.warriorIpOffset(g_FollowIp);
+            if (off >= 0)
+            {
+                const float tx = (float)(off % N) + 0.5f - visX * 0.5f;
+                const float ty = (float)(off / N) + 0.5f - visY * 0.5f;
+                if (fabsf(tx - pan.x) > 48.0f || fabsf(ty - pan.y) > 48.0f) pan = ImVec2(tx, ty);
+                else
+                {
+                    const float k = 1.0f - expf(-io.DeltaTime * 14.0f);
+                    pan.x += (tx - pan.x) * k;
+                    pan.y += (ty - pan.y) * k;
+                }
+            }
+        }
+    }
+
+    ArenaPlaceAxis(pan.x, visX, (float)N);
+    ArenaPlaceAxis(pan.y, visY, (float)N);
+
+    // The mouse goes straight from where the wheel turned to where the zoom's
+    // byte will end up, as far along as the zoom is, locked there until the
+    // glide ends -- the last frame puts it on the final spot exactly.
+    if (gesture && g_FollowIp >= 0) { gesture = false; ArenaMouseUnlock(); }
+    if (gesture)
+    {
+        const ImVec2 to(ArenaZoomMouseFinal(anchorScreen.x, anchorByte.x, zoomTarget, (float)N, viewMin.x, viewSz.x),
+                        ArenaZoomMouseFinal(anchorScreen.y, anchorByte.y, zoomTarget, (float)N, viewMin.y, viewSz.y));
+        const float t = (cell == zoomTarget || zoomTarget == cellFrom) ? 1.0f
+                      : ImClamp(logf(cell / cellFrom) / logf(zoomTarget / cellFrom), 0.0f, 1.0f);
+        mouseAt = ImVec2(anchorScreen.x + (to.x - anchorScreen.x) * t, anchorScreen.y + (to.y - anchorScreen.y) * t);
+        ArenaMouseLock(mouseAt);
+        if (cell == zoomTarget) { gesture = false; ArenaMouseUnlock(); }
+    }
 
     const ImVec2 p0(viewMin.x - pan.x * cell, viewMin.y - pan.y * cell);   // cell 0,0
 
@@ -3555,11 +5089,12 @@ static void DrawArenaGrid(cw::GuiSession& g)
 
     // Line width and corner rounding are straight proportions of the zoom and
     // of the thickness setting -- 0 is no lines and square corners, one solid
-    // sheet -- and grow in from nothing as the arena is zoomed in (see
-    // ArenaLineScale), so there is no size at which the grid snaps on.
+    // sheet -- with a pixel as the thinnest line. Lines exist only past
+    // kGridOn, and fade in from transparent there (see ArenaLineScale).
     const float gridW    = ArenaLineScale(cell);
-    const float gap      = ImMin(cell * 0.07f * gridW, cell * 0.35f);
-    const float rounding = ImMin(cell * 0.10f * gridW, cell * 0.30f);
+    const float gridFade = ArenaLineFade(cell);
+    const float gap      = (gridW > 0.0f) ? ImClamp(cell * 0.07f * gridW, 1.0f, cell * 0.35f) : 0.0f;
+    const float rounding = (gridW > 0.0f) ? ImMin(cell * 0.10f * gridW, cell * 0.30f) : 0.0f;
     const float half     = gap * 0.5f;     // each cell gives up half a line on every side
     if (showHex) ImGui::PushFont(g_App.fontMono, hexSize);
     const float digitW = showHex ? ImGui::CalcTextSize("FF").x : 0.0f;
@@ -3576,9 +5111,17 @@ static void DrawArenaGrid(cw::GuiSession& g)
     // every line exactly on a cell boundary -- where the offsets in the strips
     // point -- and leaves each byte's digits centred in its square. Their
     // colour, the theme's, is one sheet laid under the visible cells.
-    if (gap > 0.0f)
-        dl->AddRectFilled(ImVec2(p0.x + x0 * cell - half, p0.y + y0 * cell - half),
-                          ImVec2(p0.x + x1 * cell + half, p0.y + y1 * cell + half), HexU(Col::ArenaGrid));
+    //
+    // While the lines are fading in, each cell is first laid down whole and
+    // square, the sheet goes over everything at the fade's opacity, and the
+    // inset cell goes on top. So the gaps and the rounded corners show the
+    // cell's own colour tinted towards the line colour -- the lines appear by
+    // turning opaque, not by growing out of nothing.
+    const bool fading = gap > 0.0f && gridFade < 1.0f;
+    const ImVec2 sheetMin(p0.x + x0 * cell - half, p0.y + y0 * cell - half);
+    const ImVec2 sheetMax(p0.x + x1 * cell + half, p0.y + y1 * cell + half);
+    if (gap > 0.0f && !fading)
+        dl->AddRectFilled(sheetMin, sheetMax, HexU(Col::ArenaGrid));
 
     // Instruction bands, worked out for this frame's state of the war.
     static std::vector<unsigned char> band(0x10000, 0);
@@ -3616,18 +5159,45 @@ static void DrawArenaGrid(cw::GuiSession& g)
         return (t & ~IM_COL32_A_MASK) | ((ImU32)(hexFade * 255.0f + 0.5f) << IM_COL32_A_SHIFT);
     };
 
+    // Each owner's cell colour, plain and banded, worked out once a frame rather
+    // than once a byte -- a war can own all 65536 of them.
+    // Solid, always: a dead survivor's cells are its colour faded into the core
+    // colour rather than made see-through.
+    static std::vector<ImU32> ownCol, ownBand;
+    const int nw = ImMax(0, g.numWarriors());
+    ownCol.resize((size_t)nw + 1);
+    ownBand.resize((size_t)nw + 1);
+    ownCol[0]  = coreCol;                                   // [0] is untouched core
+    ownBand[0] = MixOpaque(coreCol, coreBandInk, 0.14f);
+    for (int wi = 0; wi < nw; wi++)
+    {
+        ownCol[(size_t)wi + 1]  = MixOpaque(coreCol, WarriorColor(wi, 1.0f), g.warriorAlive(wi) ? 1.0f : 0.36f);
+        ownBand[(size_t)wi + 1] = MixOpaque(ownCol[(size_t)wi + 1], bandInk, 0.26f);
+    }
+    auto cellColour = [&](int off, int wi) -> ImU32 {
+        const size_t k = (wi >= 0 && wi < nw) ? (size_t)wi + 1 : 0;
+        return band[(size_t)off] ? ownBand[k] : ownCol[k];
+    };
+
+    if (fading)
+    {
+        // whole square cells, then the line sheet over them, see-through
+        for (int y = y0; y < y1; y++)
+            for (int x = x0; x < x1; x++)
+            {
+                const int off = y * N + x;
+                const ImVec2 a(p0.x + x * cell, p0.y + y * cell);
+                dl->AddRectFilled(a, ImVec2(a.x + cell, a.y + cell), cellColour(off, g.ownerAt(off)));
+            }
+        dl->AddRectFilled(sheetMin, sheetMax, HexU(Col::ArenaGrid, gridFade));
+    }
+
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++)
         {
             const int off = y * N + x;
             const int wi  = g.ownerAt(off);
-            ImU32 col;
-            // Solid, always: a dead survivor's cells are its colour faded into
-            // the core colour rather than made see-through.
-            if (wi >= 0) col = MixOpaque(coreCol, WarriorColor(wi, 1.0f), g.warriorAlive(wi) ? 1.0f : 0.36f);
-            else         col = coreCol;
-            if (band[(size_t)off])
-                col = (wi >= 0) ? MixOpaque(col, bandInk, 0.26f) : MixOpaque(col, coreBandInk, 0.14f);
+            const ImU32 col = cellColour(off, wi);
             const ImVec2 a(p0.x + x * cell, p0.y + y * cell);
             dl->AddRectFilled(ImVec2(a.x + half, a.y + half), ImVec2(a.x + cell - half, a.y + cell - half),
                               col, rounding);
@@ -3657,6 +5227,18 @@ static void DrawArenaGrid(cw::GuiSession& g)
             RequestByteEdit(cw::SNAP_LO + g_App.arenaHoverOff,
                             bytes[g_App.arenaHoverOff], "arena");
     }
+    // a byte being edited: the field goes over its cell, wherever the view has
+    // put that this frame
+    if (EditIsByte(g_Edit.linear))
+    {
+        const int eo = (int)(g_Edit.linear - cw::SNAP_LO);
+        const int ex = eo % N, ey = eo / N;
+        if (eo >= 0 && eo < N * N && ex >= x0 && ex < x1 && ey >= y0 && ey < y1)
+        {
+            const ImVec2 a(p0.x + ex * cell, p0.y + ey * cell);
+            EditPlace(ImVec2(a.x + half, a.y + half), ImVec2(a.x + cell - half, a.y + cell - half));
+        }
+    }
 
     // IP markers: a ring on the cell each live warrior is about to execute. The
     // ring follows the cells' own rounding so it does not read as a stray square
@@ -3670,8 +5252,10 @@ static void DrawArenaGrid(cw::GuiSession& g)
         if (x < x0 - 1 || x > x1 || y < y0 - 1 || y > y1) continue;
         const ImVec2 a(p0.x + x * cell, p0.y + y * cell);
         const ImVec2 mn(a.x + half - 1, a.y + half - 1), mx(a.x + cell - half + 1, a.y + cell - half + 1);
+        // the warrior's colour, and a hairline between it and the cell: black,
+        // or white when that colour is a dark one
         dl->AddRect(mn, mx, WarriorColor(wi, 1.0f), ipRound, 0, ImMax(1.5f, cell * 0.16f));
-        dl->AddRect(mn, mx, HexU(ContrastInk(), 0.9f), ipRound, 0, 1.0f);
+        dl->AddRect(mn, mx, HairlineFor(WarriorColor(wi, 1.0f), 0.9f), ipRound, 0, 1.0f);
     }
 
     ArenaPointerRings(g, p0, cell, N, x0, y0, x1, y1);
@@ -3681,25 +5265,75 @@ static void DrawArenaGrid(cw::GuiSession& g)
         ArenaRulers(p0, cell, N, lw, lh);
         ArenaPointerTags(p0, cell, N, lw, lh);
     }
+    // the edit field, at the size the digits are drawn at (within reason)
+    EditField(ImClamp(hexSize, g_App.fontMonoSize * g_Scale, 40.0f * g_Scale));
 }
 
-// A small square toggle used for the two binary transport switches.
-static bool ToggleChip(const char* id, const char* label, bool* v, const char* tip)
+// A text toggle; several in a row with no gap form a train (TrainCorners).
+static bool ToggleChip(const char* id, const char* label, bool* v, const char* tip,
+                       int trainIndex = 0, int trainCount = 1)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 ts = ImGui::CalcTextSize(label);
-    const float h = 28.0f * g_Scale;
-    const float w = ts.x + 16 * g_Scale;
+    const float h = kBarH * g_Scale;
+    const float w = ts.x + 18 * g_Scale;
     BtnState b = BareButton(id, ImVec2(w, h));
     const bool on = *v;
     dl->AddRectFilled(b.mn, b.mx,
-                      HexU(on ? Col::Accent : (b.hovered ? Col::Bg3 : Col::Bg2), on ? 0.85f : 1.0f),
-                      7.0f * g_Scale);
-    dl->AddText(ImVec2(b.mn.x + 8 * g_Scale, (b.mn.y + b.mx.y - ts.y) * 0.5f),
-                HexU(on ? Col::Bg0 : Col::TextDim), label);
+                      HexU(on ? Col::Accent : (b.held ? Col::Bg4 : b.hovered ? Col::Bg3 : Col::Bg2),
+                           on ? (b.hovered ? 0.95f : 0.85f) : 1.0f),
+                      7.0f * g_Scale, TrainCorners(trainIndex, trainCount));
+    // a lit carriage needs no joint; two dark ones side by side do
+    if (!on)
+    {
+        bool prevOn = false;
+        ImGuiStorage* st = ImGui::GetStateStorage();
+        prevOn = st->GetBool(ImGui::GetID("##trainprev"), false);
+        if (!prevOn) TrainJoint(dl, b.mn, b.mx, trainIndex);
+    }
+    ImGui::GetStateStorage()->SetBool(ImGui::GetID("##trainprev"), on);
+    dl->AddText(ImVec2((b.mn.x + b.mx.x - ts.x) * 0.5f, (b.mn.y + b.mx.y - ts.y) * 0.5f),
+                HexU(on ? Col::Bg0 : (b.hovered ? Col::Text : Col::TextDim)), label);
     if (b.hovered && tip) ImGui::SetTooltip("%s", tip);
     if (b.clicked) *v = !*v;
     return b.clicked;
+}
+
+// The playback speed as a slim bar with its value written inside it: drag
+// along it, or scroll over it. Full is the fastest.
+static void SpeedBar(float w)
+{
+    AppState& S = g_App;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float h = kBarH * g_Scale;
+    BtnState b = BareButton("##speedbar", ImVec2(w, h));
+    const ImGuiIO& io = ImGui::GetIO();
+    if (b.held)
+        S.speedExp = ImClamp((io.MousePos.x - b.mn.x) / w, 0.0f, 1.0f) * 30.0f;
+    if (b.hovered && io.MouseWheel != 0.0f)
+        S.speedExp = ImClamp(S.speedExp + io.MouseWheel, 0.0f, 30.0f);
+    if (b.hovered || b.held) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+
+    const float r = 7.0f * g_Scale;
+    const float t = ImClamp(S.speedExp / 30.0f, 0.0f, 1.0f);
+    dl->AddRectFilled(b.mn, b.mx, HexU(b.hovered || b.held ? Col::Bg3 : Col::Bg2), r);
+    if (t > 0.0f)
+    {
+        // the fill keeps the bar's left corners and is cut square at its end,
+        // until it reaches the right edge
+        const float fx = b.mn.x + w * t;
+        dl->AddRectFilled(b.mn, ImVec2(fx, b.mx.y), HexU(Col::Accent2, b.held ? 0.42f : 0.30f), r,
+                          t >= 0.999f ? ImDrawFlags_RoundCornersAll : ImDrawFlags_RoundCornersLeft);
+    }
+    char txt[32];
+    const double rps = RoundsPerSec();
+    if (rps >= 10000.0) snprintf(txt, sizeof(txt), "%.0fk r/s", rps / 1000.0);
+    else                snprintf(txt, sizeof(txt), "%.0f r/s", rps);
+    const ImVec2 ts = ImGui::CalcTextSize(txt);
+    dl->AddText(ImVec2((b.mn.x + b.mx.x - ts.x) * 0.5f, (b.mn.y + b.mx.y - ts.y) * 0.5f),
+                HexU(Col::Text), txt);
+    if (b.hovered && !b.held)
+        ImGui::SetTooltip("Playback speed, in rounds per second\nDrag along the bar, or scroll over it");
 }
 
 #include "gui/gui_timeline.inl"   // step-column / survivor-lane timeline
@@ -3722,11 +5356,11 @@ static void InspectorSplitter(const char* id, float sign, float h)
 
 // Centre the arena on the instruction the inspected survivor is about to run.
 // A warrior whose CS has been pushed out of the arena has no cell to point at.
-static void FocusArenaOnIp()
+static void FocusArenaOnIp(int wi)
 {
     AppState& S = g_App;
     if (!S.game.ready()) return;
-    int wi = S.inspectWarrior;
+    if (wi < 0) wi = S.inspectWarrior;
     if (wi < 0 || wi >= S.game.numWarriors()) wi = S.game.player().actingWarrior();
     if (wi < 0 || wi >= S.game.numWarriors()) { S.status = "No survivor selected"; return; }
 
@@ -3770,61 +5404,79 @@ static void DrawArenaPanel()   // window title: "Debug"
 
         ImGui::SetCursorScreenPos(ImVec2(o.x + 10 * g_Scale, o.y + (barH - 28 * g_Scale) * 0.5f));
 
-        // transport: back | play/pause | forward, then continue and rewind.
-        // Everything moves in whole rounds -- one pass in which every living
-        // warrior takes its turn.
-        if (ToolButton("##back", 7, "Back - one round (Shift+F11)", false, ready)) GameStepRound(-1);
-        ImGui::SameLine(0, 4 * g_Scale);
+        // transport, one train: back | play/pause | forward | to the next
+        // event | rewind. Everything moves in whole rounds -- one pass in
+        // which every living warrior takes its turn. Play wears the accent.
+        const float group = 10.0f * g_Scale;   // the gap between two trains
+        if (ToolButton("##back", 7, "Back - one round (Shift+F11)", false, ready,
+                       TrainCorners(0, 5), 0)) GameStepRound(-1);
+        ImGui::SameLine(0, 0);
         if (ToolButton("##dbgrun", run ? 1 : 0,
                        busy ? "Precomputing..." : (run ? "Pause (F5)" : (ready ? "Run (F5)" : "Precompute + play (F5)")),
-                       true, !busy))
+                       true, !busy, TrainCorners(1, 5), 1))
             GamePlayPause();
-        ImGui::SameLine(0, 4 * g_Scale);
-        if (ToolButton("##fwd", 8, "Forward - one round (F11)", false, ready)) GameStepRound(+1);
-        ImGui::SameLine(0, 8 * g_Scale);
-        if (ToolButton("##cont", 9, "Continue to the next event - death or BRK (F8)", false, ready)) GameContinue();
-        ImGui::SameLine(0, 4 * g_Scale);
-        if (ToolButton("##rew", 3, "Rewind to the start (Shift+F5)", false, ready))           GameReset();
+        ImGui::SameLine(0, 0);
+        if (ToolButton("##fwd", 8, "Forward - one round (F11)", false, ready, TrainCorners(2, 5), 0))
+            GameStepRound(+1);
+        ImGui::SameLine(0, 0);
+        if (ToolButton("##cont", 9, "Continue to the next event - death or BRK (F8)", false, ready,
+                       TrainCorners(3, 5), 3)) GameContinue();
+        ImGui::SameLine(0, 0);
+        if (ToolButton("##rew", 3, "Rewind to the start (Shift+F5)", false, ready, TrainCorners(4, 5), 4))
+            GameReset();
 
-        ImGui::SameLine(0, 12 * g_Scale);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (28 * g_Scale - ImGui::GetFrameHeight()) * 0.5f);
-        ImGui::SetNextItemWidth(120 * g_Scale);
-        ImGui::SliderFloat("##speedexp", &S.speedExp, 0.0f, 30.0f, "");
-        ImGui::SameLine(0, 8 * g_Scale);
-        ImGui::TextColored(Hex(Col::Accent2), "%.0f r/s", RoundsPerSec());
+        // the speed, its value written inside the bar
+        ImGui::SameLine(0, group);
+        SpeedBar(112 * g_Scale);
 
-        // seed + recompute: the two things you reach for to run the fight again
-        ImGui::SameLine(0, 12 * g_Scale);
-        ImGui::SetNextItemWidth(96 * g_Scale);
-        if (ImGui::InputTextWithHint("##seed", "seed", S.seedText, sizeof(S.seedText),
-                                     ImGuiInputTextFlags_EnterReturnsTrue))
-            GameArm();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Text or a number, resolved the way the reference does:\n"
-                              "a plain number is used as-is, anything else is hashed.\n"
-                              "-> %lld", (long long)SeedFromText(S.seedText));
-        ImGui::SameLine(0, 6 * g_Scale);
-        if (ImGui::Button(busy ? "..." : "Recompute") && !busy) GameArm();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Play the whole war out again from this seed (Ctrl+F5)");
+        // seed + recompute, one train: the field and the button that uses it
+        ImGui::SameLine(0, group);
+        {
+            const float h = kBarH * g_Scale, r = 7.0f * g_Scale;
+            const float fieldW = 92 * g_Scale;
+            const ImVec2 fmn = ImGui::GetCursorScreenPos();
+            const bool hot = ImGui::IsMouseHoveringRect(fmn, ImVec2(fmn.x + fieldW, fmn.y + h));
+            dl->AddRectFilled(fmn, ImVec2(fmn.x + fieldW, fmn.y + h), HexU(hot ? Col::Bg3 : Col::Bg2), r,
+                              ImDrawFlags_RoundCornersLeft);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                                ImVec2(9 * g_Scale, (h - ImGui::GetFontSize()) * 0.5f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
+            ImGui::SetNextItemWidth(fieldW);
+            if (ImGui::InputTextWithHint("##seed", "seed", S.seedText, sizeof(S.seedText),
+                                         ImGuiInputTextFlags_EnterReturnsTrue))
+                GameArm();
+            if (ImGui::IsItemActive())
+                dl->AddRect(fmn, ImVec2(fmn.x + fieldW, fmn.y + h), HexU(Col::Accent, 0.7f), r,
+                            ImDrawFlags_RoundCornersLeft, 1.2f);
+            ImGui::PopStyleColor(3);
+            ImGui::PopStyleVar(3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Seed - text or a number, resolved the way the reference does:\n"
+                                  "a plain number is used as-is, anything else is hashed.\n"
+                                  "-> %lld   (Enter plays the war again)", (long long)SeedFromText(S.seedText));
+            ImGui::SameLine(0, 0);
+            if (ToolButton("##recompute", 10,
+                           busy ? "Precomputing..." : "Recompute - play the whole war out again from this seed (Ctrl+F5)",
+                           false, !busy, ImDrawFlags_RoundCornersRight, 1))
+                GameArm();
+        }
 
-        ImGui::SameLine(0, 6 * g_Scale);
-        if (ImGui::Button("Find IP") && ready) FocusArenaOnIp();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Zoom the arena onto the inspected survivor's next instruction");
-
-        ImGui::SameLine(0, 10 * g_Scale);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - (28 * g_Scale - ImGui::GetFrameHeight()) * 0.5f);
-        ToggleChip("##dbgstop", "DBG", &S.game.stopOnEvents, "Stop when a death or breakpoint is reached");
-        ImGui::SameLine(0, 4 * g_Scale);
-        ToggleChip("##dbgrev", "REV", &S.game.reverse, "Run and continue backwards through the recording");
-        ImGui::SameLine(0, 4 * g_Scale);
+        // the three modes, one train: no gaps, rounded only at its two ends
+        ImGui::SameLine(0, group);
+        ToggleChip("##dbgstop", "DBG", &S.game.stopOnEvents, "Stop when a death or breakpoint is reached", 0, 3);
+        ImGui::SameLine(0, 0);
+        ToggleChip("##dbgrev", "REV", &S.game.reverse, "Run and continue backwards through the recording", 1, 3);
+        ImGui::SameLine(0, 0);
         ToggleChip("##dbgedit", "EDIT", &S.editMode,
                    "Double-click a byte, a register or a flag to change it.\n"
-                   "The war is played out again with the change on the next move.");
+                   "The war is played out again with the change on the next move.", 2, 3);
 
         ImGui::SameLine(0, 14 * g_Scale);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (28 * g_Scale - ImGui::GetTextLineHeight()) * 0.5f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (kBarH * g_Scale - ImGui::GetTextLineHeight()) * 0.5f);
         if (busy)
             ImGui::TextColored(Hex(Col::Warn), "precomputing  %d rounds  (%.0f%%)",
                                S.game.progressRounds(), S.game.progress() * 100.0f);
@@ -3939,8 +5591,15 @@ static double AppNow() { return glfwGetTime(); }
 
 #include "gui/gui_gpulane.inl"   // the Vulkan engine, run as a child process
 #include "gui/gui_javalane.inl"  // the CGX Java engine, run the same way
-#include "gui/gui_net.inl"       // shard files and the host / join wire
+#include "gui/gui_net.inl"       // the host / join wire
+// the smart check's state and button live in gui_smartcheck.inl, after the
+// competition code it builds on; the toolbar needs these two first
+static bool AnyGroupUsesInt89();
+static void SmartCheckToggle();
+static bool SmartCheckIsOpen();
+static bool SmartCheckIsRunning();
 #include "gui/gui_compete.inl"   // tournament runner + score board
+#include "gui/gui_smartcheck.inl" // which AX:DX an int 0x89 should look for
 
 static void DrawStatusBar(float height)
 {
@@ -4034,9 +5693,12 @@ static std::string SettingsPath()
 // cannot be saved but not loaded.
 #define CWEST_SETTINGS(B, I, F, U, S)                                          \
     B(inspectorLeft)      B(groupsCollapsed)   B(showInspector)                \
-    B(showTimeline)       B(showEditor)        B(showArena)      B(showBoard)  \
+    B(popOutWindows)                                                           \
+    B(showTimeline)      B(showEditor)        B(showArena)      B(showBoard)  \
     B(arenaRulers)        B(advanceSeed)                                       \
-    B(compBarLabels)                                                           \
+    B(compBarLabels)      B(compBarShadow)                                     \
+    B(compSeedInBar)      B(compAllowBusy)     B(compSeekTool)                 \
+    B(autoSave)                                                                \
     B(asmUpperCase)       B(showAsmGutter)     B(dblClickDisasm)               \
     B(followSS)           B(followES)          B(followCS)                     \
     B(arenaInsnBands)     I(arenaInsnWho)      I(arenaInsnReach)               \
@@ -4046,12 +5708,17 @@ static std::string SettingsPath()
     I(themeIndex)         I(folderSortMode)    I(zombieSpeed)   I(maxRounds)   \
     B(compBarsUp)         B(compBarsFit)                                       \
     I(compGames)          I(compThreads)       I(compByGroup)                  \
+    I(compFieldShow)                                                           \
     I(compCombo)          I(compPairSeed)      I(compBackend)                  \
-    I(compMode)           I(compNetPort)       I(compShards)                   \
+    I(compMode)           I(compNetPort)                                       \
+    I(compNetProtect)     S(compNetPassword)                                   \
+    I(exportFormat)       B(exportKeepFolders) S(exportDir)                    \
     F(inspectorWidth)     F(workspaceWidth)    F(fontUISize)                   \
     F(fontMonoSize)       F(fontEditorSize)    F(speedExp)      F(arenaZoom)   \
     F(arenaGridWidth)                                                          \
     U(hlColor)                                                                 \
+    U(groupPal0)          U(groupPal1)         U(groupPal2)                    \
+    U(groupPal3)          U(groupPal4)         I(groupPalNext)                 \
     S(seedText)           S(breakPatterns)     S(compNetHost)   S(compNetName) \
     S(fontUIFile)         S(fontMonoFile)      S(compSeedText)
 
@@ -4072,6 +5739,8 @@ static void SaveSettings()
 #undef WU
 #undef WS
     f << "lastFolder=" << S.lastFolder << "\n";
+    for (size_t i = 0; i < S.recentWorkspaces.size() && i < 8; i++)
+        f << "recent" << i << "=" << S.recentWorkspaces[i] << "\n";
     // the palette, so a hand-edited theme survives
     for (int i = 0; i < kPalCount; i++) f << "pal" << i << "=" << *PalSlot(i) << "\n";
 }
@@ -4107,13 +5776,20 @@ static void LoadSettings()
 #undef RF
 #undef RU
 #undef RS
-        if (k == "lastFolder") { S.lastFolder = v; continue; }
+        // opened once the app is up, not here: until then there is no workspace
+        if (k == "lastFolder") { g_StartWorkspace = v; continue; }
+        if (k.compare(0, 6, "recent") == 0) { if (!v.empty()) S.recentWorkspaces.push_back(v); continue; }
         if (k.compare(0, 3, "pal") == 0)
         {
             const int i = atoi(k.c_str() + 3);
             if (i >= 0 && i < kPalCount) { *PalSlot(i) = (unsigned)strtoul(v.c_str(), NULL, 10); havePal[i] = true; }
         }
     }
+
+    // GPU alone is gone, and the busy lane only stays chosen while it is allowed.
+    if (S.compBackend == COMP_GPU || S.compBackend < 0 || S.compBackend > COMP_JAVA) S.compBackend = COMP_CPU;
+    if (S.compBackend == COMP_BOTH && !S.compAllowBusy) S.compBackend = COMP_CPU;
+    if (S.folderSortMode != 1) S.folderSortMode = 0;
 
     // A file saved before the arena joined the palette has no pal13. In it,
     // "Custom" was index 4 -- which is a preset now.
@@ -4160,16 +5836,56 @@ static void HandleShortcuts()
     ImGuiIO& io = ImGui::GetIO();
 
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Q))              ToggleSelectionEnabled();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N))              NewPlayer();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O))              OpenWorkspaceFolder();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_B))              ImportLooseFiles();
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N))              QueueWsOp(WsOp::NewGroup, TargetFolder());
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O))              QueueWsOp(WsOp::PickWorkspace);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Comma))          g_App.showOptions = !g_App.showOptions;
 
-    // Delete closes the selected warriors -- but never while a text field or the
-    // source editor has the keyboard.
-    if (!io.WantTextInput && !g_App.selection.empty() &&
-        ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+    // The list keys -- never while a text field or the source editor has the
+    // keyboard, and (but for Delete and Paste) only when the groups bar had the
+    // last click.
+    const bool listKeys = !io.WantTextInput && HasWorkspace();
+    if (listKeys && !g_App.selection.empty() && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
         DeleteSelection();
+    if (listKeys && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_V))
+        QueueWsOp(WsOp::Paste, TargetFolder());
+    if (listKeys && g_GroupsFocus)
+    {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_A)) SelectAllRows();
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C)) CopySelectionToClipboard();
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z) && !g_Trash.empty()) QueueWsOp(WsOp::Undo);
+        if (ImGui::IsKeyPressed(ImGuiKey_F2, false) && !g_App.selection.empty())
+        {
+            Ref r = g_App.anchor.Valid() && IsSelected(g_App.anchor) ? g_App.anchor : g_App.selection.back();
+            if (!IsFolderRef(r) && !IsZombieRef(r)) r.slot = -1;     // a survivor renames its group
+            BeginInlineRename(r);
+        }
+    }
+
+#ifdef CWEST_TEST_HOOKS
+    // Test builds only: F9 runs the selected groups against every top-level
+    // folder, the same op the group menu queues.
+    if (ImGui::IsKeyPressed(ImGuiKey_F9, false))
+    {
+        WsOp op;
+        op.kind = WsOp::RunFolders;
+        for (const Ref& r : S.selection) { RefKey k = KeyOfRef(r); if (k.kind == 0) op.items.push_back(k); }
+        for (int fi : FolderChildren(std::string())) op.paths.push_back(S.folders[fi].path);
+        QueueWsOp(op);
+    }
+    // F8 opens the run-against-folders picker for the selected groups
+    if (ImGui::IsKeyPressed(ImGuiKey_F8, false))
+    {
+        g_RunPicker.groups.clear();
+        for (const Ref& r : S.selection) { RefKey k = KeyOfRef(r); if (k.kind == 0) g_RunPicker.groups.push_back(k); }
+        if (!g_RunPicker.groups.empty()) { g_RunPicker.open = true; g_RunPicker.appearing = true; }
+    }
+    // and Ctrl+F12 crashes on purpose, to check what crash.log says
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F12))
+    {
+        volatile int* nowhere = nullptr;
+        *nowhere = 1;
+    }
+#endif
 
     // Ctrl +/- sizes the source editor, the way every editor does it
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Equal) ||
@@ -4185,7 +5901,7 @@ static void HandleShortcuts()
     // ordinary edits of its own to undo.
     {
         Survivor* sv = SurvivorAt(g_App.open);
-        if (sv && sv->present)
+        if (sv && sv->present && !(listKeys && g_GroupsFocus))
         {
             if (!g_App.editor.CanUndo() && !g_ReframeUndo.empty() &&
                 ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
@@ -4198,8 +5914,9 @@ static void HandleShortcuts()
                 PushEditorMarkers(*sv);
                 g_App.status = "Undid the re-read";
             }
-            else if (!g_ReframeRedo.empty() &&
-                     ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y))
+            else if (!g_ReframeRedo.empty() && !g_App.editor.CanRedo() &&
+                     (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) ||
+                      ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z)))
             {
                 g_ReframeUndo.push_back(sv->code);
                 sv->code = g_ReframeRedo.back();
@@ -4228,7 +5945,8 @@ static void HandleShortcuts()
         if (S.open.Valid() && !io.KeyCtrl && !io.KeyShift)
             CycleAlternativeOnCursorLine();
 
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !S.selection.empty() && !ImGui::IsAnyItemActive())
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !S.selection.empty() && !ImGui::IsAnyItemActive() &&
+        !g_Rename.active)
     {
         S.selection.clear();
         S.status = "Selection cleared";
@@ -4435,11 +6153,36 @@ static void TickSimulation(float dt)
         S.status = S.game.status();
 }
 
-// Dropping files: source files (.asm/.s/.txt) become editable survivors, files
-// with no such extension are treated as assembled machine code.
+// Files dropped on the window are copied into the workspace -- into the folder
+// (or the zombie list) under the mouse, or the selected folder. With no
+// workspace open, a dropped folder becomes the workspace.
 static void OnDropFiles(GLFWwindow*, int count, const char** paths)
 {
-    ImportFiles(std::vector<std::string>(paths, paths + count));
+    const std::vector<std::string> v(paths, paths + count);
+    if (!HasWorkspace())
+    {
+        if (v.size() == 1 && DirExists(v[0])) { WsOp op; op.kind = WsOp::OpenWorkspace; op.folder = v[0]; QueueWsOp(op); }
+        else g_App.status = "Open a workspace first -- or drop a folder here to open it as one";
+        return;
+    }
+    double mx = 0.0, my = 0.0;
+    glfwGetCursorPos(g_Window, &mx, &my);
+    // the drop zones are in ImGui's coordinates: the window's own with one
+    // viewport, the desktop's once windows can be popped out
+    const ImVec2 vp = ImGui::GetMainViewport()->Pos;
+    const ImVec2 at((float)mx + vp.x, (float)my + vp.y);
+    WsOp op;
+    op.kind = WsOp::Import;
+    op.paths = v;
+    op.folder = TargetFolder();
+    for (const DropZone& z : g_DropZones)
+        if (at.x >= z.mn.x && at.y >= z.mn.y && at.x < z.mx.x && at.y < z.mx.y)
+        {
+            op.folder = z.folder;
+            op.zombies = z.zombies;
+            break;
+        }
+    QueueWsOp(op);
 }
 
 // -----------------------------------------------------------------------------
@@ -4463,8 +6206,91 @@ static void BuildDockLayout(ImGuiID dockId, const ImVec2& size)
 // -----------------------------------------------------------------------------
 // Entry point
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Crash log
+//
+// A crash appends what happened and the call stack -- as offsets into the exe
+// and its DLLs -- to crash.log beside the exe, so "it crashed when I pasted"
+// comes with the place it happened (addr2line -e app.exe <0x140000000+offset>).
+// -----------------------------------------------------------------------------
+static void WriteCrashLog(const char* what, const CONTEXT* ctx)
+{
+    FILE* f = fopen((ExeDir() + "crash.log").c_str(), "a");
+    if (!f) return;
+    const time_t now = time(NULL);
+    char when[64];
+    strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(f, "=== %s  %s\n", when, what);
+    if (ctx)
+    {
+        CONTEXT c = *ctx;
+        for (int i = 0; i < 48 && c.Rip; i++)
+        {
+            HMODULE mod = NULL;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)c.Rip, &mod);
+            char name[MAX_PATH] = "?";
+            if (mod) GetModuleFileNameA(mod, name, MAX_PATH);
+            fprintf(f, "  #%02d  %s+0x%llx\n", i, FileNameOf(name).c_str(),
+                    (unsigned long long)(c.Rip - (DWORD64)(uintptr_t)mod));
+            DWORD64 imageBase = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &imageBase, NULL);
+            if (fn)
+            {
+                PVOID handlerData = NULL;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fn, &c, &handlerData, &establisher, NULL);
+            }
+            else if (i == 0 && c.Rsp)
+            {
+                // a leaf function has no unwind data: its return address is on top
+                c.Rip = *(const DWORD64*)(uintptr_t)c.Rsp;
+                c.Rsp += 8;
+            }
+            else break;
+        }
+    }
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
+{
+    char what[128];
+    snprintf(what, sizeof(what), "exception 0x%08lX", (unsigned long)ep->ExceptionRecord->ExceptionCode);
+    WriteCrashLog(what, ep->ContextRecord);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void TerminateLogger()
+{
+    std::string what = "std::terminate";
+    if (std::exception_ptr p = std::current_exception())
+    {
+        try { std::rethrow_exception(p); }
+        catch (const std::exception& e) { what += std::string(" -- ") + e.what(); }
+        catch (...) { what += " -- not a std::exception"; }
+    }
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    WriteCrashLog(what.c_str(), &ctx);
+    abort();
+}
+
+// Whether any window is out on the desktop on its own (Options > Panels).
+static bool PoppedOutWindowsOpen()
+{
+    if (!(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)) return false;
+    const ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+    for (int i = 1; i < pio.Viewports.Size; i++)
+        if (!(pio.Viewports[i]->Flags & ImGuiViewportFlags_IsMinimized)) return true;
+    return false;
+}
+
 int main(int argc, char** argv)
 {
+    SetUnhandledExceptionFilter(CrashFilter);
+    std::set_terminate(TerminateLogger);
     if (!glfwInit())
         return -1;
 
@@ -4538,9 +6364,20 @@ int main(int argc, char** argv)
     io.IniFilename = layoutPath.c_str();
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
+#ifdef CWEST_TEST_HOOKS
+    // Test builds only: the clipboard reads testclip.txt beside the exe, so a
+    // paste can be driven without touching the machine's real clipboard.
+    ImGui::GetPlatformIO().Platform_GetClipboardTextFn = [](ImGuiContext*) -> const char* {
+        static std::string clip;
+        if (!ReadFileBytes(ExeDir() + "testclip.txt", clip)) clip.clear();
+        return clip.c_str();
+    };
+#endif
     ImGui_ImplOpenGL3_Init("#version 130");
 
     LoadSettings();
+    // the offline mode (1) is gone: a setting saved with it is a local run now
+    if (g_App.compMode != MODE_SERVER && g_App.compMode != MODE_JOIN) g_App.compMode = MODE_LOCAL;
     if (!g_App.compNetName[0])
         snprintf(g_App.compNetName, sizeof(g_App.compNetName), "%s", NetComputerName().c_str());
     LoadFonts();
@@ -4558,36 +6395,36 @@ int main(int argc, char** argv)
     // a few switches so a machine can be pointed at a tournament from a
     // shortcut without anyone clicking through the panel on it.
     //
-    //   --folder <dir>        open a workspace folder
+    //   --folder <dir>        open this workspace instead of the last one
     //   --serve [port]        host: listen, and Run the tournament straight away
     //   --join host[:port]    play a share of the tournament at host
     //   --games <n>           battles for the run (0 = until Stop)
     //   --threads <n>         worker threads for this machine (0 = every core)
-    //   --engine cpu|gpu|both|java which lanes this machine plays with
-    //   --mode local|offline|server|join
+    //   --engine c++|java|busy which lanes this machine plays with (busy only when allowed in Options)
+    //   --mode local|server|join
     //   --run                 press Run once the field is loaded
     bool autoRun = false;
+    bool joinAtStart = false;      // --join dials once every option is read (--password may follow it)
     {
-        std::vector<const char*> a;
+        std::vector<std::string> a;
         for (int i = 1; i < argc; i++)
         {
             const std::string arg = argv[i];
             const bool more = (i + 1 < argc);
-            if (arg == "--folder" && more)      { LoadWorkspaceFolder(argv[++i]); continue; }
+            if (arg == "--folder" && more)      { g_StartWorkspace = argv[++i]; continue; }
             if (arg == "--games" && more)       { g_App.compGames = atoi(argv[++i]); continue; }
             if (arg == "--threads" && more)     { g_App.compThreads = atoi(argv[++i]); continue; }
             if (arg == "--mode" && more)
             {
                 const std::string m = ToLower(argv[++i]);
-                g_App.compMode = (m == "offline") ? MODE_OFFLINE : (m == "server") ? MODE_SERVER
-                               : (m == "join") ? MODE_JOIN : MODE_LOCAL;
+                g_App.compMode = (m == "server") ? MODE_SERVER : (m == "join") ? MODE_JOIN : MODE_LOCAL;
                 continue;
             }
             if (arg == "--run")                 { autoRun = true; continue; }
             if (arg == "--engine" && more)
             {
                 const std::string e = ToLower(argv[++i]);
-                g_App.compBackend = (e == "gpu") ? COMP_GPU : (e == "both") ? COMP_BOTH
+                g_App.compBackend = ((e == "busy" || e == "both") && g_App.compAllowBusy) ? COMP_BOTH
                                   : (e == "java") ? COMP_JAVA : COMP_CPU;
                 continue;
             }
@@ -4602,46 +6439,252 @@ int main(int argc, char** argv)
             }
             if (arg == "--join" && more)
             {
-                std::string hp = argv[++i];
-                const size_t colon = hp.find(':');
-                if (colon != std::string::npos) { g_App.compNetPort = atoi(hp.c_str() + colon + 1); hp = hp.substr(0, colon); }
-                snprintf(g_App.compNetHost, sizeof(g_App.compNetHost), "%s", hp.c_str());
+                // the host's https address, or host:port on this machine
+                snprintf(g_App.compNetHost, sizeof(g_App.compNetHost), "%s", argv[++i]);
                 g_App.compMode = MODE_JOIN;
                 g_App.showBoard = true;
                 g_CompRaise = true;
-                std::string why;
-                if (!NetClientConnect(g_App.compNetHost, g_App.compNetPort, why)) g_NetClient.note = why;
+                joinAtStart = true;
+                continue;
+            }
+            if (arg == "--password" && more)
+            {
+                snprintf(g_App.compNetPassword, sizeof(g_App.compNetPassword), "%s", argv[++i]);
                 continue;
             }
             a.push_back(argv[i]);
         }
-        if (!a.empty()) OnDropFiles(window, (int)a.size(), a.data());
+        // a lone folder on the command line is the workspace to open
+        if (a.size() == 1 && DirExists(a[0])) { g_StartWorkspace = a[0]; a.clear(); }
+        if (!g_StartWorkspace.empty() && DirExists(g_StartWorkspace))
+        {
+            const double t0 = glfwGetTime();
+            OpenWorkspace(g_StartWorkspace);
+#ifdef CWEST_TEST_HOOKS
+            char b[96];
+            snprintf(b, sizeof(b), "open %.1f ms, %d groups, %d folders\n", (glfwGetTime() - t0) * 1000.0,
+                     (int)g_App.players.size(), (int)g_App.folders.size());
+            std::string all = b;
+            for (auto& kv : g_Perf)
+            {
+                char l[96];
+                snprintf(l, sizeof(l), "  %-10s %8.1f ms", kv.first.c_str(), kv.second.sum);
+                all += l;
+                all += (char)10;
+            }
+            WriteFileBytes(ExeDir() + "perf_open.txt", all);
+#else
+            (void)t0;
+#endif
+        }
+        // anything else comes into the workspace as if dropped on it
+        if (!a.empty() && HasWorkspace()) ImportIntoWorkspace(a, std::string(), false);
     }
-    if (g_App.players.empty() && g_App.compMode != MODE_JOIN)
-        SeedDemoWorkspace();
+    if (joinAtStart)
+    {
+        std::string why;
+        if (!NetClientConnect(g_App.compNetHost, why)) { g_NetClient.state = NET_FAILED; g_NetClient.note = why; }
+    }
     if (autoRun) { g_App.showBoard = true; g_CompRaise = true; CompetitionStart(); }
 
-    bool layoutBuilt = false;
-
+    g_AppReady = true;
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
-        if (glfwGetWindowAttrib(window, GLFW_ICONIFIED) != 0)
+        // Windows popped out of the main one stay on the desktop when it is
+        // minimized (they are not owned by it), so they are kept drawing --
+        // paced by hand, since a minimized window's swap does not wait for
+        // the screen.
+        const bool iconified = glfwGetWindowAttrib(window, GLFW_ICONIFIED) != 0;
+        if (iconified && PoppedOutWindowsOpen())
+        {
+            AppFrame();
+            Sleep(15);
+            continue;
+        }
+        if (iconified)
         {
             // No drawing while minimized, but a tournament must not stall: a
             // host keeps accepting joiners and merging their packs, a joiner
             // keeps knocking, picks up its field and reports back.
+            ArenaMouseUnlock();
             CompetitionPoll();
             Sleep(10);
             continue;
         }
+        AppFrame();
+    }
+    g_AppReady = false;
+    ArenaMouseUnlock();
 
+    FlushEditorToModel();
+    if (g_App.autoSave) SaveDirty();   // the last few keystrokes, before the pause
+    WriteWsStateNow();
+    StopWatch();
+    SaveSettings();
+    SeedSearchStop();
+    SmartCheckStop();
+    CompetitionStop();
+    if (g_CompThread && g_CompThread->joinable()) g_CompThread->join();
+    GpuLaneStop();
+    JavaLaneStop();
+    NetServerStop();
+    NetClientDisconnect();
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
+
+#ifdef CWEST_TEST_HOOKS
+static void PerfTick()
+{
+    static double next = 0.0;
+    const double now = glfwGetTime();
+    if (now < next) return;
+    next = now + 3.0;
+    std::string out;
+    char line[160];
+    for (auto& kv : g_Perf)
+    {
+        snprintf(line, sizeof(line), "%-12s avg %7.3f ms  max %7.3f ms  (%d)\n", kv.first.c_str(),
+                 kv.second.n ? kv.second.sum / kv.second.n : 0.0, kv.second.max, kv.second.n);
+        out += line;
+    }
+    WriteFileBytes(ExeDir() + "perf.txt", out);
+    g_Perf.clear();
+}
+
+// Test builds only: a file shot.req beside the exe, holding a path, makes the
+// next frame save the main window's back buffer there as a .bmp. Read straight
+// from GL, so it works while the screen is locked and PrintWindow sees black.
+// shot.txt beside it gets a few facts a picture cannot show.
+static void SaveBackBufferBmp(const std::string& out, int fbW, int fbH)
+{
+    if (out.empty() || fbW <= 0 || fbH <= 0) return;
+    std::vector<unsigned char> px((size_t)fbW * fbH * 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, fbW, fbH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    const int rowBytes = (fbW * 3 + 3) & ~3;
+    std::string bmp(54 + (size_t)rowBytes * fbH, '\0');
+    auto put32 = [&](size_t at, uint32_t v) { for (int k = 0; k < 4; k++) bmp[at + k] = (char)((v >> (8 * k)) & 0xFF); };
+    bmp[0] = 'B'; bmp[1] = 'M';
+    put32(2, (uint32_t)bmp.size()); put32(10, 54); put32(14, 40);
+    put32(18, (uint32_t)fbW); put32(22, (uint32_t)fbH);
+    bmp[26] = 1; bmp[28] = 24;
+    put32(34, (uint32_t)(rowBytes * fbH));
+    for (int y = 0; y < fbH; y++)                 // GL's rows run bottom-up, as a BMP's do
+        for (int x = 0; x < fbW; x++)
+        {
+            const unsigned char* s = &px[((size_t)y * fbW + x) * 4];
+            char* d = &bmp[54 + (size_t)y * rowBytes + (size_t)x * 3];
+            d[0] = (char)s[2]; d[1] = (char)s[1]; d[2] = (char)s[0];
+        }
+    WriteFileBytes(out, bmp);
+}
+
+static std::string TakeShotRequest(const char* file)
+{
+    const std::string req = ExeDir() + file;
+    std::string out;
+    if (!ReadFileBytes(req, out)) return std::string();
+    DeleteFileA(req.c_str());
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) out.pop_back();
+    return out;
+}
+
+// shotvp.req does the same for every window popped out of the main one
+// (<path>_1.bmp, _2 ...): it renders them itself this frame, reading each
+// back buffer before it is swapped. Returns whether it did.
+static bool TestShotViewports()
+{
+    const std::string out = TakeShotRequest("shotvp.req");
+    if (out.empty()) return false;
+    ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+    std::string log;
+    for (int i = 0; i < pio.Viewports.Size; i++)
+    {
+        int w = 0, h = 0;
+        glfwGetFramebufferSize((GLFWwindow*)pio.Viewports[i]->PlatformHandle, &w, &h);
+        char line[160];
+        snprintf(line, sizeof(line), "pio viewport %d id %08X flags %08X fb %dx%d\n", i, pio.Viewports[i]->ID,
+                 (unsigned)pio.Viewports[i]->Flags, w, h);
+        log += line;
+    }
+    WriteFileBytes(ExeDir() + "shotvp.txt", log);
+    for (int i = 1; i < pio.Viewports.Size; i++)
+    {
+        ImGuiViewport* vp = pio.Viewports[i];
+        if (vp->Flags & ImGuiViewportFlags_IsMinimized) continue;
+        if (pio.Platform_RenderWindow) pio.Platform_RenderWindow(vp, NULL);
+        if (pio.Renderer_RenderWindow) pio.Renderer_RenderWindow(vp, NULL);
+        int w = 0, h = 0;
+        glfwGetFramebufferSize((GLFWwindow*)vp->PlatformHandle, &w, &h);
+        SaveBackBufferBmp(out + "_" + std::to_string(i) + ".bmp", w, h);
+        if (pio.Platform_SwapBuffers) pio.Platform_SwapBuffers(vp, NULL);
+        if (pio.Renderer_SwapBuffers) pio.Renderer_SwapBuffers(vp, NULL);
+    }
+    return true;
+}
+
+static void TestShotTick(int fbW, int fbH)
+{
+    const std::string out = TakeShotRequest("shot.req");
+    if (out.empty()) return;
+    SaveBackBufferBmp(out, fbW, fbH);
+    std::string facts;
+    char line[200];
+    ImGuiContext& g = *GImGui;
+    snprintf(line, sizeof(line), "frame %d  viewports %d  enabled %d\n", g_FrameNo, g.Viewports.Size,
+             (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) ? 1 : 0);
+    facts += line;
+    for (ImGuiViewportP* v : g.Viewports)
+    {
+        snprintf(line, sizeof(line), "viewport %08X pos %.0f,%.0f size %.0fx%.0f window %s platform %d\n",
+                 v->ID, v->Pos.x, v->Pos.y, v->Size.x, v->Size.y, v->Window ? v->Window->Name : "-",
+                 v->PlatformWindowCreated ? 1 : 0);
+        facts += line;
+    }
+    snprintf(line, sizeof(line), "edit open %d reg %d  pokes %d  status %s\n", g_Edit.open ? 1 : 0,
+             g_Edit.isReg ? 1 : 0, (int)g_App.pokes.size(), g_App.status.c_str());
+    facts += line;
+    WriteFileBytes(ExeDir() + "shot.txt", facts);
+}
+#else
+static void PerfTick() {}
+#endif
+
+// One whole frame: build the UI, draw it, present it. Called from the main
+// loop, and also from inside the window procedure while Windows is running its
+// own modal loop for a resize or a move -- without that the last frame was
+// simply stretched to the new size until the mouse was let go.
+static void AppFrame()
+{
+    if (g_InFrame) return;
+    g_InFrame = true;
+    g_FrameNo++;
+    PerfTick();
+    GLFWwindow* window = g_Window;
+    ImGuiIO& io = ImGui::GetIO();
+    bool& layoutBuilt = g_LayoutBuilt;
+    {
         if (g_FontsDirty)
         {
             g_FontsDirty = false;
             ReloadFonts();
         }
 
+        // Windows that may leave the main one (Options > Appearance > Panels):
+        // Dear ImGui's multi-viewports, flipped between frames -- it moves
+        // every window across to the new coordinates itself when it changes.
+        if (g_App.popOutWindows) io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+        else                     io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+
+        const double perfT0 = glfwGetTime();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -4698,7 +6741,7 @@ int main(int argc, char** argv)
         if (!S.groupsCollapsed) S.workspaceWidth = wsW;
 
         ImGui::SetCursorScreenPos(ImVec2(rootMin.x, bodyTop));
-        DrawWorkspacePanel(wsW, bodyH);
+        { PERF("groups"); DrawWorkspacePanel(wsW, bodyH); }
 
         // splitter
         {
@@ -4738,25 +6781,30 @@ int main(int argc, char** argv)
         ImGui::End(); // CoreWarsRoot
 
         // Docked panels are submitted after the host window is closed.
-        if (S.showEditor) DrawEditorPanel();
-        if (S.showArena)  DrawArenaPanel();
-        if (S.showBoard)  DrawLeaderboardPanel();
+        if (S.showEditor) { PERF("editor"); DrawEditorPanel(); }
+        if (S.showArena)  { PERF("arena"); DrawArenaPanel(); }
+        if (S.showBoard)  { PERF("board"); DrawLeaderboardPanel(); }
         DrawPoppedInspectors(S.game);
         DrawAboutPopup();
-    DrawEditPopup();
-    DrawOptionsWindow();
+        EditFieldSweep();
+        DrawOptionsWindow();
+        DrawSeedSearchWindow();
+        DrawSmartCheckWindow();
+        DrawRunFoldersWindow();
+        DrawExportWindow();
 
-        RunFolderOp();
-        if (g_PendingClosePlayer >= 0)
-        {
-            ClosePlayer(g_PendingClosePlayer);
-            g_PendingClosePlayer = -1;
-        }
-        HandleShortcuts();
+        { PERF("shortcuts"); HandleShortcuts(); }
+        { PERF("wsops"); RunWsOps(); }
+        { PERF("autosave"); AutoSaveTick(); }
+        { PERF("wsstate"); WsStateTick(); }
+        { PERF("watch"); WsWatchTick(); }
+        KeepFloatingWindowsClickable();
 
         // --- render ----------------------------------------------------------
+        const double perfR0 = glfwGetTime();
         ImGui::Render();
         g_NoDragActive.swap(g_NoDragBuild);
+        if (g_MouseLockFrame >= 0 && g_MouseLockFrame != g_FrameNo) ArenaMouseUnlock();   // the arena went away mid-zoom
 
         int fbW = 0, fbH = 0;
         glfwGetFramebufferSize(window, &fbW, &fbH);
@@ -4765,23 +6813,49 @@ int main(int argc, char** argv)
         glClearColor(clear.x, clear.y, clear.z, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+#ifdef CWEST_TEST_HOOKS
+        TestShotTick(fbW, fbH);
+#endif
+        // and the windows dragged out of it, each into its own. Updated every
+        // frame, on or off: ImGui checks the last frame did it before it lets
+        // the option be switched on, and it does nothing while off.
+        {
+            GLFWwindow* ctx = glfwGetCurrentContext();
+            ImGui::UpdatePlatformWindows();
+#ifdef CWEST_TEST_HOOKS
+            if ((io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) && !TestShotViewports())
+#else
+            if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+#endif
+                ImGui::RenderPlatformWindowsDefault();
+            glfwMakeContextCurrent(ctx);
+        }
+        PerfAdd("render", perfR0);
+        PerfAdd("frame", perfT0);
 
         glfwSwapBuffers(window);
     }
+    g_InFrame = false;
+}
 
-    FlushEditorToModel();
-    SaveSettings();
-    CompetitionStop();
-    if (g_CompThread && g_CompThread->joinable()) g_CompThread->join();
-    GpuLaneStop();
-    JavaLaneStop();
-    NetServerStop();
-    NetClientDisconnect();
-
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
-    glfwDestroyWindow(window);
-    glfwTerminate();
-    return 0;
+// A floating ImGui window (Options, a popped-out inspector, an undocked panel)
+// can be dragged up over the app's own title strip. The strip answers
+// HTCAPTION there, so Windows took the click and dragged the whole app instead
+// of the panel -- and the panel could not be got back down. Wherever such a
+// window covers the strip, the strip is client area.
+static void KeepFloatingWindowsClickable()
+{
+    ImGuiContext& g = *GImGui;
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float stripBottom = vp->Pos.y + g_TitleBarHeight;
+    for (ImGuiWindow* w : g.Windows)
+    {
+        if (!w->Active || w->Hidden) continue;
+        if (w->Flags & ImGuiWindowFlags_ChildWindow) continue;
+        if (w->DockIsActive) continue;                           // docked: below the strip
+        if (w->Viewport != vp) continue;                         // out on the desktop, a window of its own
+        if (strcmp(w->Name, "CoreWarsRoot") == 0) continue;      // the strip itself
+        if (w->Pos.y >= stripBottom) continue;
+        AddNoDragRect(w->Pos, ImVec2(w->Pos.x + w->Size.x, w->Pos.y + w->Size.y));
+    }
 }

@@ -4,843 +4,15 @@
 //  Included once from main.cpp, after the editor helpers so it can assemble and
 //  disassemble while it walks a folder.
 // =============================================================================
-#include <shlobj.h>
-#include <shellapi.h>   // ShellExecuteA -- "Open fonts folder"
-#include <cstdarg>
-
-// -----------------------------------------------------------------------------
-// Small filesystem helpers (Win32 -- the project already depends on it heavily)
-// -----------------------------------------------------------------------------
-static std::string JoinPath(const std::string& a, const std::string& b)
-{
-    if (a.empty()) return b;
-    char last = a[a.size() - 1];
-    return (last == '\\' || last == '/') ? a + b : a + "\\" + b;
-}
-
-static bool DirExists(const std::string& p)
-{
-    const DWORD a = GetFileAttributesA(p.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
-}
-
-static bool EnsureDir(const std::string& p)
-{
-    return DirExists(p) || CreateDirectoryA(p.c_str(), NULL) != 0;
-}
-
-// Every plain file directly inside dir, as full paths.
-static std::vector<std::string> ListDirFiles(const std::string& dir)
-{
-    std::vector<std::string> out;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(JoinPath(dir, "*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return out;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        out.push_back(JoinPath(dir, fd.cFileName));
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-    std::sort(out.begin(), out.end());
-    return out;
-}
-
-// The names of the directories directly inside dir, sorted.
-static std::vector<std::string> ListSubDirs(const std::string& dir)
-{
-    std::vector<std::string> out;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(JoinPath(dir, "*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return out;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
-        const std::string n = fd.cFileName;
-        if (n == "." || n == ".." || n[0] == '.') continue;      // .git and friends are not folders of survivors
-        out.push_back(n);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
-        return ToLower(a) < ToLower(b);
-    });
-    return out;
-}
-
-static std::string ExtOf(const std::string& fileName)
-{
-    const size_t d = fileName.find_last_of('.');
-    return (d == std::string::npos) ? std::string() : ToLower(fileName.substr(d));
-}
-
-static bool WriteBinaryFile(const std::string& path, const std::vector<unsigned char>& b)
-{
-    std::ofstream f(path.c_str(), std::ios::binary | std::ios::trunc);
-    if (!f) return false;
-    if (!b.empty()) f.write((const char*)b.data(), (std::streamsize)b.size());
-    return (bool)f;
-}
-
-// SHBrowseForFolder is the one folder picker that needs no COM object lifetime
-// management beyond initialising the apartment.
-static std::string BrowseForFolder(HWND owner, const char* title)
-{
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    char buf[MAX_PATH] = "";
-    BROWSEINFOA bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.hwndOwner = owner;
-    bi.pszDisplayName = buf;
-    bi.lpszTitle = title;
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
-
-    std::string result;
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (pidl)
-    {
-        char path[MAX_PATH] = "";
-        if (SHGetPathFromIDListA(pidl, path)) result = path;
-        CoTaskMemFree(pidl);
-    }
-    return result;
-}
-
-// -----------------------------------------------------------------------------
-// Open folder
-// -----------------------------------------------------------------------------
-static const char* kAsmDir  = "assembly";
-static const char* kSurvDir = "survivors";
-static const char* kZombDir = "zombies";
-
-static std::string g_SortPromptRoot;    // non-empty while the sort popup is up
-
-static bool IsLayoutDirName(const std::string& name)
-{
-    const std::string n = ToLower(name);
-    return n == kAsmDir || n == kSurvDir || n == kZombDir;
-}
-
-// A folder of groups is a directory on disk, so its name has to be one: no
-// path separators or the characters Windows refuses, no trailing dots, and not
-// one of the three names the workspace layout itself uses. Empty = unusable.
-static std::string CleanFolderName(const std::string& raw)
-{
-    std::string n;
-    for (char ch : raw)
-    {
-        const unsigned char c = (unsigned char)ch;
-        if (c < 32 || strchr("\\/:*?\"<>|", ch)) continue;
-        n.push_back(ch);
-    }
-    while (!n.empty() && (n.back() == ' ' || n.back() == '.')) n.pop_back();
-    size_t lead = 0;
-    while (lead < n.size() && n[lead] == ' ') lead++;
-    n.erase(0, lead);
-    if (n.empty() || n[0] == '.' || IsLayoutDirName(n)) return std::string();
-    if (n.size() > 60) n.resize(60);
-    return n;
-}
-
-// Only a directory that holds warriors and nothing else is taken for a folder
-// of survivors: one stray document, or a directory inside it, and it is
-// somebody's own folder -- not read as warriors, and never sorted.
-static bool LooksLikeSurvivorFolder(const std::string& dir)
-{
-    const std::vector<std::string> inside = ListDirFiles(dir);
-    if (inside.empty() || !ListSubDirs(dir).empty()) return false;
-    for (const std::string& p : inside)
-    {
-        const std::string ext = ExtOf(FileNameOf(p));
-        if (!ext.empty() && ext != ".asm" && ext != ".s" && ext != ".txt") return false;
-    }
-    return true;
-}
-
-static void ClearWorkspace()
-{
-    g_App.players.clear();
-    g_App.folders.clear();
-    g_App.zombies.clear();
-    g_App.selection.clear();
-    g_App.anchor = Ref();
-    g_App.open = Ref();
-    g_App.editor.SetText("");
-    g_App.editor.SetReadOnly(true);
-    g_App.inspectWarrior = -1;
-    g_App.game.clear();
-}
-
-// Move a flat pile of files into assembly / survivors / zombies. ".asm" is
-// source; anything without an extension is machine code, and a machine-code
-// file whose name starts with "zom" is a zombie.
-static int SortFolderIntoSubfolders(const std::string& root)
-{
-    if (!EnsureDir(JoinPath(root, kAsmDir)) ||
-        !EnsureDir(JoinPath(root, kSurvDir)) ||
-        !EnsureDir(JoinPath(root, kZombDir)))
-    {
-        g_App.status = "Could not create the assembly / survivors / zombies folders";
-        return 0;
-    }
-
-    // `sub` is a folder of survivors inside the pile: its files are sorted the
-    // same way, into a folder of the same name under assembly / survivors, so
-    // the grouping survives the sort. Zombies are not kept in folders.
-    int moved = 0;
-    auto sortDir = [&](const std::string& from, const std::string& sub) {
-        for (const std::string& p : ListDirFiles(from))
-        {
-            const std::string fn  = FileNameOf(p);
-            const std::string ext = ExtOf(fn);
-            const std::string low = ToLower(fn);
-
-            const char* dst = NULL;
-            if (ext == ".asm")      dst = kAsmDir;
-            else if (ext.empty())   dst = (low.compare(0, 3, "zom") == 0) ? kZombDir : kSurvDir;
-            if (!dst) continue;                       // .txt, .png, whatever -- leave it alone
-
-            std::string to = JoinPath(root, dst);
-            if (!sub.empty() && dst != kZombDir)
-            {
-                to = JoinPath(to, sub);
-                if (!EnsureDir(to)) continue;
-            }
-            if (MoveFileA(p.c_str(), JoinPath(to, fn).c_str())) moved++;
-        }
-    };
-    sortDir(root, std::string());
-    for (const std::string& sub : ListSubDirs(root))
-    {
-        if (IsLayoutDirName(sub) || CleanFolderName(sub).empty()) continue;
-        if (!LooksLikeSurvivorFolder(JoinPath(root, sub))) continue;
-        sortDir(JoinPath(root, sub), sub);
-        RemoveDirectoryA(JoinPath(root, sub).c_str());   // goes only if the sort emptied it
-    }
-    return moved;
-}
-
-// Keep the two representations of one warrior in step. The .asm wins wherever
-// both exist -- it is the file a human edits -- so a binary is only written
-// from source, and source is only written for a binary that has none.
-static void SyncFolderPair(const std::string& asmDir, const std::string& binDir,
-                           int& assembled, int& disassembled)
-{
-    if (g_App.folderAssemble)
-    {
-        for (const std::string& p : ListDirFiles(asmDir))
-        {
-            if (ExtOf(FileNameOf(p)) != ".asm") continue;
-            std::string text;
-            if (!ReadTextFile(p, text)) continue;
-
-            Survivor tmp;
-            tmp.code = text;
-            ReassembleSurvivor(tmp);
-            if (!tmp.asmOk || tmp.bin.empty()) continue;
-
-            const std::string out = JoinPath(binDir, StemOf(FileNameOf(p)));
-            std::vector<unsigned char> old;
-            if (ReadBinaryFile(out, old) && old == tmp.bin) continue;   // already current
-            if (WriteBinaryFile(out, tmp.bin)) assembled++;
-        }
-    }
-
-    if (g_App.folderDisassemble)
-    {
-        for (const std::string& p : ListDirFiles(binDir))
-        {
-            if (!ExtOf(FileNameOf(p)).empty()) continue;
-            const std::string out = JoinPath(asmDir, StemOf(FileNameOf(p)) + ".asm");
-            if (FileExists(out)) continue;             // never overwrite hand-written source
-
-            std::vector<unsigned char> bytes;
-            if (!ReadBinaryFile(p, bytes)) continue;
-            if (bytes.size() > 512) bytes.resize(512);
-
-            Survivor tmp;
-            ListSurvivor(tmp, bytes);
-            if (WriteTextFile(out, tmp.code)) disassembled++;
-        }
-    }
-}
-
-// Saving a survivor that came from a binary: the machine code goes back to the
-// file it was loaded from, and the source lands beside it in assembly/ (or next
-// to it as <name>.asm when there is no such folder). Returns false for a plain
-// .asm survivor, which the normal text save handles.
-static std::string ParentDir(const std::string& p)
-{
-    const size_t s = p.find_last_of("\\/");
-    return (s == std::string::npos) ? std::string() : p.substr(0, s);
-}
-
-static bool SaveBinarySurvivor(Survivor& sv)
-{
-    if (sv.path.empty() || !ExtOf(FileNameOf(sv.path)).empty()) return false;
-
-    const std::string dir  = ParentDir(sv.path);
-    const std::string up   = ParentDir(dir);
-    const std::string stem = StemOf(FileNameOf(sv.path));
-    std::string asmOut = sv.path + ".asm";
-    if (DirExists(JoinPath(up, kAsmDir)))
-        asmOut = JoinPath(JoinPath(up, kAsmDir), stem + ".asm");
-    else if (ToLower(FileNameOf(up)) == kSurvDir && DirExists(JoinPath(ParentDir(up), kAsmDir)))
-    {
-        // survivors/<folder>/name: the source goes to assembly/<folder>/name.asm
-        const std::string adir = JoinPath(JoinPath(ParentDir(up), kAsmDir), FileNameOf(dir));
-        if (EnsureDir(adir)) asmOut = JoinPath(adir, stem + ".asm");
-    }
-
-    bool ok = WriteTextFile(asmOut, sv.code);
-    if (ok && sv.asmOk && !sv.bin.empty()) ok = WriteBinaryFile(sv.path, sv.bin);
-
-    sv.dirty = !ok;
-    g_App.status = ok ? ("Saved " + sv.name + " + " + FileNameOf(asmOut))
-                      : ("FAILED to save " + sv.name);
-    return true;
-}
-
-static void LoadZombieFolder(const std::string& dir)
-{
-    for (const std::string& p : ListDirFiles(dir))
-    {
-        const std::string fn = FileNameOf(p);
-        if (!ExtOf(fn).empty()) continue;             // binaries only
-
-        std::vector<unsigned char> bytes;
-        if (!ReadBinaryFile(p, bytes)) continue;
-        if (bytes.size() > 512) bytes.resize(512);
-
-        Zombie z;
-        z.speed = g_App.zombieSpeed;
-        z.name  = StemOf(fn);
-        z.tint  = kPlayerTints[(g_App.zombies.size() + 3) % (sizeof(kPlayerTints) / sizeof(kPlayerTints[0]))];
-        z.sv.name = fn;
-        z.sv.path = p;
-        ListSurvivor(z.sv, bytes);
-        z.sv.present = true;
-        z.sv.enabled = true;
-        z.sv.dirty   = false;
-        // A trailing "h" is how the reference repository marks the heavy kind.
-        const std::string stem = ToLower(StemOf(fn));
-        z.heavy = !stem.empty() && stem[stem.size() - 1] == 'h';
-        g_App.zombies.push_back(std::move(z));
-    }
-}
-
-static void LoadWorkspaceFolder(const std::string& root)
-{
-    if (root.empty() || !DirExists(root)) { g_App.status = "No such folder"; return; }
-
-    const std::string aDir = JoinPath(root, kAsmDir);
-    const std::string sDir = JoinPath(root, kSurvDir);
-    const std::string zDir = JoinPath(root, kZombDir);
-    const bool structured = DirExists(aDir) || DirExists(sDir) || DirExists(zDir);
-
-    if (!structured)
-    {
-        // Nothing to load from yet. Ask, sort, or fall back to a flat read.
-        if (g_App.folderSortMode == 0) { g_SortPromptRoot = root; return; }
-        if (g_App.folderSortMode == 1) SortFolderIntoSubfolders(root);
-    }
-
-    g_App.lastFolder = root;
-    ClearWorkspace();
-
-    if (!structured && g_App.folderSortMode == 2)
-    {
-        // "Open as-is": the same as selecting every file in the folder and
-        // dropping it on the window -- nothing moved, assembled or written.
-        // Each directory inside it comes in as a folder of survivors.
-        std::vector<std::string> files = ListDirFiles(root);
-        size_t count = files.size();
-        ImportFiles(files);
-        for (const std::string& sub : ListSubDirs(root))
-        {
-            if (CleanFolderName(sub).empty() || !LooksLikeSurvivorFolder(JoinPath(root, sub))) continue;
-            const std::vector<std::string> inside = ListDirFiles(JoinPath(root, sub));
-            EnsureFolder(sub);
-            ImportFiles(inside, sub);
-            count += inside.size();
-        }
-        if (!g_App.players.empty())
-        {
-            const std::vector<Ref> rows = FlatRows();
-            Ref r = rows.empty() ? Ref() : rows[0];
-            if (r.Valid()) { r.slot = g_App.players[r.player].FirstLoaded(); }
-            if (r.Valid() && r.slot >= 0) { g_App.selection.assign(1, r); g_App.anchor = r; OpenInEditor(r); }
-        }
-        g_App.status = FileNameOf(root) + ": opened as-is, " + std::to_string((int)g_App.players.size())
-                     + " group(s)" + (g_App.folders.empty() ? std::string()
-                                      : " in " + std::to_string((int)g_App.folders.size()) + " folder(s)")
-                     + " from " + std::to_string((int)count) + " file(s)";
-        return;
-    }
-
-    int assembled = 0, disassembled = 0;
-
-    // One level of the tree: the top of assembly / survivors when `sub` is
-    // empty, otherwise the folder of that name inside each of them.
-    auto loadLevel = [&](const std::string& sub) {
-        const std::string aAt = sub.empty() ? aDir : JoinPath(aDir, sub);
-        const std::string sAt = sub.empty() ? sDir : JoinPath(sDir, sub);
-
-        // A folder that exists on one side only gets its twin when the option
-        // that would fill it is on, so the two trees keep the same shape.
-        if (!sub.empty())
-        {
-            if (DirExists(aDir) && DirExists(sAt) && !DirExists(aAt) && g_App.folderDisassemble) EnsureDir(aAt);
-            if (DirExists(sDir) && DirExists(aAt) && !DirExists(sAt) && g_App.folderAssemble)    EnsureDir(sAt);
-        }
-        if (DirExists(aAt) && DirExists(sAt)) SyncFolderPair(aAt, sAt, assembled, disassembled);
-
-        // Binaries define who runs; the matching source, if any, replaces the
-        // disassembly so the editor shows what the author actually wrote.
-        if (DirExists(sAt))
-        {
-            std::vector<std::string> bins;
-            for (const std::string& p : ListDirFiles(sAt))
-                if (ExtOf(FileNameOf(p)).empty()) bins.push_back(p);
-            LoadBinarySurvivorFiles(bins, sub);
-        }
-
-        if (DirExists(aAt))
-        {
-            for (const std::string& p : ListDirFiles(aAt))
-            {
-                if (ExtOf(FileNameOf(p)) != ".asm") continue;
-                std::string text;
-                if (!ReadTextFile(p, text)) continue;
-
-                const std::string stem = StemOf(FileNameOf(p));
-                Survivor* found = NULL;
-                for (Player& pl : g_App.players)
-                {
-                    if (ToLower(pl.folder) != ToLower(sub)) continue;   // the same name in another folder is another warrior
-                    for (int k = 0; k < kSlotCount && !found; k++)
-                        if (pl.slots[k].present && StemOf(pl.slots[k].name) == stem) found = &pl.slots[k];
-                }
-
-                if (found)
-                {
-                    found->code = text;
-                    found->path = p;                   // saving edits the source, not the binary
-                    found->dirty = false;
-                    ReassembleSurvivor(*found);
-                }
-                else
-                {
-                    LoadSurvivorFiles(std::vector<std::string>(1, p), sub);
-                }
-            }
-        }
-    };
-
-    loadLevel(std::string());
-
-    // Folders of survivors: every directory inside survivors/ or assembly/.
-    {
-        std::vector<std::string> subs = ListSubDirs(sDir);
-        for (const std::string& s : ListSubDirs(aDir))
-        {
-            bool have = false;
-            for (const std::string& t : subs) if (ToLower(t) == ToLower(s)) have = true;
-            if (!have) subs.push_back(s);
-        }
-        std::sort(subs.begin(), subs.end(), [](const std::string& a, const std::string& b) {
-            return ToLower(a) < ToLower(b);
-        });
-        for (const std::string& sub : subs)
-        {
-            if (CleanFolderName(sub).empty()) continue;
-            EnsureFolder(sub);
-            loadLevel(sub);
-        }
-    }
-
-    if (DirExists(zDir)) LoadZombieFolder(zDir);
-
-    // Every source-only survivor still needs assembling before it can run.
-    for (Player& pl : g_App.players)
-        for (int k = 0; k < kSlotCount; k++)
-            if (pl.slots[k].present && pl.slots[k].bin.empty()) ReassembleSurvivor(pl.slots[k]);
-
-    if (!g_App.players.empty())
-    {
-        // the first row the groups bar shows, which with folders is not player 0
-        const std::vector<Ref> rows = FlatRows();
-        Ref r; r.player = rows.empty() ? 0 : rows[0].player;
-        r.slot = g_App.players[r.player].FirstLoaded();
-        if (r.slot >= 0) { g_App.selection.assign(1, r); g_App.anchor = r; OpenInEditor(r); }
-    }
-
-    char buf[224];
-    snprintf(buf, sizeof(buf), "%s: %d group(s)%s, %d zombie(s)%s%s",
-             FileNameOf(root).c_str(), (int)g_App.players.size(),
-             g_App.folders.empty() ? "" : (" in " + std::to_string((int)g_App.folders.size()) + " folder(s)").c_str(),
-             (int)g_App.zombies.size(),
-             assembled    ? (" - assembled "    + std::to_string(assembled)).c_str()    : "",
-             disassembled ? (" - disassembled " + std::to_string(disassembled)).c_str() : "");
-    g_App.status = buf;
-}
-
-static void OpenWorkspaceFolder()
-{
-    const std::string dir = BrowseForFolder(g_Hwnd, "Open a CoreWars folder");
-    if (!dir.empty()) LoadWorkspaceFolder(dir);
-}
-
-// The old two-dialog flow, kept as an escape hatch for files that are not laid
-// out as a folder.
-static void ImportLooseFiles()
-{
-    std::vector<std::string> paths = OpenBinaryDialog(g_Hwnd);
-    std::vector<std::string> src, bin;
-    for (const std::string& p : paths)
-        (ExtOf(FileNameOf(p)) == ".asm" ? src : bin).push_back(p);
-    if (!bin.empty()) LoadBinarySurvivorFiles(bin);
-    if (!src.empty())
-    {
-        LoadSurvivorFiles(src);
-        for (Player& pl : g_App.players)
-            for (int k = 0; k < kSlotCount; k++)
-                if (pl.slots[k].present && pl.slots[k].bin.empty()) ReassembleSurvivor(pl.slots[k]);
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Folders of groups, on disk
-//
-// A folder in the groups bar is a directory: survivors/<folder> and
-// assembly/<folder> in a sorted workspace, <folder> itself in a flat one. Filing
-// a group therefore moves its files, so the arrangement is still there the next
-// time the folder is opened. Survivors that are not files of the open workspace
-// -- new ones, or ones imported from somewhere else -- are only labelled.
-// -----------------------------------------------------------------------------
-struct WsPlace
-{
-    bool        ok = false;
-    std::string root;      // the open workspace
-    std::string base;      // the directory folders hang off: root, or root\survivors, root\assembly
-    std::string kind;      // "assembly" / "survivors", or empty in a flat workspace
-    std::string sub;       // the folder the file is in now, or empty
-    std::string file;
-};
-
-static WsPlace PlaceOf(const std::string& path)
-{
-    WsPlace w;
-    std::string root = g_App.lastFolder;
-    while (!root.empty() && (root.back() == '\\' || root.back() == '/')) root.pop_back();
-    if (root.empty() || path.size() < root.size() + 2) return w;
-    if (ToLower(path.substr(0, root.size())) != ToLower(root)) return w;
-    if (path[root.size()] != '\\' && path[root.size()] != '/') return w;
-
-    std::vector<std::string> parts;
-    std::string cur;
-    for (size_t i = root.size() + 1; i <= path.size(); i++)
-    {
-        if (i == path.size() || path[i] == '\\' || path[i] == '/')
-        {
-            if (!cur.empty()) parts.push_back(cur);
-            cur.clear();
-        }
-        else cur.push_back(path[i]);
-    }
-    if (parts.empty()) return w;
-
-    size_t at = 0;
-    w.root = root;
-    w.base = root;
-    const std::string first = ToLower(parts[0]);
-    if (parts.size() >= 2 && (first == kAsmDir || first == kSurvDir))
-    {
-        w.kind = first;
-        w.base = JoinPath(root, parts[0]);
-        at = 1;
-    }
-    // In a sorted workspace only what is under assembly / survivors is loaded
-    // from it, so a file lying anywhere else there is not part of the layout.
-    if (w.kind.empty() && (DirExists(JoinPath(root, kAsmDir)) || DirExists(JoinPath(root, kSurvDir)) ||
-                           DirExists(JoinPath(root, kZombDir))))
-        return w;
-    const size_t depth = parts.size() - 1 - at;       // directories between the base and the file
-    if (depth > 1) return w;                          // deeper than one folder: not ours to move
-    if (depth == 1) w.sub = parts[at];
-    if (IsLayoutDirName(w.sub)) return w;             // zombies\x in a sorted workspace
-    w.file = parts.back();
-    w.ok = true;
-    return w;
-}
-
-static bool PathExists(const std::string& p)
-{
-    return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
-}
-
-// Where the survivor's file would go, or empty when filing it moves nothing.
-static std::string RefileTarget(const Survivor& sv, const std::string& folder)
-{
-    if (sv.path.empty()) return std::string();
-    const WsPlace at = PlaceOf(sv.path);
-    if (!at.ok || ToLower(at.sub) == ToLower(folder)) return std::string();
-    return JoinPath(folder.empty() ? at.base : JoinPath(at.base, folder), at.file);
-}
-
-static bool RefileSurvivor(Survivor& sv, const std::string& folder, std::string& err)
-{
-    const std::string dst = RefileTarget(sv, folder);
-    if (dst.empty()) return true;
-    const WsPlace at = PlaceOf(sv.path);
-
-    if (!EnsureDir(ParentDir(dst))) { err = "could not create " + ParentDir(dst); return false; }
-    if (!MoveFileA(sv.path.c_str(), dst.c_str())) { err = "could not move " + at.file; return false; }
-    const std::string oldDir = ParentDir(sv.path);
-    sv.path = dst;
-
-    // The other form of the same warrior -- the binary beside its source --
-    // goes with it, so the two trees keep the same shape.
-    if (!at.kind.empty())
-    {
-        const bool isAsm = (at.kind == kAsmDir);
-        const std::string otherBase = JoinPath(at.root, isAsm ? kSurvDir : kAsmDir);
-        const std::string otherName = isAsm ? StemOf(at.file) : StemOf(at.file) + ".asm";
-        const std::string otherOldDir = at.sub.empty() ? otherBase : JoinPath(otherBase, at.sub);
-        const std::string otherNewDir = folder.empty() ? otherBase : JoinPath(otherBase, folder);
-        const std::string from = JoinPath(otherOldDir, otherName), to = JoinPath(otherNewDir, otherName);
-        if (PathExists(from) && !PathExists(to) && EnsureDir(otherNewDir))
-            MoveFileA(from.c_str(), to.c_str());
-        if (!at.sub.empty()) RemoveDirectoryA(otherOldDir.c_str());   // only goes once it is empty
-    }
-    if (!at.sub.empty()) RemoveDirectoryA(oldDir.c_str());
-    return true;
-}
-
-// The directories a folder of the open workspace can exist under.
-static std::vector<std::string> FolderBases()
-{
-    std::vector<std::string> out;
-    const std::string root = g_App.lastFolder;
-    if (root.empty() || !DirExists(root)) return out;
-    const std::string a = JoinPath(root, kAsmDir), s = JoinPath(root, kSurvDir);
-    if (DirExists(a)) out.push_back(a);
-    if (DirExists(s)) out.push_back(s);
-    if (out.empty()) out.push_back(root);
-    return out;
-}
-
-static void MovePlayersToFolder(const std::vector<int>& players, const std::string& folderRaw)
-{
-    FlushEditorToModel();
-    std::string folder;
-    if (!folderRaw.empty())
-    {
-        folder = CleanFolderName(folderRaw);
-        if (folder.empty()) { g_App.status = "\"" + folderRaw + "\" is not a usable folder name"; return; }
-        folder = g_App.folders[EnsureFolder(folder)].name;       // an existing folder keeps its spelling
-    }
-
-    int moved = 0, files = 0;
-    std::string firstErr;
-    for (int pi : players)
-    {
-        if (pi < 0 || pi >= (int)g_App.players.size()) continue;
-        Player& pl = g_App.players[pi];
-        if (ToLower(pl.folder) == ToLower(folder)) { pl.folder = folder; continue; }
-
-        // Refuse rather than half-move: a group of that name already there, or
-        // a file in the way, and this group stays where it is.
-        std::string why;
-        for (int q = 0; q < (int)g_App.players.size() && why.empty(); q++)
-            if (q != pi && ToLower(g_App.players[q].name) == ToLower(pl.name) &&
-                ToLower(g_App.players[q].folder) == ToLower(folder))
-                why = (folder.empty() ? std::string("there is already a loose group")
-                                      : folder + " already has a group") + " called " + pl.name;
-        for (const Survivor& sv : pl.slots)
-        {
-            if (!sv.present || !why.empty()) continue;
-            const std::string dst = RefileTarget(sv, folder);
-            if (!dst.empty() && PathExists(dst)) why = FileNameOf(dst) + " already exists in " + FileNameOf(ParentDir(dst));
-        }
-        if (!why.empty()) { if (firstErr.empty()) firstErr = why; continue; }
-
-        for (Survivor& sv : pl.slots)
-        {
-            if (!sv.present) continue;
-            const std::string before = sv.path;
-            std::string e;
-            if (!RefileSurvivor(sv, folder, e)) { if (firstErr.empty()) firstErr = e; }
-            else if (sv.path != before) files++;
-        }
-        pl.folder = folder;
-        moved++;
-    }
-
-    std::string s = "Moved " + std::to_string(moved) + " group(s) " +
-                    (folder.empty() ? std::string("out of their folder") : "into " + folder);
-    if (files) s += "  (" + std::to_string(files) + " file(s) moved on disk)";
-    if (!firstErr.empty()) s += (moved ? "  -- skipped some: " : "  -- ") + firstErr;
-    g_App.status = (moved || !firstErr.empty()) ? s : "Already there";
-}
-
-// Forget a folder that has nobody left in it, and its (empty) directories.
-static void DropFolderIfEmpty(const std::string& name)
-{
-    const int fi = FolderIndex(name);
-    if (fi < 0 || !PlayersInFolder(name).empty()) return;
-    for (const std::string& base : FolderBases())
-        RemoveDirectoryA(JoinPath(base, name).c_str());      // refuses unless empty, which is the point
-    g_App.folders.erase(g_App.folders.begin() + fi);
-}
-
-static void RenameGroupFolder(int fi, const std::string& raw)
-{
-    if (fi < 0 || fi >= (int)g_App.folders.size()) return;
-    const std::string name = CleanFolderName(raw);
-    if (name.empty()) { g_App.status = "\"" + raw + "\" is not a usable folder name"; return; }
-    const std::string old = g_App.folders[fi].name;
-    if (name == old) return;
-    const std::vector<int> members = PlayersInFolder(old);
-
-    const int other = FolderIndex(name);
-    if (other >= 0 && other != fi)
-    {
-        // renamed onto a folder that exists: the two become one
-        MovePlayersToFolder(members, g_App.folders[other].name);
-        DropFolderIfEmpty(old);
-        return;
-    }
-    if (ToLower(name) == ToLower(old))
-    {
-        // only the capitals changed; Windows sees the same directory
-        g_App.folders[fi].name = name;
-        for (int p : members) g_App.players[p].folder = name;
-        g_App.status = "Renamed to " + name;
-        return;
-    }
-
-    // An empty directory moves in one go; anything with files in it is refiled
-    // survivor by survivor so each one's path is known afterwards.
-    if (members.empty())
-        for (const std::string& base : FolderBases())
-            if (DirExists(JoinPath(base, old)) && !PathExists(JoinPath(base, name)))
-                MoveFileA(JoinPath(base, old).c_str(), JoinPath(base, name).c_str());
-    g_App.folders[fi].name = name;
-    MovePlayersToFolder(members, name);
-    for (const std::string& base : FolderBases())
-        RemoveDirectoryA(JoinPath(base, old).c_str());
-    // anyone who could not be moved is still in the old folder, on disk and here
-    if (!PlayersInFolder(old).empty()) EnsureFolder(old);
-    else                               g_App.status = "Renamed " + old + " to " + name;
-}
-
-static void RunFolderOp()
-{
-    FolderOp op = g_FolderOp;
-    g_FolderOp = FolderOp();
-    AppState& S = g_App;
-    switch (op.kind)
-    {
-    case FolderOp::None: return;
-
-    case FolderOp::Move:
-        MovePlayersToFolder(op.players, op.name);
-        if (!op.name.empty())
-        {
-            const int fi = FolderIndex(CleanFolderName(op.name));
-            if (fi >= 0) S.folders[fi].collapsed = false;      // show where they went
-        }
-        break;
-
-    case FolderOp::Rename:
-        RenameGroupFolder(op.folder, op.name);
-        break;
-
-    case FolderOp::New:
-    {
-        std::string name = CleanFolderName(op.name);
-        for (int n = 1; name.empty() || FolderIndex(name) >= 0; n++)
-            name = "Folder " + std::to_string(n);
-        EnsureFolder(name);
-        S.status = "Created " + name + " -- drag groups onto it, or right-click it to rename";
-        break;
-    }
-
-    case FolderOp::Ungroup:
-    {
-        if (op.folder < 0 || op.folder >= (int)S.folders.size()) break;
-        const std::string name = S.folders[op.folder].name;
-        MovePlayersToFolder(PlayersInFolder(name), std::string());
-        DropFolderIfEmpty(name);
-        break;
-    }
-
-    case FolderOp::Close:
-    {
-        // Out of the workspace, like closing a group: nothing on disk is touched.
-        if (op.folder < 0 || op.folder >= (int)S.folders.size()) break;
-        const std::string name = S.folders[op.folder].name;
-        std::vector<int> members = PlayersInFolder(name);
-        FlushEditorToModel();
-        for (size_t i = members.size(); i-- > 0; )
-            S.players.erase(S.players.begin() + members[i]);
-        S.folders.erase(S.folders.begin() + op.folder);
-        S.selection.clear();
-        S.anchor = Ref();
-        S.open = Ref();
-        S.editor.SetText("");
-        S.editor.SetReadOnly(true);
-        S.status = "Closed " + name + "  (" + std::to_string((int)members.size()) + " group(s))";
-        break;
-    }
-    }
-}
-
+// The folder flow lives in gui_workspace.inl now (included from main.cpp).
 // -----------------------------------------------------------------------------
 // Zombie section of the groups bar
 // -----------------------------------------------------------------------------
-static void AddZombieFiles()
-{
-    for (const std::string& p : OpenBinaryDialog(g_Hwnd))
-    {
-        std::vector<unsigned char> bytes;
-        if (!ReadBinaryFile(p, bytes)) continue;
-        if (bytes.size() > 512) bytes.resize(512);
-        Zombie z;
-        z.speed = g_App.zombieSpeed;          // the default; each row can differ
-        z.name  = StemOf(FileNameOf(p));
-        z.tint  = kPlayerTints[(g_App.zombies.size() + 3) % (sizeof(kPlayerTints) / sizeof(kPlayerTints[0]))];
-        z.sv.name = FileNameOf(p);
-        z.sv.path = p;
-        ListSurvivor(z.sv, bytes);
-        z.sv.present = true;
-        g_App.zombies.push_back(std::move(z));
-    }
-}
-
 static float g_ZombieDragAcc = 0.0f;   // pixels banked while dragging a speed pill
 
-// A zombie written from scratch, exactly the way New player seeds a survivor.
-static void NewZombie()
-{
-    Zombie z;
-    char n[48];
-    snprintf(n, sizeof(n), "Zombie %d", (int)g_App.zombies.size() + 1);
-    z.name  = n;
-    z.tint  = kPlayerTints[(g_App.zombies.size() + 3) % (sizeof(kPlayerTints) / sizeof(kPlayerTints[0]))];
-    z.speed = g_App.zombieSpeed;
-    z.sv.name    = "zombie.asm";
-    z.sv.code    = kTemplate;
-    z.sv.present = true;
-    z.sv.dirty   = true;
-    ReassembleSurvivor(z.sv);
-    g_App.zombies.push_back(std::move(z));
-
-    Ref r; r.player = kZombiePlayer; r.slot = (int)g_App.zombies.size() - 1;
-    g_App.selection.assign(1, r);
-    g_App.anchor = r;
-    OpenInEditor(r);
-    g_App.status = std::string("Created ") + n;
-}
+// The cycles a zombie really gets per turn: its speed, twice over when it is
+// heavy (the engine doubles a ZOMBIE_H's speed -- see War's zombie turn).
+static int ZombieCycles(const Zombie& z) { return z.speed * (z.heavy ? 2 : 1); }
 
 // One zombie as a single chip, for the collapsed groups strip. Zombies have no
 // second survivor, so the row is one chip wide with the same gestures.
@@ -860,10 +32,10 @@ static void ZombieChip(int zi, float size)
 
     const bool selected = IsSelected(ref);
     ImU32 bg, fg, border = 0;
-    if (!z.sv.enabled)      { bg = HexU(Col::Bg2, 0.55f); fg = HexU(Col::TextDim); }
+    if (!z.sv.enabled)      { bg = HexU(Col::Bg2, 0.7f); fg = HexU(Col::TextDim); border = HexU(z.tint, selected ? 0.95f : 0.55f); }
     else if (selected)      { bg = HexU(b.held ? Col::Bg4 : (b.hovered ? Col::Bg3 : Col::Bg2));
                               fg = HexU(z.tint); border = HexU(z.tint, 0.95f); }
-    else                    { bg = HexU(z.tint, b.hovered ? 1.0f : 0.82f); fg = HexU(Col::Bg0); }
+    else                    { bg = HexU(z.tint, b.hovered ? 1.0f : 0.85f); fg = HexU(Col::Bg0); }
 
     const float r = 6.0f * g_Scale;
     dl->AddRectFilled(b.mn, b.mx, bg, r);
@@ -873,8 +45,8 @@ static void ZombieChip(int zi, float size)
     dl->AddText(ImVec2((b.mn.x + b.mx.x - ts.x) * 0.5f, (b.mn.y + b.mx.y - ts.y) * 0.5f), fg, lbl);
     DrawLongPressHint(b.mn, b.mx);
 
-    if (b.hovered) ImGui::SetTooltip("%s  x%d%s", z.name.c_str(), z.speed,
-                                     z.heavy ? "  (heavy)" : "");
+    if (b.hovered) ImGui::SetTooltip("%s  x%d%s  -  %s", z.name.c_str(), ZombieCycles(z),
+                                     z.heavy ? "  (heavy)" : "", z.sv.enabled ? "active" : "not active");
     if (clicked) HandleRowClick(ref, true);
     ImGui::PopID();
 }
@@ -884,48 +56,67 @@ static void DrawZombieSection()
     AppState& S = g_App;
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    ImGui::Dummy(ImVec2(0, 8 * g_Scale));
+    ImGui::Dummy(ImVec2(0, 10 * g_Scale));
+    const ImVec2 sectionTop = ImGui::GetCursorScreenPos();
 
     // --- header ------------------------------------------------------------
     {
         const ImVec2 o = ImGui::GetCursorScreenPos();
         const float  w = ImGui::GetContentRegionAvail().x;
-        const float  h = 20.0f * g_Scale;
+        const float  bs = 22.0f * g_Scale;
+        const float  h = bs + 12 * g_Scale;
         dl->AddLine(ImVec2(o.x, o.y), ImVec2(o.x + w, o.y), HexU(Col::Line));
-        dl->AddText(ImVec2(o.x + 2 * g_Scale, o.y + 5 * g_Scale), HexU(Col::TextDim), "ZOMBIES");
+        const ImVec2 ts = ImGui::CalcTextSize("Zombies");
+        dl->AddText(ImVec2(o.x + 4 * g_Scale, o.y + (h - ts.y) * 0.5f + 2 * g_Scale), HexU(Col::Text), "Zombies");
+        {
+            int active = 0;
+            for (const Zombie& z : S.zombies) if (z.sv.enabled) active++;
+            char n[24];
+            if (active == (int)S.zombies.size()) snprintf(n, sizeof(n), "%d", (int)S.zombies.size());
+            else                                  snprintf(n, sizeof(n), "%d/%d", active, (int)S.zombies.size());
+            ImGui::PushFont(NULL, ImGui::GetFontSize() * 0.82f);
+            const ImVec2 ns = ImGui::CalcTextSize(n);
+            const float ph = ns.y + 4 * g_Scale, pw = ImMax(ph, ns.x + 10 * g_Scale);
+            const ImVec2 pmn(o.x + 4 * g_Scale + ts.x + 7 * g_Scale, o.y + (h - ph) * 0.5f + 2 * g_Scale);
+            dl->AddRectFilled(pmn, ImVec2(pmn.x + pw, pmn.y + ph), HexU(Col::Bg3), ph * 0.5f);
+            dl->AddText(ImVec2(pmn.x + (pw - ns.x) * 0.5f, pmn.y + 2 * g_Scale), HexU(Col::TextDim), n);
+            ImGui::PopFont();
+        }
 
-        const float bs = 16.0f * g_Scale;
-        ImGui::SetCursorScreenPos(ImVec2(o.x + w - bs, o.y + 4 * g_Scale));
+        // new zombie
+        ImGui::SetCursorScreenPos(ImVec2(o.x + w - bs, o.y + (h - bs) * 0.5f + 2 * g_Scale));
         BtnState b = BareButton("##znew", ImVec2(bs, bs));
-        if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 4 * g_Scale);
-        DrawGlyphPlus(dl, ImVec2((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f), 4 * g_Scale,
-                      HexU(Col::TextDim));
-        if (b.hovered) ImGui::SetTooltip("New zombie");
-        if (b.clicked) NewZombie();
+        dl->AddRectFilled(b.mn, b.mx, HexU(b.held ? Col::Bg4 : b.hovered ? Col::Bg3 : Col::Bg2), 6 * g_Scale);
+        DrawGlyphPlus(dl, ImVec2((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f), 4.5f * g_Scale,
+                      HexU(b.hovered ? Col::Text : Col::TextDim));
+        if (b.hovered) ImGui::SetTooltip("New zombie\nZombie files you paste or drop here land in zombies too");
+        if (b.clicked) QueueWsOp(WsOp::NewZombie);
 
-        ImGui::SetCursorScreenPos(ImVec2(o.x + w - bs * 2 - 4 * g_Scale, o.y + 4 * g_Scale));
-        b = BareButton("##zadd", ImVec2(bs, bs));
-        if (b.hovered) dl->AddRectFilled(b.mn, b.mx, HexU(Col::Bg3), 4 * g_Scale);
-        DrawGlyphFolder(dl, ImVec2((b.mn.x + b.mx.x) * 0.5f, (b.mn.y + b.mx.y) * 0.5f), 4 * g_Scale,
-                        HexU(Col::TextDim));
-        if (b.hovered) ImGui::SetTooltip("Load zombie binaries");
-        if (b.clicked) AddZombieFiles();
-
-        ImGui::SetCursorScreenPos(ImVec2(o.x, o.y + h + 3 * g_Scale));
+        ImGui::SetCursorScreenPos(ImVec2(o.x, o.y + h + 4 * g_Scale));
     }
 
-    if (S.zombies.empty())
+    // the zombies deleted a moment ago, by where they were
+    std::vector<GhostRef> ghosts;
+    for (size_t bi = 0; bi < g_Trash.size(); bi++)
+    {
+        const float a = GhostAlpha(g_Trash[bi]);
+        if (a <= 0.0f) continue;
+        for (const GhostRow& g : g_Trash[bi].ghosts)
+            if (g.kind == 2) ghosts.push_back(GhostRef{ &g, a, bi + 1 == g_Trash.size() });
+    }
+    const float rowH = 28.0f * g_Scale;
+
+    if (S.zombies.empty() && ghosts.empty())
     {
         ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::TextDim));
         ImGui::TextWrapped("None yet.");
         ImGui::PopStyleColor();
-        return;
     }
 
     // --- rows --------------------------------------------------------------
-    const float rowH = 24.0f * g_Scale;
     for (int zi = 0; zi < (int)S.zombies.size(); zi++)
     {
+        for (const GhostRef& g : ghosts) if (g.row->pos == zi) DrawGhostRow(*g.row, g.alpha, g.newest, rowH);
         Zombie& z = S.zombies[zi];
         Ref ref; ref.player = kZombiePlayer; ref.slot = zi;
 
@@ -933,74 +124,105 @@ static void DrawZombieSection()
         const float avail = ImGui::GetContentRegionAvail().x;
         const ImVec2 rowStart = ImGui::GetCursorScreenPos();
 
-        bool clicked = ImGui::Selectable("##zrow", IsSelected(ref), ImGuiSelectableFlags_AllowOverlap,
+        const bool selected = IsSelected(ref);
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+        bool clicked = ImGui::Selectable("##zrow", selected, ImGuiSelectableFlags_AllowOverlap,
                                          ImVec2(avail, rowH));
+        ImGui::PopStyleColor(3);
         const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        const bool rowHovered = ImGui::IsItemHovered(), rowHeld = ImGui::IsItemActive();
         if (CheckLongPress(clicked)) ToggleRefEnabled(ref);
+        if (selected)
+        {
+            dl->AddRectFilled(mn, mx, HexU(Col::Accent, rowHovered ? 0.20f : 0.15f), 7 * g_Scale);
+            dl->AddRect(mn, mx, HexU(Col::Accent, 0.35f), 7 * g_Scale, 0, 1.0f);
+        }
+        else if (rowHovered || rowHeld)
+            dl->AddRectFilled(mn, mx, HexU(rowHeld ? Col::Bg3 : Col::Bg2), 7 * g_Scale);
         DrawLongPressHint(mn, mx);
+        const bool renaming = RenamingRef(ref);
 
         // Attached here, not further down: BeginPopupContextItem hangs off
         // whatever item was submitted last, and below this point that is the
         // speed pill rather than the row.
         if (ImGui::BeginPopupContextItem("##zctx"))
         {
-            if (ImGui::IsWindowAppearing())
-                snprintf(g_RenameBuf, sizeof(g_RenameBuf), "%s", z.name.c_str());
-            ImGui::SetNextItemWidth(180 * g_Scale);
-            if (ImGui::InputText("##zrename", g_RenameBuf, sizeof(g_RenameBuf),
-                                 ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
+            if (MultiSelected(ref)) SharedContextMenu(ref);
+            else
             {
-                if (g_RenameBuf[0]) { z.name = g_RenameBuf; S.status = "Renamed to " + z.name; }
-                ImGui::CloseCurrentPopup();
-            }
-            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(-1);
-
-            float zc[3] = { ((z.tint >> 16) & 0xFF) / 255.0f,
-                            ((z.tint >>  8) & 0xFF) / 255.0f,
-                            ( z.tint        & 0xFF) / 255.0f };
-            if (ImGui::ColorEdit3("Colour", zc,
-                                  ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel))
-                z.tint = ((unsigned)(zc[0] * 255.0f + 0.5f) << 16) |
-                         ((unsigned)(zc[1] * 255.0f + 0.5f) <<  8) |
-                          (unsigned)(zc[2] * 255.0f + 0.5f);
-            ImGui::Separator();
-            ImGui::MenuItem("Heavy (double speed)", NULL, &z.heavy);
-            if (ImGui::MenuItem(z.sv.enabled ? "Disable" : "Enable")) ToggleRefEnabled(ref);
-            if (ImGui::MenuItem("Remove"))
-            {
-                if (S.open == ref) { S.open = Ref(); S.editor.SetText(""); S.editor.SetReadOnly(true); }
-                S.zombies.erase(S.zombies.begin() + zi);
-                ImGui::EndPopup();
-                ImGui::PopID();
-                break;
+                ImGui::TextDisabled("%s", z.name.c_str());
+                ImGui::Separator();
+                if (ImGui::MenuItem("Rename", "F2")) BeginInlineRename(ref);
+                float zc[3] = { ((z.tint >> 16) & 0xFF) / 255.0f,
+                                ((z.tint >>  8) & 0xFF) / 255.0f,
+                                ( z.tint        & 0xFF) / 255.0f };
+                if (ImGui::ColorEdit3("Colour", zc,
+                                      ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel))
+                    z.tint = ((unsigned)(zc[0] * 255.0f + 0.5f) << 16) |
+                             ((unsigned)(zc[1] * 255.0f + 0.5f) <<  8) |
+                              (unsigned)(zc[2] * 255.0f + 0.5f);
+                ImGui::Separator();
+                ImGui::MenuItem("Heavy (double speed)", NULL, &z.heavy);
+                if (ImGui::MenuItem("Active", "Ctrl+Q", z.sv.enabled)) ToggleRefEnabled(ref);
+                if (ImGui::MenuItem("Export...")) ExportOpen(ExportKeysFor(ref));
+                if (ImGui::MenuItem("Reveal in Explorer"))
+                    RevealInExplorer(PathExists(z.sv.binPath) ? z.sv.binPath : z.sv.asmPath);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Delete", "Del")) QueueDelete(std::vector<RefKey>(1, KeyOfRef(ref)));
             }
             ImGui::EndPopup();
         }
 
-
-        dl->AddRectFilled(ImVec2(mn.x, mn.y + 3 * g_Scale), ImVec2(mn.x + 3 * g_Scale, mx.y - 3 * g_Scale),
-                          HexU(z.tint, z.sv.enabled ? 1.0f : 0.30f), 1.5f * g_Scale);
-
         // Speed reads as a small pill rather than a framed slider -- a 24px row
         // has no room for one, and drag-to-change is the same gesture anyway.
+        // It shows what the zombie really gets: a heavy x2 is x4.
         char sp[8];
-        snprintf(sp, sizeof(sp), "x%d", z.speed);
-        const float pillW = ImMax(ImGui::CalcTextSize("x8").x + 12 * g_Scale, 26.0f * g_Scale);
+        snprintf(sp, sizeof(sp), "x%d", ZombieCycles(z));
+        const float pillW = ImMax(ImGui::CalcTextSize("x16").x + 12 * g_Scale, 26.0f * g_Scale);
         const float pillH = ImGui::GetTextLineHeight() + 4 * g_Scale;
 
+        const float av = 18.0f * g_Scale;
+        const ImVec2 amn(mn.x + 6 * g_Scale, mn.y + (rowH - av) * 0.5f), amx(amn.x + av, amn.y + av);
         const ImVec2 nsz = ImGui::CalcTextSize(z.name.c_str());
-        const float tx = mn.x + 12 * g_Scale, tyy = mn.y + (rowH - nsz.y) * 0.5f;
-        dl->PushClipRect(mn, ImVec2(mx.x - pillW - 12 * g_Scale, mx.y), true);
-        dl->AddText(ImVec2(tx, tyy), z.sv.enabled ? HexU(Col::Text) : HexU(Col::TextDim), z.name.c_str());
-        if (!z.sv.enabled)
-            dl->AddLine(ImVec2(tx, tyy + nsz.y * 0.55f), ImVec2(tx + nsz.x, tyy + nsz.y * 0.55f),
-                        HexU(Col::Danger, 0.85f), 1.2f);
-        dl->PopClipRect();
+        const float tx = amx.x + 9 * g_Scale, tyy = mn.y + (rowH - nsz.y) * 0.5f;
+        if (!renaming)
+        {
+            dl->PushClipRect(mn, ImVec2(mx.x - pillW - 12 * g_Scale, mx.y), true);
+            dl->AddText(ImVec2(tx, tyy), z.sv.enabled ? HexU(Col::Text) : HexU(Col::TextDim), z.name.c_str());
+            dl->PopClipRect();
+        }
 
-        if (ImGui::IsItemHovered() && !ImGui::IsAnyItemActive())
-            ImGui::SetTooltip("%s%s\n\nClick: open in the editor\nRight-click: rename, colour, heavy\nHold: %s",
+        if (rowHovered && !ImGui::IsAnyItemActive())
+            ImGui::SetTooltip("%s%s - %s\n\nClick: open in the editor\nClick the square or hold the row: %s\n"
+                              "F2: rename   Del: delete   right-click: colour, heavy",
                               z.name.c_str(), z.heavy ? "  (heavy - double speed)" : "",
-                              z.sv.enabled ? "disable" : "enable");
+                              z.sv.enabled ? "active" : "not active",
+                              z.sv.enabled ? "take it out" : "make it active");
+
+        // avatar, like a group's: solid when active, an outline when not, and
+        // a click on it is the switch
+        {
+            ImGui::SetCursorScreenPos(amn);
+            BtnState ab = BareButton("##zavatar", ImVec2(av, av));
+            if (z.sv.enabled) dl->AddRectFilled(amn, amx, HexU(z.tint, ab.hovered ? 1.0f : 0.92f), 5 * g_Scale);
+            else
+            {
+                dl->AddRectFilled(amn, amx, HexU(ab.hovered ? Col::Bg3 : Col::Bg2), 5 * g_Scale);
+                dl->AddRect(amn, amx, HexU(z.tint, ab.hovered ? 0.9f : 0.6f), 5 * g_Scale, 0, 1.5f);
+            }
+            const char* zl = z.heavy ? "H" : "Z";
+            const ImVec2 zs = ImGui::CalcTextSize(zl);
+            dl->AddText(ImVec2((amn.x + amx.x - zs.x) * 0.5f, (amn.y + amx.y - zs.y) * 0.5f),
+                        z.sv.enabled ? HexU(Col::Bg0, 0.9f) : HexU(z.tint, 0.85f), zl);
+            if (ab.hovered)
+                ImGui::SetTooltip(z.sv.enabled ? "Active - in every war\nClick: take it out"
+                                               : "Not active - sits out\nClick: make it active");
+            if (ab.clicked) ToggleRefEnabled(ref);
+        }
+
+        if (renaming) InlineRenameField(ImVec2(tx - 4 * g_Scale, mn.y), ImVec2(mx.x - pillW - 12 * g_Scale, mx.y));
 
         // submitted after the row so it wins the click
         ImGui::SetCursorScreenPos(ImVec2(mx.x - pillW - 4 * g_Scale, mn.y + (rowH - pillH) * 0.5f));
@@ -1019,12 +241,18 @@ static void DrawZombieSection()
         }
         else if (ImGui::IsItemDeactivated()) g_ZombieDragAcc = 0.0f;
         if (pb.hovered)
-            ImGui::SetTooltip("Cycles this zombie gets per turn: %d%s\n\nDrag sideways to change",
-                              z.speed, z.heavy ? "   (heavy doubles it)" : "");
+        {
+            if (z.heavy)
+                ImGui::SetTooltip("Cycles this zombie gets per turn: %d\n(x%d, doubled because it is heavy)\n\n"
+                                  "Drag sideways to change", ZombieCycles(z), z.speed);
+            else
+                ImGui::SetTooltip("Cycles this zombie gets per turn: %d\n\nDrag sideways to change", z.speed);
+        }
 
-        if (clicked)
+        if (clicked && !renaming)
         {
             HandleRowClick(ref, true);
+            g_GroupsFocus = true;
             // zombies are warriors like any other, so the inspector follows too
             if (S.game.ready())
                 for (int k = 0; k < S.game.numWarriors(); k++)
@@ -1034,7 +262,14 @@ static void DrawZombieSection()
         ImGui::PopID();
         ImGui::SetCursorScreenPos(ImVec2(rowStart.x, mx.y + 3 * g_Scale));
     }
+    for (const GhostRef& g : ghosts) if (g.row->pos >= (int)S.zombies.size()) DrawGhostRow(*g.row, g.alpha, g.newest, rowH);
     ImGui::Dummy(ImVec2(0.0f, 0.0f));
+
+    // files dropped on this part of the list are zombies
+    const ImVec2 end = ImGui::GetCursorScreenPos();
+    AddDropZone(sectionTop, ImVec2(sectionTop.x + ImGui::GetContentRegionAvail().x + 8 * g_Scale,
+                                   ImMax(end.y, ImGui::GetWindowPos().y + ImGui::GetWindowHeight())),
+                std::string(), true);
 }
 
 // -----------------------------------------------------------------------------
@@ -1046,64 +281,12 @@ static void RelistAllSurvivors()
         for (int k = 0; k < kSlotCount; k++)
         {
             Survivor& sv = pl.slots[k];
-            if (sv.present && !sv.bin.empty() && !sv.dirty) ListSurvivor(sv, sv.bin);
+            // only a listing nobody has written down: real source is left alone
+            if (sv.present && !sv.bin.empty() && !sv.dirty && sv.asmTime == 0) ListSurvivor(sv, sv.bin);
         }
     for (Zombie& z : g_App.zombies)
-        if (z.sv.present && !z.sv.bin.empty() && !z.sv.dirty) ListSurvivor(z.sv, z.sv.bin);
+        if (z.sv.present && !z.sv.bin.empty() && !z.sv.dirty && z.sv.asmTime == 0) ListSurvivor(z.sv, z.sv.bin);
     Ref keep = g_App.open; g_App.open = Ref(); OpenInEditor(keep);
-}
-
-static void DrawSortPrompt()
-{
-    if (!g_SortPromptRoot.empty() && !ImGui::IsPopupOpen("Sort this folder?"))
-        ImGui::OpenPopup("Sort this folder?");
-
-    ImGui::SetNextWindowSize(ImVec2(430 * g_Scale, 0), ImGuiCond_Always);
-    if (!ImGui::BeginPopupModal("Sort this folder?", NULL, ImGuiWindowFlags_NoResize)) return;
-
-    ImGui::TextWrapped("%s has no assembly / survivors / zombies folders.",
-                       FileNameOf(g_SortPromptRoot).c_str());
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, Hex(Col::TextDim));
-    ImGui::TextWrapped("Sorting moves .asm files into assembly, extension-less files into survivors, "
-                       "and extension-less files whose name starts with \"zom\" into zombies. "
-                       "A folder inside it that holds nothing but warriors is sorted the same way and "
-                       "stays a folder of survivors. Everything else is left where it is.");
-    ImGui::PopStyleColor();
-    ImGui::Spacing();
-
-    static bool dontAsk = false;
-    ImGui::Checkbox("Do not ask again", &dontAsk);
-    ImGui::Separator();
-
-    const std::string root = g_SortPromptRoot;
-    if (ImGui::Button("Sort and open", ImVec2(150 * g_Scale, 0)))
-    {
-        if (dontAsk) g_App.folderSortMode = 1;
-        g_SortPromptRoot.clear();
-        const int moved = SortFolderIntoSubfolders(root);
-        LoadWorkspaceFolder(root);
-        g_App.status += "  (sorted " + std::to_string(moved) + " file(s))";
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Open as-is", ImVec2(120 * g_Scale, 0)))
-    {
-        if (dontAsk) g_App.folderSortMode = 2;
-        g_SortPromptRoot.clear();
-        const int keep = g_App.folderSortMode;
-        g_App.folderSortMode = 2;                 // one-shot: read the folder flat
-        LoadWorkspaceFolder(root);
-        g_App.folderSortMode = keep;
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(90 * g_Scale, 0)))
-    {
-        g_SortPromptRoot.clear();
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
 }
 
 // =============================================================================
@@ -1199,15 +382,16 @@ static void OptDivide()
 }
 
 // One setting. Draws the text half and leaves the cursor where a control
-// `ctrlW` wide belongs, level with the middle of the text. Returns true when
-// the text half was clicked, so a switch can be flipped from its label.
-static bool OptRow(const char* label, const char* note, float ctrlW)
+// `ctrlW` wide belongs, level with the middle of the text -- a control `ctrlH`
+// tall when it is not one frame high. Returns true when the text half was
+// clicked, so a switch can be flipped from its label.
+static bool OptRow(const char* label, const char* note, float ctrlW, float ctrlH = 0.0f)
 {
     OptDivide();
     const float  full   = ImGui::GetContentRegionAvail().x;
     const ImVec2 start  = ImGui::GetCursorScreenPos();
     const float  textW  = ImMax(90.0f * g_Scale, full - ctrlW - 18.0f * g_Scale);
-    const float  frameH = ImGui::GetFrameHeight();
+    const float  frameH = ctrlH > 0.0f ? ctrlH : ImGui::GetFrameHeight();
     const bool   hasNote = note && note[0];
 
     ImGui::BeginGroup();
@@ -1311,7 +495,7 @@ static bool OptColour(const char* label, unsigned* v, const char* note = NULL)
 // A row whose control is a button: the label says what, the button does it.
 static bool OptAction(const char* label, const char* button, const char* note = NULL)
 {
-    const float w = ImGui::CalcTextSize(button).x + ImGui::GetStyle().FramePadding.x * 2.0f + 8 * g_Scale;
+    const float w = ImGui::CalcTextSize(button, NULL, true).x + ImGui::GetStyle().FramePadding.x * 2.0f + 8 * g_Scale;
     OptRow(label, note, w);
     ImGui::PushID(label);
     const bool hit = ImGui::Button(button, ImVec2(w, 0));
@@ -1328,35 +512,52 @@ static float SegmentedWidth(const char* const* items, int n)
     return w;
 }
 
+// The strip is one item, and the segment under the mouse is worked out from
+// where it is. A button per segment, each placed by hand, left the layout's
+// cursor under the strip instead of under the row -- so beside a note longer
+// than the strip is tall, the next row started on top of the note's last lines.
 static bool Segmented(const char* id, int* v, const char* const* items, int n)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float h = ImGui::GetFrameHeight();
     const ImVec2 at = ImGui::GetCursorScreenPos();
     const float r = 6 * g_Scale;
-    dl->AddRectFilled(at, ImVec2(at.x + SegmentedWidth(items, n), at.y + h), HexU(Col::Bg2), r);
+    const float total = SegmentedWidth(items, n);
 
-    bool changed = false;
     ImGui::PushID(id);
+    const bool hit = ImGui::InvisibleButton("##seg", ImVec2(total, h));
+    const bool hovStrip = ImGui::IsItemHovered();
+    ImGui::PopID();
+    const float mouseX = ImGui::GetIO().MousePos.x;
+    auto segW = [&](int i) { return ImGui::CalcTextSize(items[i]).x + 22 * g_Scale; };
+
+    int under = -1;
+    if (hovStrip)
+    {
+        float x = at.x;
+        for (int i = 0; i < n; i++)
+        {
+            const float w = segW(i);
+            if (mouseX >= x && mouseX < x + w) { under = i; break; }
+            x += w;
+        }
+    }
+    bool changed = false;
+    if (hit && under >= 0 && *v != under) { *v = under; changed = true; }
+
+    dl->AddRectFilled(at, ImVec2(at.x + total, at.y + h), HexU(Col::Bg2), r);
     float x = at.x;
     for (int i = 0; i < n; i++)
     {
         const ImVec2 ts = ImGui::CalcTextSize(items[i]);
-        const float  w  = ts.x + 22 * g_Scale;
-        ImGui::SetCursorScreenPos(ImVec2(x, at.y));
-        ImGui::PushID(i);
-        const bool hit = ImGui::InvisibleButton("##seg", ImVec2(w, h));
-        const bool hov = ImGui::IsItemHovered();
-        ImGui::PopID();
-        if (hit && *v != i) { *v = i; changed = true; }
-        const bool on = (*v == i);
+        const float  w  = segW(i);
+        const bool on = (*v == i), hov = (under == i);
         if (on)       dl->AddRectFilled(ImVec2(x + 2, at.y + 2), ImVec2(x + w - 2, at.y + h - 2), HexU(Col::Accent, 0.9f), r - 1);
         else if (hov) dl->AddRectFilled(ImVec2(x + 2, at.y + 2), ImVec2(x + w - 2, at.y + h - 2), HexU(Col::Bg3), r - 1);
         dl->AddText(ImVec2(x + (w - ts.x) * 0.5f, at.y + (h - ts.y) * 0.5f),
                     HexU(on ? Col::Bg0 : (hov ? Col::Text : Col::TextDim)), items[i]);
         x += w;
     }
-    ImGui::PopID();
     return changed;
 }
 
@@ -1576,6 +777,13 @@ static void DrawOptionsWindow()
     static const char* kSections[] = { "Appearance", "Files", "Editor", "Debugger", "Simulation", "Competition", "About" };
     static const int   kSectionCount = (int)(sizeof(kSections) / sizeof(kSections[0]));
     static int section = 0;
+#ifdef CWEST_TEST_HOOKS
+    // test builds only: CWEST_OPTSECTION=<n> opens on that section
+    {
+        static bool picked = false;
+        if (!picked) { picked = true; if (const char* e = getenv("CWEST_OPTSECTION")) section = atoi(e); }
+    }
+#endif
     if (g_OptionsTab >= 1 && g_OptionsTab <= kSectionCount) section = g_OptionsTab - 1;
     g_OptionsTab = -1;
 
@@ -1637,6 +845,10 @@ static void DrawOptionsWindow()
     ImGui::BeginChild("##optbody", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
+#ifdef CWEST_TEST_HOOKS
+    // test builds only: CWEST_OPTSCROLL=<pixels> holds the section scrolled there
+    if (const char* sc = getenv("CWEST_OPTSCROLL")) ImGui::SetScrollY((float)atof(sc));
+#endif
     ImGui::PushID(section);
 
     switch (section)
@@ -1672,6 +884,64 @@ static void DrawOptionsWindow()
         PaletteEditor();
         OptCardEnd();
 
+        OptCard("GROUP COLOURS");
+        {
+            const float sw = ImGui::GetFrameHeight(), gap = 6 * g_Scale;
+            OptRow("Palette",
+                   "Groups made here take these in turn. A group read in from disk gets a colour "
+                   "from its name instead. Either way it keeps it until you change it.",
+                   5 * sw + 4 * gap);
+            // each square placed outright, in one group: after OptRow, SameLine
+            // would line the second square up with the label's top, not the first
+            unsigned* pal[5] = { &S.groupPal0, &S.groupPal1, &S.groupPal2, &S.groupPal3, &S.groupPal4 };
+            const ImVec2 at = ImGui::GetCursorScreenPos();
+            ImGui::BeginGroup();
+            for (int i = 0; i < 5; i++)
+            {
+                ImGui::SetCursorScreenPos(ImVec2(at.x + i * (sw + gap), at.y));
+                ImGui::PushID(i);
+                EditColour("##pal", pal[i], ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+                ImGui::PopID();
+            }
+            ImGui::EndGroup();
+
+            if (OptAction("Default palette", "Reset",
+                          "Back to the five colours the palette started with. Groups keep their colours."))
+            {
+                S.groupPal0 = 0xFF3B3B; S.groupPal1 = 0x2EDB4B; S.groupPal2 = 0x3D6BFF;
+                S.groupPal3 = 0xFFD83A; S.groupPal4 = 0xD54BFF;
+            }
+            // asks first, in a dialog of its own: this replaces colours chosen by
+            // hand, and there is no undo for it
+            if (OptAction("Recolour every group", "Recolour all",
+                          "Gives every group in the workspace the colour its name picks, as if it were "
+                          "read in for the first time. Two-colour groups go back to one. "
+                          "Colours you picked by hand are lost."))
+                ImGui::OpenPopup("Recolour every group?");
+            ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            if (ImGui::BeginPopupModal("Recolour every group?", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                ImGui::Text("Give all %d group(s) the colour their name picks?", (int)S.players.size());
+                ImGui::TextColored(Hex(Col::TextDim), "Colours picked by hand are replaced, and this cannot be undone.");
+                ImGui::Dummy(ImVec2(0, 4 * g_Scale));
+                if (ImGui::Button("Recolour all"))
+                {
+                    for (Player& pl : S.players)
+                    {
+                        pl.tint    = DefaultGroupTint(pl.name);
+                        pl.tint2   = SlotTint(pl.tint, 1);
+                        pl.twoTone = false;
+                    }
+                    S.status = "Recoloured " + std::to_string((int)S.players.size()) + " group(s) by their names";
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        }
+        OptCardEnd();
+
         OptCard("ARENA");
         // part of the theme: changing either makes the palette Custom
         if (OptColour("Arena", &Col::ArenaCore,
@@ -1681,8 +951,9 @@ static void DrawOptionsWindow()
                       "The lines between the cells once the arena is zoomed in. Part of the theme."))
             S.themeIndex = kThemeCount;
         OptSliderF("Grid line thickness", &S.arenaGridWidth, 0.0f, 3.0f, "%.1f x",
-                   "The lines and the cells' rounded corners both scale with it, and grow in "
-                   "gradually as you zoom in. 0 is no lines and square corners: one solid sheet.");
+                   "The lines and the cells' rounded corners both scale with it and with the zoom. "
+                   "Zooming in, they fade in from transparent rather than snapping on. "
+                   "0 is no lines and square corners: one solid sheet.");
         OptToggle("Offsets along the edges", &S.arenaRulers,
                   "Row and column addresses pinned to the top and left of the arena.");
         OptCardEnd();
@@ -1698,6 +969,10 @@ static void DrawOptionsWindow()
         OptSliderF("Inspector width", &S.inspectorWidth, 240.0f, 900.0f, "%.0f px");
         OptToggle("Collapse groups to survivors only", &S.groupsCollapsed,
                   "The groups bar shrinks to a strip of 1 / 2 chips.");
+        OptToggle("Windows can leave the main window", &S.popOutWindows,
+                  "Drag a panel by its tab -- or Options, an inspector, any window -- past the edge of "
+                  "the app and it becomes a window of its own on the desktop. Drag it back over the "
+                  "app to put it back in.");
         if (OptAction("Panel layout", "Reset", "Puts every panel back into one tabbed group."))
             g_ResetLayout = true;
         OptCardEnd();
@@ -1726,47 +1001,59 @@ static void DrawOptionsWindow()
         OptSectionTitle("Files", "The workspace folder, folders of survivors, and how both are kept on disk.");
 
         OptCard("WORKSPACE");
-        ImGui::PushStyleColor(ImGuiCol_Text, Hex(S.lastFolder.empty() ? Col::TextDim : Col::Text));
-        ImGui::TextWrapped("%s", S.lastFolder.empty() ? "No folder open" : S.lastFolder.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, Hex(HasWorkspace() ? Col::Text : Col::TextDim));
+        ImGui::TextWrapped("%s", HasWorkspace() ? WsRoot().c_str() : "No workspace open");
         ImGui::PopStyleColor();
-        OptNote("%d group(s) in %d folder(s), %d zombie(s)", (int)S.players.size(),
-                (int)S.folders.size(), (int)S.zombies.size());
+        if (HasWorkspace())
+            OptNote("%d group(s), %d folder(s), %d zombie(s). Everything is a file in this folder; "
+                    "files added, removed or edited there from outside show up on their own.",
+                    (int)S.players.size(), (int)S.folders.size(), (int)S.zombies.size());
         ImGui::Dummy(ImVec2(0, 2 * g_Scale));
-        if (ImGui::Button("Open folder...")) OpenWorkspaceFolder();
+        if (ImGui::Button("Open workspace...")) QueueWsOp(WsOp::PickWorkspace);
+        ImGui::BeginDisabled(!HasWorkspace());
         ImGui::SameLine();
-        if (ImGui::Button("Reload") && !S.lastFolder.empty()) LoadWorkspaceFolder(S.lastFolder);
+        if (ImGui::Button("Reveal")) RevealInExplorer(WsRoot());
         ImGui::SameLine();
-        if (ImGui::Button("Import files...")) ImportLooseFiles();
+        if (ImGui::Button("Read again")) ReconcileWorkspace();
         ImGui::SameLine();
         if (ImGui::Button("Save all")) SaveAll();
         ImGui::SameLine();
-        if (ImGui::Button("Close all") && !(S.players.empty() && S.zombies.empty() && S.folders.empty()))
-            ClearWorkspace();
+        if (ImGui::Button("Close")) QueueWsOp(WsOp::CloseWorkspace);
+        ImGui::EndDisabled();
         g_OptRows = 1;
-        if (OptAction("New group", "Create", "Two survivors from the template, ready to edit.")) NewPlayer();
-        if (OptAction("New zombie", "Create")) NewZombie();
+        OptToggle("Autosave", &S.autoSave,
+                  "Edits are written to disk a moment after you stop typing. A survivor's machine "
+                  "code is only rewritten once its source assembles cleanly. Off, a yellow dot on a "
+                  "survivor marks unsaved changes (Ctrl+S saves).");
+        ImGui::BeginDisabled(!HasWorkspace());
+        if (OptAction("New group", "Create", "Two survivors from the template, in the selected folder."))
+            QueueWsOp(WsOp::NewGroup, TargetFolder());
+        if (OptAction("New zombie", "Create")) QueueWsOp(WsOp::NewZombie);
+        ImGui::EndDisabled();
         OptCardEnd();
 
-        OptCard("FOLDERS OF SURVIVORS");
-        OptNote("Groups can be filed into folders in the groups bar: drag a group onto a folder, or "
-                "right-click it and pick Move to folder. Clicking a folder folds it away; holding "
-                "it turns every group in it on or off.");
+        OptCard("FOLDERS OF GROUPS");
+        OptNote("A folder is a directory, the same one under survivors and under assembly, and "
+                "folders go inside folders as deep as you like. Drag groups or folders onto a "
+                "folder to move them in, or onto empty space to bring them to the top. F2 renames, "
+                "Delete deletes (Ctrl+Z brings it back), Ctrl+A selects everything.");
         g_OptRows = 1;
-        if (OptAction("New folder", "Create", "Empty, at the top of the groups bar."))
-        { g_FolderOp = FolderOp(); g_FolderOp.kind = FolderOp::New; }
+        ImGui::BeginDisabled(!HasWorkspace());
+        if (OptAction("New folder", "Create", "Inside the selected folder."))
+            QueueWsOp(WsOp::NewFolder, TargetFolder());
+        ImGui::EndDisabled();
         OptDivide();
-        OptNote("A folder is a directory on disk -- survivors/<folder> and assembly/<folder> in a "
-                "sorted workspace, <folder> itself in one opened as-is -- so filing a group moves "
-                "its files and the arrangement is still there the next time the folder is opened. "
-                "Dropping a directory of warriors on the window brings it in as a folder too.");
+        OptNote("To bring warriors in, paste them (Ctrl+V after copying them in Explorer), drop them "
+                "on the window -- onto a folder to land them there -- or put them in the workspace's "
+                "survivors or assembly folder yourself.");
         OptCardEnd();
 
         OptCard("FOLDER LAYOUT");
         {
-            static const char* kSort[] = { "Ask", "Always sort", "Never sort" };
-            OptSegmented("When a folder is not sorted yet", &S.folderSortMode, kSort, 3,
-                         "A workspace holds assembly, survivors and zombies subfolders. This is "
-                         "what happens when a folder has none of them.");
+            static const char* kSort[] = { "Ask", "Always sort" };
+            OptSegmented("Warriors loose in a folder you open", &S.folderSortMode, kSort, 2,
+                         "A workspace keeps them in assembly, survivors and zombies. Sorting moves them "
+                         "there; nothing is moved without this.");
         }
         OptCardEnd();
 
@@ -1818,9 +1105,10 @@ static void DrawOptionsWindow()
 
         OptCard("EDIT TOOL");
         OptToggle("Edit mode", &S.editMode,
-                  "Double-click a byte in the arena, the stack or the shared page, a register, "
-                  "or a flag to change it. The war is played out again with the change on the "
-                  "next move.");
+                  "Double-click a byte in the arena, the stack or the shared page, or a register, "
+                  "and type the new value right there -- Enter or clicking away keeps it, Esc drops "
+                  "it. Double-click a flag to flip it. The war is played out again with the change "
+                  "on the next move.");
         OptCardEnd();
 
         OptCard("BREAKPOINTS");
@@ -1918,6 +1206,54 @@ static void DrawOptionsWindow()
         OptRow("Pairing seed", "Which groups are drawn into each battle, independent of the fight seed.",
                200 * g_Scale);
         ImGui::InputInt("##pairseed", &S.compPairSeed, 0, 0);
+        OptToggle("Seed field on the toolbar", &S.compSeedInBar,
+                  "Shown only while the panel is wide enough for it; the seed is always here.");
+        OptToggle("Seed search on the toolbar", &S.compSeekTool,
+                  "A tool that plays random wars between the groups you pick and keeps the seeds "
+                  "of the ones the survivors you pick won -- so a game like that can be opened "
+                  "in Debug.");
+        OptCardEnd();
+
+        OptCard("ENGINES");
+        OptNote("C++ is this app's own engine on every core; Java is the CGX reference engine, "
+                "playing the same battles.");
+        g_OptRows = 1;
+        if (OptToggle("Offer the Busy (C++) engine", &S.compAllowBusy,
+                      "The C++ engine and the graphics card (gpu-engine) at the same time, each "
+                      "playing half the battles.") && !S.compAllowBusy && S.compBackend == COMP_BOTH)
+            S.compBackend = COMP_CPU;
+        {
+            // the hazard: a striped sign and the plain words
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 o = ImGui::GetCursorScreenPos();
+            const float w = ImGui::GetContentRegionAvail().x;
+            const float s = 18.0f * g_Scale;
+            const char* warn = "Fire hazard. Busy runs the processor and the graphics card flat out "
+                               "together for as long as the tournament lasts. A laptop, a dusty "
+                               "case or a weak cooler can overheat -- it can throttle, shut down or, "
+                               "in the worst case, fry the computer. Watch the temperatures, and "
+                               "don't leave it running unattended.";
+            const float textW = w - s - 28 * g_Scale;
+            const ImVec2 ts = ImGui::CalcTextSize(warn, NULL, false, textW);
+            const float h = ImMax(ts.y, s) + 14 * g_Scale;
+            dl->AddRectFilled(o, ImVec2(o.x + w, o.y + h), HexU(Col::Danger, 0.12f), 7 * g_Scale);
+            dl->AddRect(o, ImVec2(o.x + w, o.y + h), HexU(Col::Danger, 0.55f), 7 * g_Scale, 0, 1.0f);
+            const ImVec2 c(o.x + 8 * g_Scale + s * 0.5f, o.y + 7 * g_Scale + s * 0.5f);
+            dl->AddTriangleFilled(ImVec2(c.x, c.y - s * 0.5f), ImVec2(c.x + s * 0.55f, c.y + s * 0.45f),
+                                  ImVec2(c.x - s * 0.55f, c.y + s * 0.45f), HexU(Col::Warn));
+            dl->AddTriangle(ImVec2(c.x, c.y - s * 0.5f), ImVec2(c.x + s * 0.55f, c.y + s * 0.45f),
+                            ImVec2(c.x - s * 0.55f, c.y + s * 0.45f), HexU(0x000000, 0.8f), 1.2f);
+            dl->AddLine(ImVec2(c.x, c.y - s * 0.18f), ImVec2(c.x, c.y + s * 0.16f), HexU(0x000000), 2.0f * g_Scale);
+            dl->AddCircleFilled(ImVec2(c.x, c.y + s * 0.30f), 1.2f * g_Scale, HexU(0x000000));
+            ImGui::SetCursorScreenPos(ImVec2(o.x + s + 16 * g_Scale, o.y + 7 * g_Scale));
+            ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + textW);      // window-local, like ImGui wants it
+            ImGui::PushStyleColor(ImGuiCol_Text, Hex(S.compAllowBusy ? Col::Danger : Col::TextDim));
+            ImGui::TextUnformatted(warn);
+            ImGui::PopStyleColor();
+            ImGui::PopTextWrapPos();
+            ImGui::SetCursorScreenPos(ImVec2(o.x, o.y + h + 4 * g_Scale));
+            ImGui::Dummy(ImVec2(0, 0));
+        }
         OptCardEnd();
 
         OptCard("BAR GRAPH");
@@ -1927,6 +1263,9 @@ static void DrawOptionsWindow()
         OptToggle("Names and scores on the bars", &S.compBarLabels,
                   "Written along a bar that lies down, and turned on its side on a column that "
                   "stands up. A bar too thin to carry a line of text shows them on hover instead.");
+        OptToggle("Shadow under names on the bars", &S.compBarShadow,
+                  "A one-pixel drop shadow in the opposite tone, so a name stays readable on a bright "
+                  "bar as well as a dark one.");
         OptToggle("Fit the whole field", &S.compBarsFit,
                   "The bars share the whole panel between them, never thinner than 3 px, so a "
                   "field of hundreds is one picture.");
@@ -1937,15 +1276,36 @@ static void DrawOptionsWindow()
                "How it is listed on a host's board and named in a result file. Two machines "
                "with the same name get numbered by the host.", 200 * g_Scale);
         ImGui::InputText("##netname", S.compNetName, sizeof(S.compNetName));
+        {
+            static const char* kWho[] = { "Anyone", "Password", "Ask me" };
+            OptSegmented("Who may join when you host", &S.compNetProtect, kWho, 3,
+                         "Anyone with the address; whoever types the password -- every message is then "
+                         "sealed with it, so the tunnel carries the tournament but cannot read it; or "
+                         "whoever you accept on the Competition panel when they knock.");
+            S.compNetProtect = ImClamp(S.compNetProtect, 0, 2);
+            if (S.compNetProtect == NET_PASSWORD)
+            {
+                OptRow("Password", "Joiners type the same one next to the address. It never crosses the wire.",
+                       200 * g_Scale);
+                ImGui::InputTextWithHint("##hostpw", "password", S.compNetPassword, sizeof(S.compNetPassword),
+                                         ImGuiInputTextFlags_Password);
+            }
+            if (NetServerUp())
+            {
+                OptDivide();
+                OptNote("You are listening now: a change here counts from the next time you press Listen.");
+            }
+        }
         OptRow("Port",
-               "What a host listens on and a joiner connects to. Hosting needs it let through "
-               "the firewall.", 200 * g_Scale);
+               "The local port the tunnel hands joiners to -- this machine only, nothing to open in "
+               "a firewall. Change it only if it is taken. (host:port joins a host on this same machine.)",
+               200 * g_Scale);
         ImGui::InputInt("##netport", &S.compNetPort, 0, 0);
         S.compNetPort = ImClamp(S.compNetPort, 1, 65535);
         OptDivide();
         OptNote("A hosted tournament is cut into %d phases of the game index: the host plays "
                 "phase 0 and each joiner gets one of its own, so up to %d machines can share "
-                "a run. Shard files work the same way with as many phases as shards.",
+                "a run.",
                 kNetStride, kNetStride - 1);
         OptCardEnd();
         break;
@@ -1960,14 +1320,17 @@ static void DrawOptionsWindow()
         {
             struct K { const char* k; const char* what; };
             static const K keys[] = {
-                { "Ctrl+O",       "open a workspace folder" },
-                { "Ctrl+B",       "import loose files" },
+                { "Ctrl+O",       "open a workspace" },
                 { "Ctrl+N",       "new group" },
                 { "Ctrl+S",       "save the open survivor" },
                 { "Ctrl+Shift+S", "save everything" },
                 { "Ctrl+,",       "these options" },
-                { "Ctrl+Q",       "disable / enable the selection" },
-                { "Delete",       "close the selected groups" },
+                { "Ctrl+Q",       "make the selection active / take it out" },
+                { "F2",           "rename the selected group, folder or zombie" },
+                { "Ctrl+A",       "select every row of the groups bar" },
+                { "Ctrl+C / V",   "copy the selection's files / paste files in" },
+                { "Delete",       "delete the selection (to the Recycle Bin)" },
+                { "Ctrl+Z",       "bring back what was deleted (groups bar)" },
                 { "F5",           "play or pause" },
                 { "Ctrl+F5",      "new war (re-precompute)" },
                 { "Shift+F5",     "rewind" },
@@ -1993,9 +1356,11 @@ static void DrawOptionsWindow()
         OptCardEnd();
 
         OptCard("MOUSE");
-        OptNote("Groups bar: click opens and selects, Ctrl / Shift click multi-selects, hold to "
-                "disable, right-click to rename, recolour and move to a folder. Drag a group onto "
-                "a folder to file it there.");
+        OptNote("Groups bar: click opens and selects, Ctrl / Shift click multi-selects. A group's "
+                "square is solid when it is active and an outline when it sits out -- click it (or "
+                "hold the row) to switch. Right-click for colours, folders and runs against folders; "
+                "with several rows selected it shows only what applies to all of them. Drag rows "
+                "onto a folder to move them in.");
         g_OptRows = 1;
         OptDivide();
         OptNote("Arena and timeline: wheel zooms, drag pans, and the bar under the timeline is "

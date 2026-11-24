@@ -27,7 +27,7 @@ $engineHeaders = Get-ChildItem (Join-Path $root 'src\engine') -Filter *.h
 $imguiHeaders  = Get-ChildItem $imgui -Filter *.h
 $units = @()
 # the engine translation units the app links -- test harnesses are not here
-foreach ($u in 'cpu', 'war', 'replay', 'disasm', 'asm', 'listing', 'session', 'compete', 'netpack') {
+foreach ($u in 'cpu', 'war', 'replay', 'disasm', 'asm', 'listing', 'session', 'compete', 'netpack', 'netlink') {
     $units += ,@("eng_$u", (Join-Path $root "src\engine\$u.cpp"), @(), $engineHeaders)
 }
 $inc = @("-I$imgui", "-I$imgui\backends", "-I$glfw")

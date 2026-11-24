@@ -32,10 +32,22 @@ struct AsmLine {
     int length = 0;             // bytes emitted (0 for labels / blank / comment)
 };
 
+// A numeric EQU and what it came to (names are upper case).
+struct AsmSymbol {
+    std::string name;
+    int         line = 0;       // 0-based source line of the EQU
+    long long   value = 0;
+    bool        resolved = false;
+};
+
 struct AsmResult {
     std::vector<u8>      bytes;
     std::vector<AsmLine> lines;
     std::vector<AsmDiag> diags;
+    std::vector<AsmSymbol> equs;
+    // Where `int 0x89` was written: the offset of its CD. Those assemble to
+    // INT 87h (CD 87); the smart check plays a copy with CD 89 there instead.
+    std::vector<int> smartSites;
     bool ok = false;
     bool hasWarning = false;
 };

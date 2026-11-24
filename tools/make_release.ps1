@@ -48,7 +48,7 @@ Write-Host "  linking $name.exe"
 $objs = Get-ChildItem $objDir -Filter *.o | ForEach-Object { $_.FullName }
 & g++ -O2 -s -std=c++17 src/main.cpp @objs `
     -Isrc -Ithird_party/imgui -Ithird_party/imgui/backends -Ithird_party/glfw/include `
-    -Lthird_party/glfw/lib-mingw-w64 -lglfw3 -lopengl32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -lws2_32 `
+    -Lthird_party/glfw/lib-mingw-w64 -lglfw3 -lopengl32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -lws2_32 -lwinhttp -lbcrypt `
     -mwindows -static -o (Join-Path $outDir "$name.exe")
 if ($LASTEXITCODE -ne 0) { throw 'link failed' }
 
@@ -56,7 +56,8 @@ Write-Host "  linking cwnode.exe"
 & g++ -O2 -s -std=c++17 -static src/engine/cwnode.cpp `
     (Join-Path $objDir 'eng_cpu.o') (Join-Path $objDir 'eng_war.o') `
     (Join-Path $objDir 'eng_compete.o') (Join-Path $objDir 'eng_netpack.o') `
-    -lws2_32 -o (Join-Path $outDir 'cwnode.exe')
+    (Join-Path $objDir 'eng_netlink.o') `
+    -lws2_32 -lwinhttp -lbcrypt -o (Join-Path $outDir 'cwnode.exe')
 if ($LASTEXITCODE -ne 0) { throw 'cwnode link failed' }
 
 # ---- runtime files -------------------------------------------------------------
@@ -95,6 +96,16 @@ Copy-Item third_party\glfw\LICENSE.md "$outDir\licenses\glfw-LICENSE.md"
 Get-ChildItem assets\fonts\licenses -Filter *.txt | ForEach-Object { Copy-Into $_.FullName "$outDir\licenses\fonts" }
 
 Copy-Item assets\README-release.txt "$outDir\README.txt"
+
+# server mode's tunnel program (Cloudflare's, Apache-2.0), when it sits next to
+# the dev build -- without it the release's server mode says where to get it.
+# Apache-2.0 asks for its licence to go wherever the program goes, so the two
+# ship together or not at all (cloudflared has no NOTICE file to add).
+if (Test-Path cloudflared.exe) {
+    if (-not (Test-Path third_party\cloudflared\LICENSE)) { throw 'cloudflared.exe without third_party\cloudflared\LICENSE' }
+    Copy-Item cloudflared.exe $outDir
+    Copy-Item third_party\cloudflared\LICENSE "$outDir\licenses\cloudflared-LICENSE.txt"
+}
 
 # ---- zip -------------------------------------------------------------------------
 # bsdtar keeps the empty survivors/ and zombies/ folders, which Compress-Archive drops

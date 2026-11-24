@@ -1,44 +1,63 @@
 // =============================================================================
 //  Distributed tournament -- the wire
 //
-//  Three ways to share one tournament between machines, all resting on the
-//  same fact: a game's seed and its combination are pure functions of a global
+//  Two sides of sharing one tournament between machines, resting on one
+//  fact: a game's seed and its combination are pure functions of a global
 //  game index, so any machine handed the field and a phase of a stride plays
 //  battles nobody else plays, and the standings are the plain sum.
 //
-//    offline  -- the host writes one shard file per machine (the field plus a
-//                phase); each machine runs its shard and saves a result file;
-//                the host adds the result files up.
 //    server   -- the host listens; joiners get the field the moment Run is
 //                pressed and stream their contribution back while they play.
 //    join     -- connect to a host and play whatever it sends.
 //
+//  Over the internet, not just a LAN: the host listens on 127.0.0.1 only and
+//  runs `cloudflared` (a Cloudflare quick tunnel -- no account, no router
+//  setup), which gives it a public https://....trycloudflare.com address and
+//  brings every joiner in to that port as a WebSocket. Server mode needs
+//  cloudflared.exe next to app.exe. The transport, the WebSocket and the
+//  password sealing live in engine/netlink.{h,cpp}, shared with cwnode.
+//
 //  The protocol is blocks of text lines ending in a line that says `end`, so
 //  the field and result packs cross the wire exactly as they sit in a file:
 //
-//    client -> server    hello 1 / name <n> / end
-//                        <result pack>              every second while running
+//    server -> client    cwest-host 1 / auth / salt / nonce / end   on connect
+//    client -> server    hello 1 / name <n> [/ proof] / end
+//    server -> client    welcome | waiting | denied                  the door
+//    client -> server    <result pack>              every second while running
 //                        done 1 / run <id> / end    lanes have wound down
 //    server -> client    <field pack>               Run pressed (or a late join)
 //                        stop 1 / end               target reached, or Stop
 //                        <result pack from "total"> the merged board, for watching
+//                        ping 1 / end               every 20 s, so the tunnel
+//                                                   never sees an idle line
 //
-//  Sockets are non-blocking and polled from the frame. Nothing here is fast
-//  enough to need a thread: a field is ~100 KB once, a result pack a few KB a
-//  second.
+//  The host's sockets are non-blocking and polled from the frame; the
+//  joiner's link reads on threads of its own (NetLink) and is polled too.
 // =============================================================================
 
 #pragma comment(lib, "ws2_32.lib")
-#include <shellapi.h>   // ShellExecuteExW -- the firewall button
+#include <shellapi.h>   // ShellExecuteA -- the download page
+#include "engine/netlink.h"
 
 static const int kNetStride = 64;     // phases a hosted tournament is cut into
+
+// Who may come in: anyone, whoever knows the password (and then everything is
+// sealed), or whoever the host accepts by hand.
+enum { NET_OPEN = 0, NET_PASSWORD = 1, NET_ASK = 2 };
 
 struct NetPeer
 {
     SOCKET      s = INVALID_SOCKET;
     std::string name;                 // unique on this server
     std::string addr;
+    int         proto = 0;            // 0 not known yet, 1 line protocol, 2 WebSocket, 3 reading an HTTP request
+    std::string raw;                  // bytes off the socket, before the WebSocket is unwrapped
     std::string in, out;
+    std::string nonce;                // for the password proof
+    bool        sealed = false;       // proved the password: everything both ways is sealed
+    bool        pending = false;      // "ask": waiting for the host to accept
+    bool        admitted = false;     // in: seated, or waiting for a seat
+    bool        closeAfterFlush = false;
     int         phase = -1;           // -1 until the host hands one out
     bool        running = false;      // sent a field, not yet heard `done`
     int         runId = 0;
@@ -51,27 +70,24 @@ struct NetServer
 {
     SOCKET  listener = INVALID_SOCKET;
     int     port = 0;
+    int     protect = NET_OPEN;       // fixed while listening
+    std::string salt;                 // for the password's key, new each Listen
+    cw::NetKey  key;
     std::vector<NetPeer> peers;
     std::string note;
     double  lastBoard = 0.0;          // when the merged board was last sent
+    double  lastPing = 0.0;
 };
 
 enum { NET_IDLE = 0, NET_CONNECTING, NET_WAITING, NET_RUNNING, NET_FAILED };
 
 struct NetClient
 {
-    SOCKET      s = INVALID_SOCKET;
     int         state = NET_IDLE;
-    std::string in, out;
+    std::string in;
     std::string note;
-    double      started = 0.0;
-    double      lastSend = 0.0;
-    // A joiner switched on before its host keeps knocking: where to, and
-    // until when.
-    std::string host;
-    int         port = 0;
-    double      retryUntil = 0.0;
-    double      retryAt = 0.0;
+    double      started = 0.0;        // when the line opened (for the greeting's timeout)
+    std::string host;                 // the address as typed
     int         attempts = 0;
     std::string lastWhy;              // why the previous attempt failed, kept on show
     bool        haveField = false;    // a field arrived and is waiting to start
@@ -85,9 +101,10 @@ struct NetClient
 
 static NetServer g_NetServer;
 static NetClient g_NetClient;
-// Result packs from elsewhere -- files added in offline mode, peers in server
-// mode -- keyed by sender, so a pack re-sent or a file added twice replaces
-// rather than doubles.
+static cw::NetLink     g_NetLink;     // the joiner's line to its host
+static cw::NetJoinAuth g_NetAuth;     // and its half of the first exchange
+// Result packs from the joined machines, keyed by sender, so a pack re-sent
+// replaces rather than doubles.
 static std::map<std::string, cw::ResultPack> g_NetPacks;
 static int  g_NetPacksRev = 0;        // bumped when a pack arrives, so the board recombines
 static bool g_NetReady = false;
@@ -113,13 +130,8 @@ static std::string NetErr(int code)
 {
     switch (code)
     {
-    case WSAECONNREFUSED: return "refused: that machine is up, but nothing listens on the port (Listen not pressed? wrong port?)";
-    case WSAETIMEDOUT:    return "timed out: a firewall on the host is dropping the port, or the address is wrong";
-    case WSAEHOSTUNREACH: return "host unreachable: wrong address, or not on the same network";
-    case WSAENETUNREACH:  return "network unreachable: this machine is not on that network";
-    case WSAEACCES:       return "blocked on this machine: a firewall or antivirus here stops CWEST8086 connecting";
-    case WSAEADDRNOTAVAIL:return "not a usable address";
-    case WSAEADDRINUSE:   return "port already in use (another copy listening?)";
+    case WSAEACCES:       return "blocked on this machine: a firewall or antivirus here stops CWEST8086 listening";
+    case WSAEADDRINUSE:   return "port already in use (another copy listening?) -- pick another port";
     case WSAECONNRESET:   return "connection reset";
     default: break;
     }
@@ -152,47 +164,9 @@ static bool NetRead(SOCKET s, std::string& in)
     }
 }
 
-// The next complete block in `in`, if one has fully arrived. Blocks end at a
-// line that is exactly `end`.
-static bool NetTakeBlock(std::string& in, std::string& block)
-{
-    size_t pos = 0;
-    for (;;)
-    {
-        const size_t nl = in.find('\n', pos);
-        if (nl == std::string::npos) return false;
-        std::string line = in.substr(pos, nl - pos);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line == "end")
-        {
-            block = in.substr(0, nl + 1);
-            in.erase(0, nl + 1);
-            return true;
-        }
-        pos = nl + 1;
-    }
-}
-
-static std::string NetFirstLine(const std::string& block)
-{
-    const size_t nl = block.find('\n');
-    return nl == std::string::npos ? block : block.substr(0, nl);
-}
-
-// `key value` lines of a small block (hello, done)
-static std::string NetField(const std::string& block, const char* key)
-{
-    const std::string k = std::string(key) + " ";
-    size_t pos = 0;
-    while (pos < block.size())
-    {
-        size_t nl = block.find('\n', pos);
-        if (nl == std::string::npos) nl = block.size();
-        if (block.compare(pos, k.size(), k) == 0) return block.substr(pos + k.size(), nl - pos - k.size());
-        pos = nl + 1;
-    }
-    return std::string();
-}
+static bool        NetTakeBlock(std::string& in, std::string& block) { return cw::netTakeBlock(in, block); }
+static std::string NetFirstLine(const std::string& block)            { return cw::netFirstLine(block); }
+static std::string NetField(const std::string& block, const char* key) { return cw::netField(block, key); }
 
 static std::string NetComputerName()
 {
@@ -202,10 +176,138 @@ static std::string NetComputerName()
     return buf;
 }
 
+// ---- the tunnel -----------------------------------------------------------
+//
+// cloudflared.exe, run next to app.exe: `tunnel --url http://127.0.0.1:<port>`
+// asks Cloudflare for a quick tunnel and prints its public address. It runs
+// in a job object, so it goes when the app goes, however the app ends.
+
+static const char* kCloudflaredPage = "https://github.com/cloudflare/cloudflared/releases/latest";
+
+struct NetTunnel
+{
+    HANDLE      proc = NULL, job = NULL, pipe = NULL;
+    std::thread reader;
+    std::mutex  mu;
+    std::string url;                  // https://....trycloudflare.com once it is up
+    std::string lastLine;             // cloudflared's latest complaint, for the panel
+    std::atomic<bool> running{false};
+    double      startedAt = 0.0;
+};
+static NetTunnel g_Tunnel;
+
+static std::string CloudflaredPath() { return ExeDir() + "cloudflared.exe"; }
+static bool CloudflaredPresent()
+{
+    const DWORD a = GetFileAttributesA(CloudflaredPath().c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::string NetTunnelUrl()
+{
+    std::lock_guard<std::mutex> lk(g_Tunnel.mu);
+    return g_Tunnel.url;
+}
+
+static void NetTunnelStop()
+{
+    NetTunnel& t = g_Tunnel;
+    if (t.job) { TerminateJobObject(t.job, 0); CloseHandle(t.job); t.job = NULL; }
+    if (t.proc) { CloseHandle(t.proc); t.proc = NULL; }
+    if (t.reader.joinable()) t.reader.join();        // the pipe broke when cloudflared went
+    if (t.pipe) { CloseHandle(t.pipe); t.pipe = NULL; }
+    std::lock_guard<std::mutex> lk(t.mu);
+    t.url.clear();
+    t.lastLine.clear();
+    t.running.store(false);
+}
+
+static bool NetTunnelStart(int port, std::string& why)
+{
+    NetTunnelStop();
+    NetTunnel& t = g_Tunnel;
+    if (!CloudflaredPresent()) { why = "cloudflared.exe is not next to app.exe"; return false; }
+
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) { why = "could not make a pipe for cloudflared"; return false; }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    si.hStdInput = NULL;
+    PROCESS_INFORMATION pi{};
+    std::string cmd = "\"" + CloudflaredPath() + "\" tunnel --no-autoupdate --url http://127.0.0.1:" + std::to_string(port);
+    if (!CreateProcessA(NULL, &cmd[0], NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL,
+                        ExeDir().c_str(), &si, &pi))
+    {
+        why = "could not start cloudflared.exe (error " + std::to_string(GetLastError()) + ")";
+        CloseHandle(rd); CloseHandle(wr);
+        return false;
+    }
+    CloseHandle(wr);
+    t.job = CreateJobObjectA(NULL, NULL);
+    if (t.job)
+    {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(t.job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+        AssignProcessToJobObject(t.job, pi.hProcess);
+    }
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    t.proc = pi.hProcess;
+    t.pipe = rd;
+    t.startedAt = AppNow();
+    t.running.store(true);
+
+    t.reader = std::thread([rd]() {
+        NetTunnel& tt = g_Tunnel;
+        std::string acc;
+        char buf[4096];
+        DWORD got = 0;
+        while (ReadFile(rd, buf, sizeof(buf), &got, NULL) && got > 0)
+        {
+            acc.append(buf, got);
+            size_t nl;
+            while ((nl = acc.find('\n')) != std::string::npos)
+            {
+                std::string line = acc.substr(0, nl);
+                acc.erase(0, nl + 1);
+                const size_t at = line.find("https://");
+                if (at != std::string::npos)
+                {
+                    size_t e = at + 8;
+                    while (e < line.size() && (isalnum((unsigned char)line[e]) || line[e] == '-' || line[e] == '.')) e++;
+                    const std::string u = line.substr(at, e - at);
+                    if (u.size() > 26 && u.compare(u.size() - 18, 18, ".trycloudflare.com") == 0)
+                    {
+                        std::lock_guard<std::mutex> lk(tt.mu);
+                        tt.url = u;
+                    }
+                }
+                if (line.find(" ERR ") != std::string::npos || line.find("failed") != std::string::npos)
+                {
+                    // the part after the timestamp and level
+                    const size_t lv = line.find(" ERR ");
+                    std::lock_guard<std::mutex> lk(tt.mu);
+                    tt.lastLine = lv != std::string::npos ? line.substr(lv + 5) : line;
+                }
+            }
+        }
+        tt.running.store(false);
+    });
+    return true;
+}
+
 // ---- server ---------------------------------------------------------------
 
 static void NetServerStop()
 {
+    NetTunnelStop();
     for (NetPeer& p : g_NetServer.peers)
         if (p.s != INVALID_SOCKET) closesocket(p.s);
     g_NetServer.peers.clear();
@@ -214,19 +316,29 @@ static void NetServerStop()
     g_NetServer.port = 0;
 }
 
+// Listens on 127.0.0.1 only -- everyone comes in through the tunnel -- and
+// starts the tunnel. Needs cloudflared.exe next to app.exe.
 static bool NetServerStart(int port, std::string& why)
 {
+    if (!CloudflaredPresent()) { why = "server mode needs cloudflared.exe next to app.exe"; return false; }
     if (!NetInit()) { why = "winsock would not start"; return false; }
     NetServerStop();
 
+    g_NetServer.protect = ImClamp(g_App.compNetProtect, 0, 2);
+    g_NetServer.salt = cw::netRandomHex(16);
+    g_NetServer.key = cw::NetKey();
+    if (g_NetServer.protect == NET_PASSWORD)
+    {
+        if (!g_App.compNetPassword[0]) { why = "type a password first (or choose Open)"; return false; }
+        if (!cw::netDeriveKey(g_App.compNetPassword, g_NetServer.salt, g_NetServer.key))
+        { why = "could not work out the password's key"; return false; }
+    }
+
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) { why = NetErr(WSAGetLastError()); return false; }
-    BOOL reuse = TRUE;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-
     sockaddr_in a{};
     a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     a.sin_port = htons((u_short)port);
     if (bind(s, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR || listen(s, 16) == SOCKET_ERROR)
     {
@@ -238,145 +350,33 @@ static bool NetServerStart(int port, std::string& why)
     g_NetServer.listener = s;
     g_NetServer.port = port;
     g_NetServer.note.clear();
+    if (!NetTunnelStart(port, why))
+    {
+        NetServerStop();
+        return false;
+    }
     return true;
 }
 
 static bool NetServerUp() { return g_NetServer.listener != INVALID_SOCKET; }
 
-// The addresses this machine answers on, for telling joiners what to type --
-// best guess first. A typical PC also carries Hyper-V / WSL / VirtualBox
-// adapters whose addresses nobody else can reach, and listing those first is
-// how a joiner ends up knocking on the wrong door.
-struct NetAddr
+// Bytes to a peer, in a WebSocket's frames when it came that way.
+static void NetPeerWrite(NetPeer& p, const std::string& bytes)
 {
-    std::string ip;
-    std::string adapter;
-    int         rank = 0;      // 0 real adapter with a gateway, 1 real, 2 virtual
-};
-
-static std::vector<NetAddr> NetLocalAddresses()
-{
-    std::vector<NetAddr> out;
-    if (!NetInit()) return out;
-
-    // Loaded at run time so the link line needs no iphlpapi.
-    typedef ULONG (WINAPI *GaaFn)(ULONG, ULONG, PVOID, PIP_ADAPTER_ADDRESSES, PULONG);
-    static GaaFn gaa = []() -> GaaFn {
-        HMODULE m = LoadLibraryA("iphlpapi.dll");
-        return m ? (GaaFn)(void*)GetProcAddress(m, "GetAdaptersAddresses") : nullptr;
-    }();
-
-    if (gaa)
-    {
-        std::vector<unsigned char> buf;
-        ULONG size = 32 * 1024, rc = ERROR_BUFFER_OVERFLOW;
-        for (int tries = 0; tries < 3 && rc == ERROR_BUFFER_OVERFLOW; tries++)
-        {
-            buf.resize(size);
-            rc = gaa(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST |
-                              GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-                     nullptr, (PIP_ADAPTER_ADDRESSES)buf.data(), &size);
-        }
-        if (rc == NO_ERROR)
-            for (PIP_ADAPTER_ADDRESSES a = (PIP_ADAPTER_ADDRESSES)buf.data(); a; a = a->Next)
-            {
-                if (a->OperStatus != IfOperStatusUp) continue;
-                if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || a->IfType == IF_TYPE_TUNNEL) continue;
-
-                char name[256] = "", desc[256] = "";
-                WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, name, sizeof(name), NULL, NULL);
-                WideCharToMultiByte(CP_UTF8, 0, a->Description,  -1, desc, sizeof(desc), NULL, NULL);
-                const std::string both = ToLower(std::string(name) + " " + desc);
-                bool virt = false;
-                for (const char* v : { "vethernet", "hyper-v", "virtualbox", "vmware", "wsl", "docker", "loopback" })
-                    if (both.find(v) != std::string::npos) virt = true;
-                const int rank = virt ? 2 : (a->FirstGatewayAddress ? 0 : 1);
-
-                for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u; u = u->Next)
-                {
-                    if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
-                    char ip[64] = "";
-                    inet_ntop(AF_INET, &((sockaddr_in*)u->Address.lpSockaddr)->sin_addr, ip, sizeof(ip));
-                    if (strncmp(ip, "169.254.", 8) == 0) continue;   // self-assigned: no network behind it
-                    NetAddr n;
-                    // The description ("Intel Wi-Fi 6 AX201") rather than the
-                    // friendly name: on a localized Windows the name is in the
-                    // UI language ("Wi-Fi" in Hebrew, with bidi marks), which
-                    // the app's fonts cannot draw.
-                    n.ip = ip; n.adapter = desc[0] ? desc : name; n.rank = rank;
-                    out.push_back(n);
-                }
-            }
-    }
-
-    if (out.empty())
-    {
-        // the old way: every address the host name resolves to, unranked
-        char host[256] = "";
-        addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        addrinfo* res = nullptr;
-        if (gethostname(host, sizeof(host)) == 0 && getaddrinfo(host, nullptr, &hints, &res) == 0)
-        {
-            for (addrinfo* p = res; p; p = p->ai_next)
-            {
-                char ip[64];
-                inet_ntop(AF_INET, &((sockaddr_in*)p->ai_addr)->sin_addr, ip, sizeof(ip));
-                NetAddr n; n.ip = ip; n.rank = 1;
-                out.push_back(n);
-            }
-            freeaddrinfo(res);
-        }
-    }
-
-    std::stable_sort(out.begin(), out.end(), [](const NetAddr& x, const NetAddr& y) { return x.rank < y.rank; });
-    return out;
+    p.out += (p.proto == 2) ? cw::wsServerFrames(bytes) : bytes;
 }
 
-// Lets joiners in through Windows Defender Firewall. Runs netsh elevated, so
-// Windows asks the user for admin approval first; nothing happens without it.
-//   1. removes the inbound rules Windows made for THIS exe -- pressing Cancel
-//      on the first-run "allow access" prompt leaves a Block rule behind, and
-//      a block rule beats any allow rule;
-//   2. replaces our own named rule with one for the port, TCP, open to the
-//      local subnet only (no password on the wire), on every network profile.
-// Returns a one-line outcome for the panel.
-static std::string NetAllowThroughFirewall(int port)
+// A block to a peer -- sealed once it has proved the password.
+static void NetPeerSay(NetPeer& p, const std::string& block)
 {
-    wchar_t exe[MAX_PATH] = L"";
-    GetModuleFileNameW(NULL, exe, MAX_PATH);
-    const std::wstring p = std::to_wstring(port);
-    const std::wstring args =
-        L"/c netsh advfirewall firewall delete rule name=all dir=in program=\"" + std::wstring(exe) + L"\" >nul 2>&1"
-        L" & netsh advfirewall firewall delete rule name=\"CWEST8086 server\" >nul 2>&1"
-        L" & netsh advfirewall firewall add rule name=\"CWEST8086 server\" dir=in action=allow protocol=TCP"
-        L" localport=" + p + L" remoteip=localsubnet profile=any";
-
-    SHELLEXECUTEINFOW sei{};
-    sei.cbSize = sizeof(sei);
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
-    sei.hwnd = g_Hwnd;
-    sei.lpVerb = L"runas";
-    sei.lpFile = L"cmd.exe";
-    sei.lpParameters = args.c_str();
-    sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei))
-        return GetLastError() == ERROR_CANCELLED ? "firewall unchanged: the admin prompt was declined"
-                                                 : "firewall unchanged: could not run netsh";
-    DWORD code = 1;
-    if (sei.hProcess)
-    {
-        if (WaitForSingleObject(sei.hProcess, 20000) != WAIT_OBJECT_0)
-        { CloseHandle(sei.hProcess); return "netsh is taking long -- check the firewall by hand"; }
-        GetExitCodeProcess(sei.hProcess, &code);
-        CloseHandle(sei.hProcess);
-    }
-    return code == 0 ? "firewall: TCP port " + std::to_string(port) + " is open to this network"
-                     : "netsh failed (code " + std::to_string(code) + ") -- add the rule by hand";
+    NetPeerWrite(p, p.sealed ? cw::netSeal(g_NetServer.key, block) : block);
 }
 
-static void NetServerSend(NetPeer& p, const std::string& block) { p.out += block; }
+// Tournament traffic: only to peers that are in.
+static void NetServerSend(NetPeer& p, const std::string& block)
+{
+    if (p.admitted) NetPeerSay(p, block);
+}
 
 static void NetServerBroadcast(const std::string& block)
 {
@@ -420,13 +420,37 @@ static void NetServerAccept()
         inet_ntop(AF_INET, &a.sin_addr, ip, sizeof(ip));
         p.addr = ip;
         p.name = ip;                     // until it says hello
+        p.nonce = cw::netRandomHex(16);
         p.lastSeen = AppNow();
         g_NetServer.peers.push_back(p);
     }
 }
 
-// Hands the peer a phase, and the field if a run is going. Called on hello.
+// The first thing every joiner hears: how the door works here.
+static void NetServerGreet(NetPeer& p)
+{
+    static const char* kAuth[] = { "open", "password", "ask" };
+    NetPeerWrite(p, std::string("cwest-host 1\nauth ") + kAuth[g_NetServer.protect] +
+                    "\nsalt " + g_NetServer.salt + "\nnonce " + p.nonce + "\nend\n");
+}
+
+// Hands the peer a phase, and the field if a run is going.
 static void NetServerSeat(NetPeer& p);
+
+static void NetServerAdmit(NetPeer& p)
+{
+    p.pending = false;
+    p.admitted = true;
+    NetPeerSay(p, "welcome 1\nend\n");
+    NetServerSeat(p);
+}
+
+static void NetServerTurnAway(NetPeer& p, const char* why)
+{
+    p.pending = false;
+    NetPeerSay(p, std::string("denied 1\nwhy ") + why + "\nend\n");
+    p.closeAfterFlush = true;
+}
 
 static void NetServerPoll()
 {
@@ -434,17 +458,69 @@ static void NetServerPoll()
     NetServerAccept();
 
     const double now = AppNow();
+    const bool ping = now - g_NetServer.lastPing > 20.0;
+    if (ping) g_NetServer.lastPing = now;
     for (size_t i = 0; i < g_NetServer.peers.size(); )
     {
         NetPeer& p = g_NetServer.peers[i];
-        bool alive = NetRead(p.s, p.in) && NetFlush(p.s, p.out);
+        bool alive = NetRead(p.s, p.raw);
+
+        // what came in: a WebSocket through the tunnel (cloudflared sends its
+        // request at once), or plain lines from this machine -- a joiner that
+        // dials host:port says nothing until it is greeted, so a short silence
+        // means the line protocol
+        if (alive && p.proto == 0)
+        {
+            const size_t n = ImMin<size_t>(4, p.raw.size());
+            if (n > 0 && p.raw.compare(0, n, std::string("GET ").substr(0, n)) != 0) { p.proto = 1; NetServerGreet(p); }
+            else if (n == 4) p.proto = 3;
+            else if (n == 0 && now - p.lastSeen > 0.3) { p.proto = 1; NetServerGreet(p); }
+        }
+        // a connection that never says hello does not keep a socket forever
+        if (alive && !p.admitted && !p.pending && now - p.lastSeen > 60.0) alive = false;
+        if (alive && p.proto == 3)
+        {
+            std::string resp, ip;
+            bool upgrade = false;
+            if (cw::wsServerHandshake(p.raw, resp, upgrade, ip))
+            {
+                p.out += resp;
+                if (upgrade)
+                {
+                    p.proto = 2;
+                    if (!ip.empty()) { p.addr = ip; p.name = ip; }
+                    NetServerGreet(p);
+                }
+                else p.closeAfterFlush = true;          // a browser: it got the page
+            }
+        }
+        if (alive && p.proto == 1) { p.in += p.raw; p.raw.clear(); }
+        if (alive && p.proto == 2)
+        {
+            std::string reply;
+            if (!cw::wsServerDecode(p.raw, p.in, reply)) alive = false;
+            p.out += reply;
+        }
+        if (alive && ping && (p.admitted || p.pending)) NetPeerSay(p, "ping 1\nend\n");
+
         std::string block;
         while (alive && NetTakeBlock(p.in, block))
         {
             p.lastSeen = now;
-            const std::string head = NetFirstLine(block);
+            std::string head = NetFirstLine(block);
+            if (head.rfind("sealed", 0) == 0)
+            {
+                if (!p.sealed) continue;
+                std::string plain;
+                if (!cw::netUnseal(g_NetServer.key, block, plain)) { alive = false; break; }   // tampered with
+                block.swap(plain);
+                head = NetFirstLine(block);
+            }
+            else if (p.sealed) continue;                 // plain text after the seal: not from that joiner
+
             if (head.rfind("hello", 0) == 0)
             {
+                if (p.admitted || p.pending) continue;
                 std::string want = NetField(block, "name");
                 if (want.empty()) want = p.addr;
                 // names key the packs, so two laptops both called LAPTOP get
@@ -459,8 +535,25 @@ static void NetServerPoll()
                     name = want + " #" + std::to_string(n);
                 }
                 p.name = name;
-                NetServerSeat(p);
+                if (g_NetServer.protect == NET_PASSWORD)
+                {
+                    if (NetField(block, "proof") != cw::netProof(g_NetServer.key, p.nonce))
+                    {
+                        NetServerTurnAway(p, "wrong password");
+                        continue;
+                    }
+                    p.sealed = true;
+                }
+                if (g_NetServer.protect == NET_ASK)
+                {
+                    p.pending = true;
+                    NetPeerSay(p, "waiting 1\nend\n");
+                    g_App.status = p.name + " asks to join -- Accept or Deny on the Competition panel";
+                    continue;
+                }
+                NetServerAdmit(p);
             }
+            else if (!p.admitted) continue;              // nothing counts before the door
             else if (head.rfind("cwest-result", 0) == 0)
             {
                 cw::ResultPack rp;
@@ -479,6 +572,8 @@ static void NetServerPoll()
                 if (atoi(NetField(block, "run").c_str()) == p.runId) p.running = false;
             }
         }
+        if (alive) alive = NetFlush(p.s, p.out);
+        if (alive && p.closeAfterFlush && p.out.empty()) alive = false;
         if (!alive)
         {
             closesocket(p.s);
@@ -492,139 +587,108 @@ static void NetServerPoll()
 
 // ---- client -----------------------------------------------------------------
 
+static bool NetClientLinked() { return g_NetLink.state() == cw::NetLink::Open; }
+
 static void NetClientDisconnect()
 {
-    if (g_NetClient.s != INVALID_SOCKET) closesocket(g_NetClient.s);
+    g_NetLink.close();
+    g_NetAuth = cw::NetJoinAuth();
     g_NetClient = NetClient();
 }
 
-// One connection attempt; the retry loop in NetClientPoll calls this again.
-static bool NetClientDial(std::string& why)
-{
-    NetClient& c = g_NetClient;
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    const std::string portStr = std::to_string(c.port);
-    if (getaddrinfo(c.host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res)
-    {
-        why = "cannot resolve " + c.host;
-        return false;
-    }
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) { freeaddrinfo(res); why = NetErr(WSAGetLastError()); return false; }
-    NetNonBlocking(s);
-    connect(s, res->ai_addr, (int)res->ai_addrlen);     // completes in the background
-    freeaddrinfo(res);
-
-    c.s = s;
-    c.state = NET_CONNECTING;
-    c.started = AppNow();
-    c.attempts++;
-    // Why the last try failed stays in c.lastWhy, which the panel shows on a
-    // line of its own -- it used to flash for the two seconds between tries
-    // and then give way to "knocking again".
-    const std::string where = c.host + ":" + std::to_string(c.port);
-    c.note = c.attempts == 1 ? "connecting to " + where + "..."
-                             : "no host at " + where + " yet (try " + std::to_string(c.attempts) + ")";
-    return true;
-}
-
-static bool NetClientConnect(const char* host, int port, std::string& why)
+// Dials `address` -- the host's https://....trycloudflare.com, or host:port
+// on this machine -- and keeps knocking for ten minutes if nobody answers yet.
+static bool NetClientConnect(const char* address, std::string& why)
 {
     if (!NetInit()) { why = "winsock would not start"; return false; }
     NetClientDisconnect();
-    g_NetClient.host = host;
-    g_NetClient.port = port;
-    g_NetClient.retryUntil = AppNow() + 600.0;   // ten minutes of knocking
-    return NetClientDial(why);
+    std::string a = address;
+    while (!a.empty() && (a.back() == ' ' || a.back() == '/')) a.pop_back();
+    while (!a.empty() && a.front() == ' ') a.erase(0, 1);
+    if (a.empty()) { why = "type the host's address first"; return false; }
+    g_NetClient.host = a;
+    g_NetAuth.name = g_App.compNetName;
+    g_NetAuth.password = g_App.compNetPassword;
+    g_NetLink.open(a, g_App.compNetPort, 600.0);
+    g_NetClient.state = NET_CONNECTING;
+    g_NetClient.note = "connecting to " + a + "...";
+    return true;
 }
 
-static void NetClientSend(const std::string& block) { g_NetClient.out += block; }
+static void NetClientSend(const std::string& block)
+{
+    if (NetClientLinked()) g_NetLink.send(g_NetAuth.wrap(block));
+}
 
 static void NetClientFail(const std::string& why)
 {
-    if (g_NetClient.s != INVALID_SOCKET) closesocket(g_NetClient.s);
-    g_NetClient.s = INVALID_SOCKET;
+    g_NetLink.close();
     g_NetClient.state = NET_FAILED;
     g_NetClient.note = why;
     g_NetClient.haveField = false;
     g_NetClient.stopAsked = true;       // whatever is running should wind down
 }
 
-// A failed dial: give up, or -- while the host may simply not be up yet --
-// close this attempt and book another.
-static void NetClientDialFailed(const std::string& why)
-{
-    NetClient& c = g_NetClient;
-    const double now = AppNow();
-    if (now >= c.retryUntil) { NetClientFail(why); return; }
-    closesocket(c.s);
-    c.s = INVALID_SOCKET;
-    c.state = NET_CONNECTING;
-    c.retryAt = now + 2.0;
-    c.lastWhy = why;
-    c.note = "no host at " + c.host + ":" + std::to_string(c.port) + " yet (try " + std::to_string(c.attempts) + ")";
-}
-
 static void NetClientPoll()
 {
     NetClient& c = g_NetClient;
-    if (c.s == INVALID_SOCKET)
-    {
-        // between attempts
-        if (c.state == NET_CONNECTING && c.retryAt > 0.0 && AppNow() >= c.retryAt)
-        {
-            c.retryAt = 0.0;
-            std::string why;
-            if (!NetClientDial(why)) NetClientFail(why);
-        }
-        return;
-    }
+    if (c.state == NET_IDLE || c.state == NET_FAILED) return;
+    const cw::NetLink::State st = g_NetLink.state();
 
     if (c.state == NET_CONNECTING)
     {
-        fd_set w, e;
-        FD_ZERO(&w); FD_ZERO(&e);
-        FD_SET(c.s, &w); FD_SET(c.s, &e);
-        timeval tv{0, 0};
-        select(0, nullptr, &w, &e, &tv);
-        if (FD_ISSET(c.s, &e))
+        if (st == cw::NetLink::Connecting)
         {
-            int err = 0, len = sizeof(err);
-            getsockopt(c.s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
-            NetClientDialFailed(NetErr(err));
+            c.attempts = g_NetLink.attempts();
+            c.lastWhy = g_NetLink.why();
+            if (c.attempts > 1) c.note = "no host at " + c.host + " yet (try " + std::to_string(c.attempts) + ")";
             return;
         }
-        if (!FD_ISSET(c.s, &w))
-        {
-            if (AppNow() - c.started > 15.0) NetClientDialFailed("no answer in 15 s: a firewall on the host is dropping the port, or the address is wrong");
-            return;
-        }
-        c.attempts = 0;
+        if (st != cw::NetLink::Open) { NetClientFail(g_NetLink.why().empty() ? "could not connect" : g_NetLink.why()); return; }
         c.state = NET_WAITING;
+        c.started = AppNow();
         c.lastWhy.clear();
-        c.note = "connected -- waiting for the host to press Run";
-        NetClientSend("hello 1\nname " + std::string(g_App.compNetName) + "\nend\n");
+        c.note = "connected -- saying hello";
     }
 
-    bool alive = NetRead(c.s, c.in) && NetFlush(c.s, c.out);
-    std::string block;
-    while (alive && NetTakeBlock(c.in, block))
+    if (!g_NetAuth.greeted && AppNow() - c.started > 20.0)
     {
+        NetClientFail("connected, but the other end never said hello -- is that a CWEST8086 host?");
+        return;
+    }
+
+    // what arrived before the line closed is read first: a host that turns us
+    // away says why, then hangs up
+    g_NetLink.take(c.in);
+    std::string block;
+    while (NetTakeBlock(c.in, block))
+    {
+        std::string reply, why;
+        const int r = g_NetAuth.onBlock(block, reply, why);
+        if (!reply.empty()) g_NetLink.send(reply);
+        if (r == cw::NetJoinAuth::Refused) { NetClientFail(why); return; }
+        if (r != cw::NetJoinAuth::Pass) continue;
+
         const std::string head = NetFirstLine(block);
-        if (head.rfind("cwest-field", 0) == 0)
+        if (head.rfind("welcome", 0) == 0)
+        {
+            if (c.state == NET_WAITING) c.note = "in -- waiting for the host to press Run";
+        }
+        else if (head.rfind("waiting", 0) == 0)
+        {
+            c.note = "knocked -- waiting for the host to let you in";
+        }
+        else if (head.rfind("cwest-field", 0) == 0)
         {
             cw::FieldPack f;
-            std::string why;
-            if (cw::parseFieldPack(block, f, why))
+            std::string fwhy;
+            if (cw::parseFieldPack(block, f, fwhy))
             {
                 c.field = f;
                 c.haveField = true;
                 c.stopAsked = false;
             }
-            else c.note = "bad field from the host: " + why;
+            else c.note = "bad field from the host: " + fwhy;
         }
         else if (head.rfind("stop", 0) == 0)
         {
@@ -633,8 +697,8 @@ static void NetClientPoll()
         else if (head.rfind("cwest-result", 0) == 0)
         {
             cw::ResultPack rp;
-            std::string why;
-            if (cw::parseResultPack(block, rp, why) && !c.board.empty())
+            std::string pwhy;
+            if (cw::parseResultPack(block, rp, pwhy) && !c.board.empty())
             {
                 cw::CompeteResult b = c.board;
                 for (size_t i = 0; i < b.warriorScore.size(); i++)
@@ -653,5 +717,9 @@ static void NetClientPoll()
             }
         }
     }
-    if (!alive) NetClientFail("the host went away");
+    if (st != cw::NetLink::Open)
+    {
+        const std::string w = g_NetLink.why();
+        NetClientFail(w.empty() ? "the host went away" : w);
+    }
 }

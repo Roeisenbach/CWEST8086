@@ -40,7 +40,7 @@ void Replay::clear() {
     memHi = SNAP_LO; numWarriors = 0; totalRounds = 0; complete = false;
     contestedUntilRound = 0; note.clear();
     warriorName.clear(); warriorGroup.clear(); warriorSlot.clear();
-    warriorZombie.clear(); homeSS.clear(); homeES.clear(); groupName.clear();
+    warriorZombie.clear(); homeSS.clear(); homeES.clear(); groupName.clear(); groupKey.clear();
 }
 
 size_t Replay::bytes() const {
@@ -280,7 +280,7 @@ bool recordWar(const std::vector<WarriorGroup>& groups,
     out.snapInterval = opt.baseSnapInterval;
 
     // identity tables
-    for (const WarriorGroup& g : groups) out.groupName.push_back(g.name);
+    for (const WarriorGroup& g : groups) { out.groupName.push_back(g.name); out.groupKey.push_back(g.key); }
     for (int i = 0; i < war.numWarriors(); ++i) {
         const Warrior& w = war.warrior(i);
         out.warriorName.push_back(w.name());

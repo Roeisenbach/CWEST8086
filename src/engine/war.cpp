@@ -295,10 +295,10 @@ bool War::shouldRunExtra(Warrior& w) {
 // per war -- so the mask is rebuilt whenever one happens and merely read on
 // every round.
 void War::rebuildAliveGroups() {
-    u32 mask = 0;
+    u64 mask = 0;
     for (int i = 0; i < m_numWarriors; ++i) {
         const Warrior& w = m_store[(size_t)i];
-        if (w.alive() && !w.zombie()) mask |= 1u << (u32)(w.groupId() & 31);
+        if (w.alive() && !w.zombie()) mask |= 1ULL << (u32)(w.groupId() & 63);
     }
     m_aliveGroupMask = mask;
 }
@@ -390,6 +390,32 @@ void War::collectScores(std::vector<std::pair<std::string,float>>& out) const {
         if (w.alive() && !w.zombie())
             out.emplace_back(w.name(), score);
     }
+}
+
+u64 War::stateDigest() const {
+    u64 h = 0x9E3779B97F4A7C15ULL;
+    auto mix = [&h](u64 v) {
+        h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= h >> 31;
+    };
+    mix(m_rand.rawSeed());
+    mix((u64)(u32)m_numWarriors);
+    const s32 lo = RMAddr(ARENA_SEGMENT, (s16)0).linear;
+    const s32 hi = m_nextFreeAddress > lo ? m_nextFreeAddress : lo + ARENA_SIZE;
+    const u8* d = m_core.data();
+    s32 a = lo;
+    for (; a + 8 <= hi; a += 8) { u64 v; std::memcpy(&v, d + a, 8); mix(v); }
+    for (; a < hi; ++a) mix(d[a]);
+    for (int i = 0; i < m_numWarriors; ++i) {
+        const Warrior& w = m_store[(size_t)i];
+        const CpuState& c = w.cpu();
+        const s16 r[] = { c.ax, c.cx, c.dx, c.bx, c.sp, c.bp, c.si, c.di,
+                          c.es, c.cs, c.ss, c.ds, c.ip, c.flags, c.energy };
+        for (s16 v : r) mix((u64)(u16)v);
+        mix((u64)(u8)c.bomb1 | ((u64)(u8)c.bomb2 << 8) | ((u64)(w.alive() ? 1 : 0) << 16));
+    }
+    return h;
 }
 
 int War::collectScoreSlots(int* slots, float& share) const {

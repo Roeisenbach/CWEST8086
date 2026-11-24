@@ -12,9 +12,9 @@
 //  message costs nothing: the receiver keeps the latest pack per sender and
 //  sums those.
 //
-//  Both are line-oriented text. That is deliberate: they travel as files
-//  between offline machines and as a socket stream between online ones, and a
-//  format you can read in a text editor is the one you can debug.
+//  Both are line-oriented text. That is deliberate: they travel as a stream
+//  between the host and its joiners, and a format you can read in a text
+//  editor is the one you can debug.
 // =============================================================================
 #pragma once
 
@@ -24,7 +24,7 @@
 
 namespace cw {
 
-// Everything in one pack, so a shard file is self-contained.
+// Everything in one pack, so a joiner needs nothing else to play its share.
 struct FieldPack {
     std::vector<WarriorGroup> groups;
     s64 seed        = 0;

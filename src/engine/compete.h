@@ -50,6 +50,14 @@ struct CompeteOptions {
     // this one without either having to know about the other.
     int  seedStride  = 1;
     int  seedPhase   = 0;
+
+    // Separate fields in one run. When fieldCount > 1, groupField[i] says which
+    // field the i-th group handed in belongs to (zombie groups are ignored and
+    // stay in every battle), and battle g is drawn only from field g % fieldCount
+    // -- so groups of two different fields never meet. A group that should play
+    // in several fields is simply handed in once per field.
+    int              fieldCount = 1;
+    std::vector<int> groupField;
 };
 
 // Whether the engine's own translation units were compiled with optimisation.
